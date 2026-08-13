@@ -888,3 +888,23 @@ def test_convert_reasoning_effort_none_disables_thinking():
     assert RP.convert_responses_to_genspec(req, {}).chat_template_kwargs == {
         "enable_thinking": False
     }
+
+
+def test_convert_reasoning_toggle_routes_through_family_mapping():
+    """The toggle goes through model_meta's per-family mapping -- for M3 that is
+    thinking_mode, not the (inert) enable_thinking key."""
+    req = ResponsesRequest.model_validate(
+        {"model": "m", "input": "hi", "reasoning": {"effort": "high"}}
+    )
+    spec = RP.convert_responses_to_genspec(req, {}, reasoning_parser="minimax_m3")
+    assert spec.chat_template_kwargs == {
+        "thinking_mode": "enabled", "reasoning_effort": "high",
+    }
+    off = ResponsesRequest.model_validate(
+        {"model": "m", "input": "hi", "reasoning": {"effort": "none"}}
+    )
+    spec = RP.convert_responses_to_genspec(off, {}, reasoning_parser="minimax_m3")
+    assert spec.chat_template_kwargs == {"thinking_mode": "disabled"}
+    # gpt-oss: the template grades effort and has no off gear
+    spec = RP.convert_responses_to_genspec(req, {}, reasoning_parser="gpt_oss")
+    assert spec.chat_template_kwargs == {"reasoning_effort": "high"}

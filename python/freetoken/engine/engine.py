@@ -125,6 +125,8 @@ def _resolve_auto_attention_backend(
         candidates.append(("dsv4_sparse", True))
     if required & {AttnType.MLA, AttnType.DSA}:
         candidates.append(("dsa", True))
+    if AttnType.BSA in required:
+        candidates.append(("m3_sparse", True))
     if AttnType.SWA in required:
         candidates.append(("triton", True))
     if AttnType.FULL in required:
@@ -173,7 +175,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
         if missing:
             valid = [
                 name
-                for name in ("fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse")
+                for name in ("fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse")
                 if required <= attention_backend_info(name).supported_types
             ]
             missing_names = "/".join(sorted(t.value for t in missing))
@@ -253,6 +255,13 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = t
         elif param.dtype.is_floating_point or param.dtype.is_complex:
             state_dict[key] = torch.randn(param.shape, dtype=param.dtype, device=device)
+        elif param.dtype == torch.uint8 and key.endswith("weight_scale_inv"):
+            # MXFP8 e8m0 exponent codes: 127 encodes scale 1.0; zeros would collapse
+            # every scale to 2^-127 and zero the model. Scoped BY NAME: other uint8
+            # buffers are packed payloads whose bytes mean something else entirely
+            # (GGUF qweight blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
+            # keep the benign all-zeros fill below.
+            state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
         else:
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
     return state_dict
@@ -1154,6 +1163,26 @@ def _adjust_config(config: EngineConfig):
     # lists, then validate whatever is now selected (explicit or auto) -- every
     # comma part must serve every required type, with packages/arch available.
     required_attn_types = _required_attn_types(model_config)
+    _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
+    if AttnType.BSA in required_attn_types and _dtype is not None and _dtype.itemsize != 2:
+        # Reject at config time: the BSA pool's own assert only fires after the
+        # model is resident (and not at all under `python -O`).
+        raise ValueError(
+            f"--dtype {config.dtype}: block-sparse attention serves 16-bit "
+            "compute only (the index slab budgets 2 bytes/token); use bfloat16 "
+            "or float16."
+        )
+    if _dtype == torch.float16 and "mxfp8" in (
+        getattr(model_config, "attn_quant", "none"),
+        getattr(model_config, "dense_quant", "none"),
+    ):
+        # The MXFP8 GEMV folds the pow2-descaled fp8 weight into the activation
+        # dtype; fp16's narrow exponent can overflow/flush what bf16 represents
+        # exactly, and the combination was never numerically validated.
+        raise ValueError(
+            "--dtype float16 with MXFP8 resident weights is unsupported (the "
+            "W8A16 fold is only validated exact in bfloat16); use bfloat16."
+        )
     if config.attention_backend == "auto":
         override(
             "attention_backend",
@@ -1165,6 +1194,36 @@ def _adjust_config(config: EngineConfig):
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
         override("moe_cache_size", math.ceil(total_experts * config.moe_cache_rate))
+
+    # The CPU MoE executor supports the silu/gelu family plus the clamped
+    # swigluoai (csrc ActKind; "gpt_oss_swiglu" rides inside the mxfp4 kernel and
+    # swigluoai the generic GEMV epilogue). A model with any other expert
+    # activation cannot decode on the CPU: reject an explicit cpu/hybrid pick at
+    # config time, and keep auto from upgrading offload -> hybrid off the profile.
+    _cpu_moe_acts = (
+        "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
+    )
+    # hidden_act (the dense activation) stands proxy for the expert activation --
+    # true for every in-tree model. mxfp4 experts pass regardless: their act runs
+    # inside the mxfp4 kernel, not the generic epilogue.
+    _cpu_moe_act_ok = getattr(model_config, "hidden_act", "silu") in _cpu_moe_acts or (
+        getattr(model_config, "moe_weight_format", None) == "mxfp4"
+    )
+    if (
+        is_moe
+        and not _cpu_moe_act_ok
+        and (config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers)
+    ):
+        asked = (
+            f"--moe-cpu-layers={config.moe_cpu_layers!r}"
+            if config.moe_backend not in ("cpu", "hybrid")
+            else f"--moe-backend {config.moe_backend!r}"
+        )
+        raise ValueError(
+            f"{asked}: the CPU MoE executor does not support this model's expert "
+            f"activation {getattr(model_config, 'hidden_act', None)!r}; drop the flag "
+            "and let every layer decode on the GPU offload path instead."
+        )
 
     if is_moe and config.moe_backend == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
@@ -1188,10 +1247,29 @@ def _adjust_config(config: EngineConfig):
 
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
         if load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid":
-            default_backend = "hybrid"
-            logger.info_rank0(
-                f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
-            )
+            from freetoken.moe.cpu_executor import compiled_extension_supports
+
+            _act = getattr(model_config, "hidden_act", "silu")
+            if not _cpu_moe_act_ok:
+                logger.info_rank0(
+                    f"benchbw profile recommends hybrid, but the CPU MoE executor does not "
+                    f"support this model's expert activation "
+                    f"{getattr(model_config, 'hidden_act', None)!r}; staying on offload"
+                )
+            elif moe_wfmt != "mxfp4" and not compiled_extension_supports(_act):
+                # Stale prebuilt _cpu_moe.so: an explicit cpu/hybrid pick still
+                # hard-fails in the executor, but a default must not turn into a
+                # post-load crash -- degrade to offload.
+                logger.info_rank0(
+                    f"benchbw profile recommends hybrid, but the compiled _cpu_moe "
+                    f"extension predates activation {_act!r} (rebuild with "
+                    f"`python setup.py build_ext --inplace`); staying on offload"
+                )
+            else:
+                default_backend = "hybrid"
+                logger.info_rank0(
+                    f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
+                )
         override("moe_backend", default_backend)
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
 

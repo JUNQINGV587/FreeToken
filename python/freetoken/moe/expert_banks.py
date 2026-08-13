@@ -178,7 +178,8 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     backend = None
     if not native:
         backend = select_nvfp4_backend(device, getattr(model_config, "moe_intermediate_size", None),
-                                       getattr(model_config, "nvfp4_backend", "auto"))
+                                       getattr(model_config, "nvfp4_backend", "auto"),
+                                       activation=getattr(model_config, "hidden_act", "silu"))
         native = backend == "triton"
 
     repack_sink = None

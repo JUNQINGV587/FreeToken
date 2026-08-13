@@ -26,6 +26,11 @@ from freetoken.utils.arch import is_sm90_supported
 SILU = 0
 GELU = 1
 GELU_TANH = 2
+# SwiGLU-OAI (gpt-oss / MiniMax-M3 "swigluoai"), UNINTERLEAVED halves (gate [:d],
+# up [d:], matching this file's *_and_mul layout -- the interleaved gpt-oss bank
+# variant lives in triton/mxfp4_moe.py):
+#   y = clamp(gate, max=limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)
+SWIGLUOAI = 3
 
 _SQRT_2_OVER_PI = 0.7978845608028654  # sqrt(2/pi)
 _GELU_C = 0.044715
@@ -64,6 +69,8 @@ def _act_and_mul_kernel(
     out_ptr,
     x_ptr,
     d,
+    alpha,
+    limit,
     ACT: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -88,18 +95,30 @@ def _act_and_mul_kernel(
 
     if ACT == 0:  # SILU: x / (1 + exp(-x)) via ex2.approx
         act = gate / (1.0 + _fast_ex2(-gate * _LOG2E))
+        y = act * up
     elif ACT == 2:  # GELU_TANH via tanh.approx
         inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
         act = 0.5 * gate * (1.0 + _fast_tanh(inner))
+        y = act * up
+    elif ACT == 3:  # SWIGLUOAI: clamped gate/up, sigmoid(alpha*gate), (up + 1) bias
+        gate = tl.minimum(gate, limit)
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
+        y = act * (up + 1.0)
     else:  # GELU (erf)
         act = 0.5 * gate * (1.0 + libdevice.erf(gate * 0.7071067811865476))
-
-    y = act * up
+        y = act * up
     out_row = out_ptr + row * d
     tl.store(out_row + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def _act_and_mul(kind: int, x: torch.Tensor, out: torch.Tensor | None):
+def _act_and_mul(
+    kind: int,
+    x: torch.Tensor,
+    out: torch.Tensor | None,
+    alpha: float = 0.0,
+    limit: float = 0.0,
+):
     assert x.is_cuda and x.is_contiguous()
     d = x.shape[-1] // 2
     out_shape = x.shape[:-1] + (d,)
@@ -115,7 +134,7 @@ def _act_and_mul(kind: int, x: torch.Tensor, out: torch.Tensor | None):
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
     )
     return out
@@ -133,4 +152,18 @@ def gelu_tanh_and_mul(x: torch.Tensor, out: torch.Tensor | None = None) -> torch
     return _act_and_mul(GELU_TANH, x, out)
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
+def swigluoai_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    alpha: float = 1.702,
+    limit: float = 7.0,
+) -> torch.Tensor:
+    """SwiGLU-OAI over UNINTERLEAVED halves (gate ``x[..., :d]``, up ``x[..., d:]``):
+    ``clamp(gate, max=limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``.
+    Same math as gpt-oss's interleaved ``gpt_oss_swiglu_kernel``; this layout matches
+    the [gate; up] halves the NVFP4 expert banks and merged gate_up projections use."""
+    return _act_and_mul(SWIGLUOAI, x, out, alpha=alpha, limit=limit)
+
+
+__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", "swigluoai_and_mul"]

@@ -40,4 +40,20 @@ def gelu_tanh_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     return gelu_tanh_and_mul(x, out=out)
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
+def swigluoai_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    alpha: float = 1.702,
+    limit: float = 7.0,
+):
+    """SwiGLU-OAI (gpt-oss / MiniMax-M3 ``swigluoai``) over UNINTERLEAVED halves
+    (gate ``x[..., :d]``, up ``x[..., d:]``): ``clamp(gate, max=limit) *
+    sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``. Always the in-repo Triton
+    kernel (flashinfer ships no clamped-swiglu *_and_mul)."""
+    from freetoken.kernel.triton.activation import swigluoai_and_mul
+
+    return swigluoai_and_mul(x, out=out, alpha=alpha, limit=limit)
+
+
+__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", "swigluoai_and_mul"]

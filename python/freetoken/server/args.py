@@ -128,6 +128,10 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
+        # M3 first: its marker also contains the bare "minimax" substring, but the
+        # namespaced tool grammar is a different protocol from M2's.
+        if "minimax_m3" in marker or "minimax-m3" in marker or "minimaxm3" in marker:
+            return "minimax_m3"
         if "minimax" in marker:
             return "minimax"
         if "gemma4" in marker:
@@ -177,6 +181,10 @@ def parse_args(
             return "qwen3"
         if "glm" in marker:
             return "glm"
+        # M3 first ("minimax" is a substring): <mm:think> tags + 3 thinking gears,
+        # not M2's always-on implicit <think>.
+        if "minimax_m3" in marker or "minimax-m3" in marker or "minimaxm3" in marker:
+            return "minimax_m3"
         if "minimax" in marker:
             return "minimax"
         if "gemma4" in marker:
@@ -407,6 +415,7 @@ def parse_args(
             "gemma4",
             "glm47",
             "minimax",
+            "minimax_m3",
             "gpt_oss",
             "gpt-oss",
         ],
@@ -417,11 +426,15 @@ def parse_args(
         "--reasoning-parser",
         type=str,
         default="auto",
-        choices=["auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm", "minimax", "gemma4"],
+        choices=[
+            "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
+            "minimax", "minimax_m3", "gemma4",
+        ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
             "for OpenAI responses. 'auto' selects per model family (gpt-oss Harmony, "
-            "<think> for qwen3/glm/minimax, gemma thought, dsv4); 'off' disables it."
+            "<think> for qwen3/glm/minimax, <mm:think> for minimax-m3, gemma thought, "
+            "dsv4); 'off' disables it."
         ),
     )
 

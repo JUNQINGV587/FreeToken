@@ -22,6 +22,10 @@ def think_spec(reasoning_parser: str | None) -> Tuple[Tuple[str, ...], str | Non
         return ("off", "on", "max"), "off"  # thinking on/off + a max-effort gear
     if reasoning_parser == "minimax":
         return ("on",), "on"  # template always opens a think block; no off path
+    if reasoning_parser == "minimax_m3":
+        # M3's template takes thinking_mode disabled/adaptive/enabled; adaptive
+        # (the template's own default) lets the model decide per turn.
+        return ("off", "adaptive", "on"), "adaptive"
     if reasoning_parser == "gemma4":
         return ("off", "on"), "off"  # gemma's template defaults thinking off
     if reasoning_parser in ("qwen3", "glm"):
@@ -41,7 +45,26 @@ def think_chat_template_kwargs(reasoning_parser: str | None, gear: str | None) -
         return {"enable_thinking": gear == "on"}
     if reasoning_parser == "minimax":
         return {}  # always thinks; its template reads no knob
+    if reasoning_parser == "minimax_m3":
+        mode = {"off": "disabled", "adaptive": "adaptive", "on": "enabled"}[gear]
+        return {"thinking_mode": mode}
     return {"enable_thinking": gear == "on"}  # qwen3, glm, gemma4
+
+
+def think_toggle_kwargs(reasoning_parser: str | None, enabled: bool) -> dict:
+    """``chat_template_kwargs`` for a protocol-level thinking on/off toggle
+    (Anthropic ``thinking.type``, Responses ``reasoning.effort``), routed through
+    the same per-family mapping as the chat-completions gears -- a hardcoded
+    ``enable_thinking`` is inert for templates that read a different knob (M3's
+    ``thinking_mode``). A family without the requested direction returns ``{}``;
+    with no configured parser the protocol-generic key is kept."""
+    gears, _default = think_spec(reasoning_parser)
+    if not gears:
+        return {"enable_thinking": enabled}
+    gear = "on" if enabled else "off"
+    if gear not in gears:
+        return {}
+    return think_chat_template_kwargs(reasoning_parser, gear)
 
 
 def moe_total_experts(config: Any) -> int:

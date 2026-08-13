@@ -1,4 +1,4 @@
-from .activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+from .activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul, swigluoai_and_mul
 from .base import BaseOP, OPList, StateLessOP
 from .embedding import ParallelLMHead, VocabParallelEmbedding
 from .linear import (
@@ -9,13 +9,20 @@ from .linear import (
     LinearRowParallel,
 )
 from .moe import MoELayer, OffloadMoELayer, make_moe_layer
-from .norm import GemmaRMSNorm, RMSNorm, RMSNormFused
+from .norm import (
+    GemmaPlusOneRMSNorm,
+    GemmaPlusOneRMSNormFused,
+    GemmaRMSNorm,
+    RMSNorm,
+    RMSNormFused,
+)
 from .rotary import get_rope, set_rope_device
 
 __all__ = [
     "silu_and_mul",
     "gelu_and_mul",
     "gelu_tanh_and_mul",
+    "swigluoai_and_mul",
     "BaseOP",
     "StateLessOP",
     "OPList",
@@ -28,6 +35,8 @@ __all__ = [
     "RMSNorm",
     "RMSNormFused",
     "GemmaRMSNorm",
+    "GemmaPlusOneRMSNorm",
+    "GemmaPlusOneRMSNormFused",
     "get_rope",
     "set_rope_device",
     "LinearReplicated",

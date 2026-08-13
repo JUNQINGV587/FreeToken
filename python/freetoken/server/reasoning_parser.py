@@ -411,6 +411,126 @@ class ThinkReasoningParser(BaseReasoningParser):
         )
 
 
+class MiniMaxM3ReasoningParser(BaseReasoningParser):
+    """Reasoning parser for MiniMax-M3's ``<mm:think>...</mm:think>`` protocol.
+
+    M3's template has three thinking modes: "enabled" pre-opens ``<mm:think>`` at
+    the generation prompt (the model emits only the closing tag -- the caller
+    passes ``force_reasoning=True``), "adaptive" leaves the model to open the tag
+    itself, and "disabled" pre-closes it (no reasoning). The tool block's
+    namespaced opener ends reasoning when a (malformed) turn skips
+    ``</mm:think>`` and runs straight into a tool call (dsv4 precedent).
+
+    Adaptive quirk (matches vLLM / llama.cpp): a NON-thinking adaptive turn
+    starts with a bare ``</mm:think>`` written by the model itself ("thinking
+    off for this turn"). Without special handling that literal marker would
+    stream into content on the DEFAULT gear's most common path, so a single
+    leading closer (whitespace-tolerant head: the detokenizer may open with a
+    newline before the marker; anything else before a closer keeps it visible)
+    is stripped in both one-shot and streaming modes -- never when
+    ``force_reasoning`` is set, where the closer genuinely terminates the
+    template-opened think block.
+    """
+
+    THINK_START = "<mm:think>"
+    THINK_END = "</mm:think>"
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            think_start_token=self.THINK_START,
+            think_end_token=self.THINK_END,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="]<]minimax[>[<tool_call>",
+        )
+        # Streaming state for the leading-bare-closer check: hold the head of the
+        # stream while it is still a prefix of ``</mm:think>``.
+        self._leading_closer_pending = not force_reasoning
+        self._head_buffer = ""
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        """One-shot parse, positional and verbatim, matching the streaming path:
+        reasoning is anchored at the first opener the model wrote, prose before
+        it stays content, later marker occurrences are data, and nothing is
+        whitespace-trimmed. (The base one-shot relabels prose before a
+        mid-content opener and strips both sides -- wrong for this grammar.)"""
+        end = self.think_end_token
+        if self.force_reasoning:
+            # enabled gear: the template pre-opened the think block.
+            reasoning, sep, rest = text.partition(end)
+            if sep:
+                return ReasoningParseResult(reasoning_text=reasoning, normal_text=rest)
+            # No closer: a malformed turn running straight into a tool block
+            # ends reasoning there (dsv4 precedent); else truncated reasoning.
+            if self.tool_start_token is not None and self.tool_start_token in text:
+                t = text.find(self.tool_start_token)
+                return ReasoningParseResult(
+                    reasoning_text=text[:t], normal_text=text[t:]
+                )
+            return ReasoningParseResult(reasoning_text=text)
+        # adaptive: a leading bare closer is "thinking off for this turn"
+        # (whitespace-tolerant head, same as streaming).
+        head = text.lstrip()
+        if head.startswith(end):
+            return ReasoningParseResult(normal_text=head[len(end) :])
+        start = text.find(self.think_start_token)
+        if start == -1:
+            return ReasoningParseResult(normal_text=text)
+        before = text[:start]
+        body = text[start + len(self.think_start_token) :]
+        reasoning, sep, rest = body.partition(end)
+        if sep:
+            return ReasoningParseResult(
+                reasoning_text=reasoning, normal_text=before + rest
+            )
+        if self.tool_start_token is not None and self.tool_start_token in body:
+            t = body.find(self.tool_start_token)
+            return ReasoningParseResult(
+                reasoning_text=body[:t], normal_text=before + body[t:]
+            )
+        return ReasoningParseResult(reasoning_text=body)
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        if self._leading_closer_pending:
+            self._head_buffer += new_text
+            # Whitespace-tolerant head: the detokenizer may open with a newline
+            # before the model's bare closer.
+            head = self._head_buffer.lstrip()
+            if head.startswith(self.think_end_token):
+                # Bare leading closer: strip it once, everything after is content.
+                self._leading_closer_pending = False
+                self._head_buffer = ""
+                self._in_reasoning = False
+                rest = head[len(self.think_end_token) :]
+                return (
+                    super().parse_streaming_increment(rest)
+                    if rest
+                    else ReasoningParseResult()
+                )
+            if not head or self.think_end_token.startswith(head):
+                return ReasoningParseResult()  # still a (whitespace+) prefix: hold
+            # Diverged: not a leading closer -- replay the held head as normal
+            # (whitespace included; it was real output).
+            replay, self._head_buffer = self._head_buffer, ""
+            self._leading_closer_pending = False
+            return super().parse_streaming_increment(replay)
+        return super().parse_streaming_increment(new_text)
+
+    def flush(self) -> ReasoningParseResult:
+        if self._leading_closer_pending and self._head_buffer:
+            # Stream ended while the head was still a closer prefix (e.g. "</mm:t"):
+            # it was never a bare closer, replay it before the base flush.
+            head, self._head_buffer = self._head_buffer, ""
+            self._leading_closer_pending = False
+            first = super().parse_streaming_increment(head)
+            rest = super().flush()
+            return ReasoningParseResult(
+                reasoning_text=first.reasoning_text + rest.reasoning_text,
+                normal_text=first.normal_text + rest.normal_text,
+            )
+        return super().flush()
+
+
 class GemmaThoughtReasoningParser(BaseReasoningParser):
     """Reasoning parser for Gemma-4's thought channel: the model emits its thought,
     then a closing ``<channel|>`` marker, then the visible answer. The opening
@@ -435,6 +555,7 @@ class ReasoningParser:
         "qwen3": ThinkReasoningParser,
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
+        "minimax_m3": MiniMaxM3ReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
     }
 

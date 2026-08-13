@@ -181,7 +181,10 @@ def _b12x_min_intermediate() -> int:
 
 
 def select_nvfp4_backend(
-    device: torch.device, intermediate_size: int | None = None, requested: str = "auto"
+    device: torch.device,
+    intermediate_size: int | None = None,
+    requested: str = "auto",
+    activation: str = "silu",
 ) -> str:
     """Pick the NVFP4 expert-GEMM backend for ``device`` (and, in ``auto``, ``intermediate_size``).
 
@@ -195,6 +198,11 @@ def select_nvfp4_backend(
     * ``marlin`` / ``flashinfer`` / ``triton`` -- force that backend (and its bank layout),
       raising if it cannot run rather than degrading.
 
+    ``activation`` is the model's routed-expert activation: the borrowed marlin/b12x
+    kernels hard-code silu (their fused epilogue), so any other activation (MiniMax-M3's
+    ``swigluoai``) resolves ``auto`` to the Triton kernels -- which dispatch the
+    activation as a separate elementwise op -- and rejects a forced marlin/flashinfer.
+
     Returns the internal backend name (``marlin`` / ``b12x`` / ``triton``); ``flashinfer``
     maps to ``b12x``.
     """
@@ -206,6 +214,18 @@ def select_nvfp4_backend(
             f"bad --nvfp4-backend={requested!r}; expected auto, marlin, flashinfer or triton"
         )
     if requested == "triton":
+        return "triton"
+    if activation != "silu":
+        if requested != "auto":
+            raise RuntimeError(
+                f"--nvfp4-backend={requested} only supports silu routed experts (its fused "
+                f"epilogue); this model's experts use {activation!r} -- use "
+                "--nvfp4-backend triton (or auto)."
+            )
+        logger.info(
+            f"NVFP4 auto backend: routed experts use {activation!r}, which only the "
+            "Triton kernels support; using the Triton inline-dequant kernels"
+        )
         return "triton"
     if requested == "marlin":
         if device.type != "cuda":

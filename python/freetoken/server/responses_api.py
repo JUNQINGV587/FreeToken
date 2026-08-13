@@ -152,7 +152,10 @@ async def handle_responses(
         return _error_response(400, "max_output_tokens must be a positive integer")
     default_max = getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
     try:
-        spec = convert_responses_to_genspec(req, model_sampling, default_max_tokens=default_max)
+        spec = convert_responses_to_genspec(
+            req, model_sampling, default_max_tokens=default_max,
+            reasoning_parser=getattr(state.config, "reasoning_parser", None),
+        )
         uid = await submit_generation(spec, state)
     except ValueError as exc:
         return _error_response(400, str(exc))
@@ -184,6 +187,7 @@ def convert_responses_to_genspec(
     req: ResponsesRequest,
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    reasoning_parser: str | None = None,
 ) -> GenSpec:
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
@@ -226,19 +230,19 @@ def convert_responses_to_genspec(
     else:
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
-    # Thinking toggle: an explicit chat_template_kwargs extra field wins; else the
-    # protocol-native `reasoning` object (codex sends {"effort": ...}) drives the
-    # template's thinking mode. effort "none" explicitly DISABLES thinking (vLLM
-    # maps it the same way); other/unset efforts enable it.
+    # Thinking toggle: an explicit chat_template_kwargs extra field wins; else
+    # the protocol-native `reasoning` object drives the template through the
+    # per-family mapping in model_meta. effort "none" disables thinking (vLLM
+    # semantics); other efforts enable it and are forwarded for templates that
+    # grade them (gpt-oss).
+    from .model_meta import think_toggle_kwargs
+
     ctk = dict(getattr(req, "chat_template_kwargs", None) or {})
     if req.reasoning and not ctk:
         effort = req.reasoning.get("effort")
-        if effort == "none":
-            ctk = {"enable_thinking": False}
-        else:
-            ctk = {"enable_thinking": True}
-            if effort:
-                ctk["reasoning_effort"] = effort
+        ctk = dict(think_toggle_kwargs(reasoning_parser, effort != "none"))
+        if effort and effort != "none":
+            ctk.setdefault("reasoning_effort", effort)
 
     return GenSpec(
         messages=render_messages(messages),

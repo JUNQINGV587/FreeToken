@@ -37,6 +37,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.minimax_m2",
         "MiniMaxM2ForCausalLM",
     ),
+    # MiniMax-M3 (model_type minimax_m3_vl): multimodal wrapper config (text tower in
+    # text_config, weights under language_model.); served text-only. GQA + block-sparse
+    # attention (lightning indexer, top-k 128-token blocks) on the trailing layers,
+    # sigmoid/bias-routed NVFP4 experts + MXFP8 shared expert, swigluoai activation.
+    "MiniMaxM3SparseForConditionalGeneration": ModelSpec(
+        "freetoken.models.minimax_m3",
+        "MiniMaxM3ForCausalLM",
+    ),
+    # Text-only sibling (the text_config's own architectures entry).
+    "MiniMaxM3SparseForCausalLM": ModelSpec(
+        "freetoken.models.minimax_m3",
+        "MiniMaxM3ForCausalLM",
+    ),
     "DeepseekV4ForCausalLM": ModelSpec(
         "freetoken.models.deepseek_v4",
         "DeepseekV4ForCausalLM",

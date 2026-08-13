@@ -54,9 +54,9 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
 
-# Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. "gpt_oss_swiglu"
-# is handled entirely inside the mxfp4 kernel (clamped swiglu + bias), so its id is a
-# placeholder that act_apply never sees.
+# Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
+# clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
+# "gpt_oss_swiglu" is the same math fused inside the mxfp4 kernel.
 _ACT_IDS = {
     "silu": 0,
     "swish": 0,
@@ -64,10 +64,28 @@ _ACT_IDS = {
     "gelu_tanh": 2,
     "gelu_pytorch_tanh": 2,
     "gpt_oss_swiglu": 3,
+    "swigluoai": 3,
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+
+
+def compiled_extension_supports(activation: str) -> bool:
+    """Whether the compiled ``_cpu_moe`` extension can serve ``activation``
+    through its generic epilogue. A stale prebuilt .so accepts newer act ids
+    while silently computing the wrong math; the executor hard-errors on that,
+    but the engine's auto offload->hybrid upgrade consults this first so a
+    default boot degrades to offload instead of crashing after weight load."""
+    if activation not in _ACT_IDS:
+        return False
+    if _ACT_IDS[activation] < 3:
+        return True
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        return False
+    return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
 
 
 def physical_core_cpus() -> list[int]:
@@ -150,6 +168,19 @@ class CpuMoeExecutor:
             )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
+        # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
+        # error and silently computes the wrong activation in the generic
+        # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
+        # handles its act inside the kernel and predates the marker.)
+        if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
+            supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
+            if _ACT_IDS[activation] > supported:
+                raise RuntimeError(
+                    f"the compiled _cpu_moe extension predates activation "
+                    f"{activation!r} (max generic act id {supported}); rebuild it "
+                    "with `python setup.py build_ext --inplace` (or reinstall the "
+                    "wheel) before serving this model on the cpu/hybrid backend."
+                )
 
         self.num_layers = int(cache.num_layers)
         self.num_experts = int(cache.num_experts)

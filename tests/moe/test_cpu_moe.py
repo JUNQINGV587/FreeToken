@@ -164,6 +164,94 @@ def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs):
     assert rel < 3e-2, f"nvfp4 bs={bs} rel err {rel.item()}"
 
 
+@pytest.mark.parametrize("bs", [1, 4])
+def test_cpu_decode_nvfp4_swigluoai_matches_dequant_reference(bs):
+    """MiniMax-M3's swigluoai routed experts on the CPU executor (ActKind 3 through
+    the generic NVFP4 GEMV epilogue, with the layer's alpha/limit scalars) vs. a
+    pure-torch dequant reference."""
+    from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(300 + bs)
+    L, E, H, I, top_k = 2, 16, 1024, 512, 4
+    layer = 1
+    alpha, limit = 1.702, 7.0
+    dev = torch.device("cuda")
+    cache = _make_nvfp4_cache(L, E, H, I, seed=17)
+
+    ex = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="swigluoai",
+        apply_router_weight_on_input=False,
+        num_threads=0,
+        max_tokens=bs,
+        device=dev,
+        swiglu_alpha=alpha,
+        swiglu_limit=limit,
+    )
+
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+
+    cpu_out = ex.decode(layer, hidden, w, ids).float()
+    torch.cuda.synchronize()
+
+    b = cache.bank_sources
+    slots = torch.arange(E, device=dev, dtype=torch.int32)
+    gate_up_layer = dequant_nvfp4(
+        b["gate_up_packed"][layer].to(dev), b["gate_up_scale"][layer].to(dev),
+        b["gate_up_global"][layer].to(dev), slots, dtype=torch.bfloat16,
+    ).float()  # [E, 2I, H]
+    down_layer = dequant_nvfp4(
+        b["down_packed"][layer].to(dev), b["down_scale"][layer].to(dev),
+        b["down_global"][layer].to(dev), slots, dtype=torch.bfloat16,
+    ).float()  # [E, H, I]
+
+    ref = torch.zeros(bs, H, device=dev, dtype=torch.float32)
+    x = hidden.float()
+    for t in range(bs):
+        for k in range(top_k):
+            e = int(ids[t, k])
+            h = gate_up_layer[e] @ x[t]
+            gate = h[:I].clamp(max=limit)
+            up = h[I:].clamp(-limit, limit)
+            act = gate * torch.sigmoid(gate * alpha) * (up + 1.0)
+            ref[t] += float(w[t, k]) * (down_layer[e] @ act)
+
+    rel = (cpu_out - ref).abs().max() / (ref.abs().max() + 1e-6)
+    assert rel < 3e-2, f"nvfp4 swigluoai bs={bs} rel err {rel.item()}"
+
+
+def test_stale_extension_rejected_for_swigluoai(monkeypatch):
+    """A prebuilt _cpu_moe.so from before ACT_SWIGLUOAI accepts act id 3 without
+    error and silently computes the wrong activation in the generic epilogue.
+    The executor probes the extension's `max_generic_act_id` marker -- absent on
+    stale builds -- and must fail loudly with the rebuild instruction."""
+    from freetoken.kernel import _cpu_moe
+    from freetoken.moe.cpu_executor import CpuMoeExecutor, compiled_extension_supports
+
+    # raising=False: on a GENUINELY stale extension the attribute is already
+    # absent, and this test must still run (it is the test for that case).
+    monkeypatch.delattr(_cpu_moe, "max_generic_act_id", raising=False)
+    assert not compiled_extension_supports("swigluoai")
+    assert compiled_extension_supports("silu")  # silu family predates the marker
+    cache = _make_nvfp4_cache(1, 4, 256, 128)
+    with pytest.raises(RuntimeError, match="rebuild"):
+        CpuMoeExecutor(
+            cache, top_k=2, activation="swigluoai",
+            apply_router_weight_on_input=False, num_threads=0, max_tokens=1,
+            device=torch.device("cuda"), swiglu_alpha=1.702, swiglu_limit=7.0,
+        )
+    # silu predates the marker and must keep working on a stale build.
+    CpuMoeExecutor(
+        cache, top_k=2, activation="silu",
+        apply_router_weight_on_input=False, num_threads=0, max_tokens=1,
+        device=torch.device("cuda"),
+    )
+
+
 def _pack_mxfp4_transposed(codes: torch.Tensor) -> torch.Tensor:
     """Pack [S, K, N] codes -> transposed blocks [S, K//2, N] (low nibble = even K)."""
     lo = codes[:, 0::2, :]

@@ -57,6 +57,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .dsa_pool import MLAKVCache
 
         return MLAKVCache
+    if AttnType.BSA in types:
+        from .bsa_pool import BSAKVCache
+
+        return BSAKVCache
     from .mha_pool import MHAKVCache
 
     return MHAKVCache
@@ -148,6 +152,28 @@ def create_kvcache_pool(
     # spec carries indexer dims. The same spec fields drive the KV cost model, so the
     # factory and the budget can never disagree.
     kv_specs = model_config.kv_cache_group_specs()
+
+    # GQA block-sparse (MiniMax-M3): one full-attention group carrying the index dims
+    # with mla=False -> the MHA pool plus the index-key slab. The same spec fields
+    # drive the KV cost model, so the factory and the budget can never disagree.
+    from freetoken.attention import AttnType as _AttnType
+
+    if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.BSA:
+        from .bsa_pool import BSAKVCache
+
+        spec = kv_specs[0]
+        return BSAKVCache(
+            num_kv_heads=spec.num_kv_heads,
+            num_layers=model_config.num_layers,
+            head_dim=spec.head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            index_head_dim=spec.index_head_dim,
+            num_index_layers=spec.num_index_layers,
+        )
+
     if len(kv_specs) == 1 and kv_specs[0].mla:
         from .dsa_pool import DSAKVCache, MLAKVCache
 

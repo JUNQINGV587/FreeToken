@@ -466,7 +466,13 @@ class OffloadMoELayer(MoELayer):
         if fmt == "nvfp4":
             # FreeToken's Triton inline-dequant kernels over the native ModelOpt
             # rows: the FP4 banks are read directly in the GEMM, no BF16 copy of
-            # the experts is ever materialized.
+            # the experts is ever materialized. The swigluoai scalars (MiniMax-M3)
+            # live on the layer via make_moe_layer's extra_attrs (gpt-oss precedent)
+            # and are ignored by the plain *_and_mul activations.
+            act_alpha = getattr(self, "hidden_act_alpha", 1.702)
+            act_limit = getattr(self, "swiglu_limit", None)
+            # None == "no clamp" everywhere else in the repo (mxfp4 maps it to +inf).
+            act_limit = float("inf") if act_limit is None else act_limit
             if is_prefill:
                 from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
 
@@ -478,6 +484,8 @@ class OffloadMoELayer(MoELayer):
                     n,
                     self.activation,
                     self.apply_router_weight_on_input,
+                    act_alpha,
+                    act_limit,
                 )
             # Marlin-style int32 wide-load GEMV (arithmetic dequant, no HW cvt).
             # Bit-identical to the byte-at-a-time path; lifts gate/up BW ~43%->51%
@@ -492,6 +500,8 @@ class OffloadMoELayer(MoELayer):
                 topk_ids,
                 self.activation,
                 self.apply_router_weight_on_input,
+                act_alpha,
+                act_limit,
             )
         if fmt == "fp8_block":
             # Block-fp8 experts: fused inline-dequant grouped GEMM reads the routed fp8 rows

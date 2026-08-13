@@ -267,6 +267,25 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         aliases=("MiniMaxAI/MiniMax-M2.5",),
     ),
     AotModel(
+        # GQA block-sparse (BSA): the BSAKVCache stores K/V through store_cache
+        # (4 kv heads x 128 head_dim), the index-key slab writes via torch scatter.
+        # Routed experts are NVFP4 with swigluoai, which restricts the expert GEMM
+        # to the Triton kernels -- but the banks keep the native "nvfp4" layout,
+        # so its bank rows are what fast_index_copy sees.
+        # The upstream MiniMaxAI/MiniMax-M3 alias covers the attention/embedding
+        # shapes only: its experts are MXFP8, which has no expert-bank provider on
+        # main -- the NVFP4 release is the servable offload path (M2.5 precedent).
+        name="nvidia/MiniMax-M3-NVFP4",
+        architecture="MiniMaxM3SparseForConditionalGeneration",
+        hidden_size=6144,
+        kv_groups=((4, 128),),
+        top_k=4,
+        moe_intermediate_size=3072,
+        expert_formats=("nvfp4",),
+        aliases=("MiniMaxAI/MiniMax-M3",),
+        arch_aliases=("MiniMaxM3SparseForCausalLM",),
+    ),
+    AotModel(
         name="deepseek-ai/DeepSeek-V4-Flash",
         architecture="DeepseekV4ForCausalLM",
         hidden_size=4096,

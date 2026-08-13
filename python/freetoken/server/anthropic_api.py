@@ -113,7 +113,10 @@ async def handle_anthropic_messages(
     model_sampling: dict[str, Any],
 ):
     try:
-        spec = convert_anthropic_to_genspec(req, model_sampling)
+        spec = convert_anthropic_to_genspec(
+            req, model_sampling,
+            reasoning_parser=getattr(state.config, "reasoning_parser", None),
+        )
         uid = await submit_generation(spec, state)
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
@@ -145,7 +148,9 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     # a checkpoint whose chat template raises ValueError is a server fault, not a bad request,
     # so it must not fall into the convert/empty-prompt ValueError branch.
     try:
-        messages, template_tools, _, ctk = convert_anthropic_prompt(req)
+        messages, template_tools, _, ctk = convert_anthropic_prompt(
+            req, reasoning_parser=getattr(state.config, "reasoning_parser", None)
+        )
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
     if not messages:
@@ -172,6 +177,7 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
 # --------------------------------------------------------------------------- #
 def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+    reasoning_parser: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
@@ -278,23 +284,29 @@ def convert_anthropic_prompt(
         selected = req.tool_choice.name if (req.tool_choice and req.tool_choice.type == "tool") else None
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
-    # Native extended-thinking toggle -> template kwargs: "enabled" turns thinking
-    # on for templates that default it off (gemma4); an explicit "disabled" is
-    # forwarded so templates that default ON can honor it.
+    # Native extended-thinking toggle -> template kwargs, through the per-family
+    # mapping in model_meta (a bare enable_thinking bool is inert for templates
+    # that read a different knob, e.g. M3's thinking_mode).
+    from .model_meta import think_toggle_kwargs
+
     ctk: dict[str, Any] = {}
     if req.thinking:
         if req.thinking.get("type") == "enabled":
-            ctk = {"enable_thinking": True}
+            ctk = think_toggle_kwargs(reasoning_parser, True)
         elif req.thinking.get("type") == "disabled":
-            ctk = {"enable_thinking": False}
+            ctk = think_toggle_kwargs(reasoning_parser, False)
 
     return render_messages(messages), template_tools, parser_tools, ctk
 
 
 def convert_anthropic_to_genspec(
-    req: AnthropicMessagesRequest, model_sampling: dict[str, Any]
+    req: AnthropicMessagesRequest,
+    model_sampling: dict[str, Any],
+    reasoning_parser: str | None = None,
 ) -> GenSpec:
-    messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(req)
+    messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
+        req, reasoning_parser=reasoning_parser
+    )
     return GenSpec(
         messages=messages,
         sampling_params=resolve_sampling(

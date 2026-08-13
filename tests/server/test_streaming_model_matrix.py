@@ -80,6 +80,13 @@ CALL_BLOCKS = {
         '<minimax:tool_call><invoke name="read"><parameter name="filePath">'
         "/tmp/test_calc.py</parameter></invoke></minimax:tool_call>"
     ),
+    "minimax_m3": (
+        "]<]minimax[>[<tool_call>\n"
+        ']<]minimax[>[<invoke name="read">'
+        "]<]minimax[>[<filePath>/tmp/test_calc.py]<]minimax[>[</filePath>"
+        "]<]minimax[>[</invoke>\n"
+        "]<]minimax[>[</tool_call>"
+    ),
     "mistral": '[TOOL_CALLS] [{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}]',
     "llama3": '<|python_tag|>{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}',
     "gpt_oss": (
@@ -96,6 +103,7 @@ MARKUP_MARKERS = {
     "glm47": ["<arg_key>", "<arg_value>", "</tool_call>"],
     "gemma4": ["<|tool_call>", "<tool_call|>"],
     "minimax": ["<minimax:tool_call>", "<invoke"],
+    "minimax_m3": ["]<]minimax[>[", "<invoke"],
     "mistral": ["[TOOL_CALLS]"],
     "llama3": ["<|python_tag|>"],
     "gpt_oss": ["<|channel|>", "to=functions."],
@@ -110,6 +118,9 @@ REASONING_FAMILIES = {
     "qwen": ("qwen25", "qwen3", "", "</think>"),
     "glm4.7": ("glm47", "glm", "", "</think>"),
     "minimax-m2": ("minimax", "minimax", "", "</think>"),
+    # M3 adaptive mode: the model opens <mm:think> itself (enabled mode pre-opens it
+    # in the template; the parser then runs with force_reasoning=True instead).
+    "minimax-m3": ("minimax_m3", "minimax_m3", "<mm:think>", "</mm:think>"),
     "gemma4": ("gemma4", "gemma4", "<|channel>thought\n", "<channel|>"),
     "gpt-oss": ("gpt_oss", "gpt_oss", None, None),  # harmony channels; custom fixture
 }
@@ -629,7 +640,9 @@ def test_empty_arguments_call_emitted_exactly_once(tool, block):
 
 
 @pytest.mark.parametrize(
-    "family", ["qwen25", "qwen3_coder", "glm47", "gemma4", "minimax", "deepseekv32", "gpt_oss"]
+    "family",
+    ["qwen25", "qwen3_coder", "glm47", "gemma4", "minimax", "minimax_m3",
+     "deepseekv32", "gpt_oss"],
 )
 def test_call_then_trailing_text_in_one_chunk_keeps_order(family):
     # Worst case: the whole generation arrives as ONE chunk. Text after the call

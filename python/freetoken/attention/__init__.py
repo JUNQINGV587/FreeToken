@@ -116,6 +116,22 @@ def create_dsa_backend(config: ModelConfig):
     return DSAAttnBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "m3_sparse",
+    BackendInfo(
+        supported_types=frozenset({AttnType.BSA}),
+        # One KV page == one 128-token sparse block: the top-k block ids ARE page
+        # indices and the block-base-row addressing needs page-aligned 128-row runs.
+        # Config-time resolution coerces any other page size here.
+        page_sizes=(128,),
+    ),
+)
+def create_m3_sparse_backend(config: ModelConfig):
+    from .m3_sparse import M3SparseAttnBackend
+
+    return M3SparseAttnBackend(config)
+
+
 def attention_backend_info(name: str) -> BackendInfo:
     return SUPPORTED_ATTENTION_BACKENDS.info(name)
 

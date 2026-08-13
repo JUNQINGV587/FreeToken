@@ -64,6 +64,9 @@ def _model_config(kind):
     elif kind == "dsv4":
         mc.dsv4_args = SimpleNamespace(window_size=128)
         specs = (_spec("dsv4", AttnType.DSV4, sliding_window=128),)
+    elif kind == "bsa":
+        # MiniMax-M3 shape: one FULL-family group, mla=False + index dims -> BSA.
+        specs = (_spec("full", AttnType.BSA, index_head_dim=128),)
     elif kind == "linear_hybrid":
         mc.has_linear_attention = True
         specs = (_spec("full", AttnType.FULL),)
@@ -105,6 +108,7 @@ def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
         ("mla", "dsa"),  # plain latent MLA
         ("dsa", "dsa"),  # MLA + DSA indexer (GLM-5.2 shape)
         ("dsv4", "dsv4_sparse"),
+        ("bsa", "m3_sparse"),  # MiniMax-M3 block-sparse GQA
     ],
 )
 def test_auto_resolves_per_type(monkeypatch, kind, expected):
@@ -114,6 +118,29 @@ def test_auto_resolves_per_type(monkeypatch, kind, expected):
     config = _config(kind, attention_backend="auto")
     _adjust_config(config)
     assert config.attention_backend == expected
+
+
+def test_auto_bsa_sets_block_page_size(monkeypatch):
+    # m3_sparse declares page_sizes=(128,): one KV page == one sparse block, and
+    # config-time resolution must coerce the page size to match.
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("bsa", attention_backend="auto")
+    _adjust_config(config)
+    assert config.page_size == 128
+
+
+def test_bsa_rejects_float32_dtype(monkeypatch):
+    # --dtype float32 used to pass config validation and die on the pool's
+    # itemsize==2 assert only after the model was resident.
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("bsa", attention_backend="auto")
+    object.__setattr__(config, "dtype", torch.float32)
+    with pytest.raises(ValueError, match="16-bit"):
+        _adjust_config(config)
 
 
 def test_auto_dsv4_sets_window_page_size(monkeypatch):
@@ -131,7 +158,11 @@ def test_auto_dsv4_sets_window_page_size(monkeypatch):
         # reverse gates: type-specific backends on models without the type
         ("full", "dsa"),
         ("full", "dsv4_sparse"),
+        ("full", "m3_sparse"),
         ("swa", "dsa"),
+        # forward gates: generic backends on the BSA-locked model
+        ("bsa", "fi"),
+        ("bsa", "triton"),
         # forward gates: generic backends on type-locked models
         ("mla", "fi"),
         ("mla", "triton"),

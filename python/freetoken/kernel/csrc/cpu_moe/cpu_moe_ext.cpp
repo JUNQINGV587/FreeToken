@@ -67,7 +67,11 @@ inline bf16_t f32_to_bf16(float f) {
   return static_cast<bf16_t>(u >> 16);
 }
 
-enum ActKind { ACT_SILU = 0, ACT_GELU = 1, ACT_GELU_TANH = 2 };
+// ACT_SWIGLUOAI is the clamped (up + 1) swiglu (gpt-oss "swigluoai" /
+// MiniMax-M3): gate/up are combined jointly with the runtime alpha/limit
+// scalars, so it is handled in the do_pass1 epilogue (act_apply never sees it;
+// the mxfp4 kernel additionally fuses its own copy of the same math).
+enum ActKind { ACT_SILU = 0, ACT_GELU = 1, ACT_GELU_TANH = 2, ACT_SWIGLUOAI = 3 };
 
 inline float act_apply(int act, float x) {
   if (act == ACT_SILU) return x / (1.0f + std::exp(-x));
@@ -1600,13 +1604,25 @@ struct CpuMoeExecutor {
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
+    const bool swigluoai = act == ACT_SWIGLUOAI;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
-      const float gate =
+      float gate =
           gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
-      const float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
-                                 xe, xo, xi8, xas) * w_in;
-      g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+      float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
+                           xe, xo, xi8, xas) * w_in;
+      if (swigluoai) {
+        // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + 1)
+        // -- same math as the mxfp4 kernel's fused epilogue (lim == +inf: no clamp).
+        if (gate > lim) gate = lim;
+        if (up > lim) up = lim;
+        else if (up < -lim) up = -lim;
+        const float glu = gate / (1.0f + std::exp(-gate * alpha));
+        g_row[i] = f32_to_bf16(glu * (up + 1.0f));
+      } else {
+        g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+      }
     }
   }
 
@@ -2124,4 +2140,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("ready_addr"), py::arg("slot"));
   m.def("memop_sync", &cumemop_sync, py::arg("stream"), py::arg("done_addr"),
         py::arg("slot"));
+  // ABI capability marker: the highest ActKind this build implements in the
+  // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act
+  // id the epilogue must handle -- a prebuilt .so from before ACT_SWIGLUOAI
+  // accepts id 3 without error and silently computes the wrong activation
+  // (act_apply falls through to gelu_tanh); the probe turns a stale extension
+  // into a loud rebuild instruction instead of wrong model outputs.
+  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
 }

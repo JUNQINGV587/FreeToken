@@ -144,8 +144,11 @@ AttentionGroupConfig: TypeAlias = (
 
 
 def _full_group_attn_type(group: FullAttentionGroupConfig) -> AttnType:
-    # Mirrors the pool-factory split: mla + index slab -> DSAKVCache, mla -> MLAKVCache.
+    # Mirrors the pool-factory split: mla + index slab -> DSAKVCache, mla -> MLAKVCache,
+    # GQA (non-mla) + index slab -> BSAKVCache (MiniMax-M3 block-sparse attention).
     if not group.mla:
+        if group.index_head_dim > 0 and group.num_index_layers > 0:
+            return AttnType.BSA
         return AttnType.FULL
     if group.index_head_dim > 0 and group.num_index_layers > 0:
         return AttnType.DSA
@@ -234,6 +237,11 @@ class ModelConfig:
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
     glm_dsa_args: Any | None = None
+    # MiniMax-M3 (minimax_m3) payload (MiniMaxM3Args): the block-sparse indexer geometry
+    # (index heads/dim, top-k blocks, init/local blocks, sparse layer set) plus the
+    # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
+    # code; None for every other model.
+    m3_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

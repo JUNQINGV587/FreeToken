@@ -75,6 +75,78 @@ class GemmaRMSNorm(BaseOP):
         return x, residual
 
 
+class GemmaPlusOneRMSNorm(BaseOP):
+    """(1 + w)-scaled RMSNorm (Gemma semantics: the checkpoint stores ``scale - 1``
+    and the effective multiplier is ``1 + weight``, added in fp32 at runtime --
+    never folded into the bf16 weight, which would round away the precision the
+    format exists to keep). Used by MiniMax-M3 (``use_gemma_norm``) for the decoder
+    layernorms, the per-head q/k norms, and the indexer q/k norms.
+
+    Per-head 3D inputs are collapsed to 2D before the kernel call: flashinfer's
+    ``gemma_rmsnorm`` CUDA binding is CHECK_DIM(2) (it rejects 3D outright on
+    wheels without the CuTe path), and the per-head weight makes the 2D view
+    exactly equivalent. The M3 call sites pass contiguous buffers, so the views
+    are free; a non-contiguous 3D input is rejected rather than silently copied
+    (an in-place norm on a copy would be dropped).
+    """
+
+    def __init__(self, size: int, eps: float) -> None:
+        from freetoken.kernel.backend import is_flashinfer_installed
+
+        if is_flashinfer_installed():
+            from flashinfer.norm import gemma_rmsnorm
+        else:
+            from freetoken.kernel.triton.norm import gemma_rmsnorm
+
+        self.eps = eps
+        self.size = size
+        self.weight = torch.empty(size)
+        self.gemma_rmsnorm = gemma_rmsnorm
+
+    def _flat(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            return x
+        assert x.is_contiguous(), "per-head gemma norm needs a contiguous buffer"
+        return x.view(-1, self.size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gemma_rmsnorm(self._flat(x), self.weight, self.eps).view(x.shape)
+
+    def forward_inplace(self, x: torch.Tensor) -> None:
+        flat = self._flat(x)
+        self.gemma_rmsnorm(flat, self.weight, self.eps, out=flat)
+
+
+class GemmaPlusOneRMSNormFused(BaseOP):
+    """(1 + w)-scaled RMSNorm with the fused-add-residual API of ``RMSNormFused``
+    (Gemma semantics, see :class:`GemmaPlusOneRMSNorm`). Drop-in for the decoder
+    layernorm seam: ``forward(x, residual)`` returns ``(normed, residual)``."""
+
+    def __init__(self, size: int, eps: float) -> None:
+        from freetoken.kernel.backend import is_flashinfer_installed
+
+        if is_flashinfer_installed():
+            from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
+        else:
+            from freetoken.kernel.triton.norm import (
+                gemma_fused_add_rmsnorm,
+                gemma_rmsnorm,
+            )
+
+        self.eps = eps
+        self.weight = torch.empty(size)
+        self.gemma_rmsnorm = gemma_rmsnorm
+        self.gemma_fused_add_rmsnorm = gemma_fused_add_rmsnorm
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return self.gemma_rmsnorm(x, self.weight, self.eps), x
+        self.gemma_fused_add_rmsnorm(x, residual, self.weight, self.eps)
+        return x, residual
+
+
 class RMSNormFused(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
         from freetoken.kernel.backend import is_flashinfer_installed

@@ -21,10 +21,32 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
     _e2m1_lut,
     _prefill_nvfp4_moe_kernel,
 )
-from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+from freetoken.layers import (
+    gelu_and_mul,
+    gelu_tanh_and_mul,
+    silu_and_mul,
+    swigluoai_and_mul,
+)
 from freetoken.moe.fused import moe_align_block_size
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
+
+
+def _run_act(
+    activation: str,
+    gate_up: torch.Tensor,
+    out: torch.Tensor,
+    act_alpha: float,
+    act_limit: float,
+) -> None:
+    """gemm1 -> gemm2 activation dispatch. ``swigluoai`` (MiniMax-M3, clamped
+    gpt-oss swiglu over the banks' uninterleaved [gate; up] halves) carries the
+    per-model ``act_alpha``/``act_limit`` scalars; the plain *_and_mul kinds
+    ignore them."""
+    if activation == "swigluoai":
+        swigluoai_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
+        return
+    _ACT[activation](gate_up, out)
 
 # Decode is captured into a CUDA graph, so the config must be fixed (no triton.autotune,
 # which benchmarks at run time). Tuned offline against the NVFP4 decode kernels.
@@ -142,6 +164,8 @@ def _fused_experts_decode_nvfp4(
     topk_ids: torch.Tensor,
     activation: str,
     apply_router_weight_on_input: bool,
+    act_alpha: float = 1.702,
+    act_limit: float = 7.0,
 ) -> torch.Tensor:
     """Shared decode body (gemm1 -> act -> gemm2 -> sum-reduce); ``gemm_fn`` is either
     the marlin-style int32 GEMV (:func:`_decode_gemm_marlin`) or the original LUT-gather
@@ -158,7 +182,7 @@ def _fused_experts_decode_nvfp4(
         ic1, topk_weights, topk_ids, apply_router_weight_on_input, False,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    _ACT[activation](ic1.view(-1, two_i), ic2)
+    _run_act(activation, ic1.view(-1, two_i), ic2, act_alpha, act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     gemm_fn(
         ic2, down_packed, down_scale, down_global,
@@ -181,6 +205,8 @@ def fused_experts_decode_nvfp4_marlin(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    act_alpha: float = 1.702,
+    act_limit: float = 7.0,
 ) -> torch.Tensor:
     """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
     return _fused_experts_decode_nvfp4(
@@ -188,6 +214,7 @@ def fused_experts_decode_nvfp4_marlin(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
         down_packed, down_scale, down_global,
         topk_weights, topk_ids, activation, apply_router_weight_on_input,
+        act_alpha, act_limit,
     )
 
 
@@ -203,6 +230,8 @@ def fused_experts_decode_nvfp4_serial(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    act_alpha: float = 1.702,
+    act_limit: float = 7.0,
 ) -> torch.Tensor:
     """Original LUT-gather decode (one program per route, full K reduction). Retained for
     A/B benchmarking against the marlin decode path; not on the production decode path."""
@@ -211,6 +240,7 @@ def fused_experts_decode_nvfp4_serial(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
         down_packed, down_scale, down_global,
         topk_weights, topk_ids, activation, apply_router_weight_on_input,
+        act_alpha, act_limit,
     )
 
 
@@ -278,6 +308,8 @@ def fused_experts_nvfp4(
     num_experts: int,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    act_alpha: float = 1.702,
+    act_limit: float = 7.0,
 ) -> torch.Tensor:
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
@@ -300,7 +332,7 @@ def fused_experts_nvfp4(
         apply_router_weight_on_input, cfg,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    _ACT[activation](ic1.view(-1, two_i), ic2)
+    _run_act(activation, ic1.view(-1, two_i), ic2, act_alpha, act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(
         ic2, down_packed, down_scale, down_global, ic3,

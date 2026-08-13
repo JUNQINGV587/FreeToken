@@ -21,6 +21,9 @@ class AttnType(str, Enum):
     DSA = "dsa"  # latent-KV MLA + DSA sparse indexer -> DSAKVCache
     DSV4 = "dsv4"  # DSV4 window+compressed sparse -> DSV4PagedKVCache
     LINEAR = "linear"  # GDN/mamba state layers -> LinearStatePool
+    # GQA block-sparse (MiniMax-M3): paged GQA K/V + a per-sparse-layer index-key
+    # slab; the indexer picks top-k 128-token blocks per query -> BSAKVCache
+    BSA = "bsa"
 
     @property
     def backend_driven(self) -> bool:

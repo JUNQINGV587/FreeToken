@@ -84,8 +84,15 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor) -> None:
     torch.testing.assert_close(out.float(), ref, rtol=3e-2, atol=tol)
 
 
-def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids) -> torch.Tensor:
-    """Dequant + dense per-token reference for the gated-silu MoE."""
+def _swigluoai_ref(h: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
+    """MiniMax-M3 / gpt-oss clamped swiglu over UNINTERLEAVED [gate; up] halves."""
+    gate = h[:I].clamp(max=limit)
+    up = h[I:].clamp(-limit, limit)
+    return gate * torch.sigmoid(gate * alpha) * (up + 1.0)
+
+
+def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="silu") -> torch.Tensor:
+    """Dequant + dense per-token reference for the gated MoE (silu or swigluoai)."""
     out = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device)
     x = hidden.float()
     for t in range(hidden.size(0)):
@@ -102,7 +109,10 @@ def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids) -> torch.Tensor:
                 sources["down_global"][layer_id][e].to(hidden.device),
             )
             h = gu @ x[t]
-            act = torch.nn.functional.silu(h[:I]) * h[I:]
+            if activation == "swigluoai":
+                act = _swigluoai_ref(h)
+            else:
+                act = torch.nn.functional.silu(h[:I]) * h[I:]
             out[t] += float(topk_weights[t, j]) * (dn @ act)
     return out
 
@@ -285,6 +295,47 @@ def test_triton_overlap_prefill_matches_dequant_reference():
         )
         _assert_close(out, ref)
         cache.release_prefill_layer(layer_id)
+
+
+@cuda
+def test_triton_swigluoai_matches_dequant_reference():
+    """MiniMax-M3's swigluoai routed experts through the Triton prefill grouped GEMM
+    and the marlin-style decode GEMV: same banks, the clamped (up+1) swiglu instead
+    of silu, alpha/limit threaded through the fused entry points."""
+    from freetoken.moe.fused_nvfp4 import (
+        fused_experts_decode_nvfp4_marlin,
+        fused_experts_nvfp4,
+    )
+
+    device = torch.device("cuda")
+    sources = _make_native_sources(device, seed=11)
+    torch.manual_seed(12)
+    M = 8
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device)
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    layer_id = 0
+    banks = [
+        sources[name][layer_id].to(device)
+        for name in (
+            "gate_up_packed", "gate_up_scale", "gate_up_global",
+            "down_packed", "down_scale", "down_global",
+        )
+    ]
+    ref = _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="swigluoai")
+    out = fused_experts_nvfp4(
+        hidden, *banks, topk_weights, topk_ids, E, "swigluoai", False, 1.702, 7.0
+    )
+    _assert_close(out, ref)
+
+    dec_hidden = hidden[:1]
+    dec_ids = topk_ids[:1]
+    dec_weights = topk_weights[:1]
+    ref = _ref_moe(sources, layer_id, dec_hidden, dec_weights, dec_ids, activation="swigluoai")
+    out = fused_experts_decode_nvfp4_marlin(
+        dec_hidden, *banks, dec_weights, dec_ids, "swigluoai", False, 1.702, 7.0
+    )
+    _assert_close(out, ref)
 
 
 def _triton_cache(device, *, cache_size=S, prefill_overlap=False):

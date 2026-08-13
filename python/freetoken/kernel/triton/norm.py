@@ -48,6 +48,7 @@ def _rmsnorm_kernel(
     CONTIG: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK: tl.constexpr,
+    GEMMA: tl.constexpr = False,
 ):
     a = tl.program_id(0)
     b = tl.program_id(1)
@@ -65,6 +66,10 @@ def _rmsnorm_kernel(
     w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
     if ENABLE_PDL:
         gdc_launch_dependents()
+    if GEMMA:
+        # Gemma semantics: checkpoint stores (scale - 1); apply (1 + w) in fp32
+        # (matches flashinfer's gemma_rmsnorm, which never rounds 1+w to bf16).
+        w = w + 1.0
     inv = tl.math.rsqrt(tl.sum(x * x, axis=0) / H + eps)
     y = x * inv * w
     tl.store(OUT + ooff + cols, y.to(OUT.dtype.element_ty), mask=mask)
@@ -79,6 +84,7 @@ def _fused_add_rmsnorm_kernel(
     CONTIG: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK: tl.constexpr,
+    GEMMA: tl.constexpr = False,
 ):
     a = tl.program_id(0)
     b = tl.program_id(1)
@@ -97,6 +103,8 @@ def _fused_add_rmsnorm_kernel(
     w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
     if ENABLE_PDL:
         gdc_launch_dependents()
+    if GEMMA:
+        w = w + 1.0
     z = x + r
     tl.store(R + roff + cols, z.to(R.dtype.element_ty), mask=mask)
     inv = tl.math.rsqrt(tl.sum(z * z, axis=0) / H + eps)
@@ -112,7 +120,7 @@ def _leading(t):
     return t.shape[0], t.shape[1], t.stride(0), t.stride(1)
 
 
-def rmsnorm(input, weight, eps: float = 1e-6, out=None, enable_pdl: bool = False):
+def _rmsnorm(input, weight, eps, out, gemma: bool):
     import torch
 
     assert weight.ndim == 1 and input.shape[-1] == weight.shape[0]
@@ -122,7 +130,7 @@ def rmsnorm(input, weight, eps: float = 1e-6, out=None, enable_pdl: bool = False
         # 2D hidden norms or 3D per-head qk-norms). reshape may copy for a strided
         # input, so this path is out-of-place only.
         assert out is None, "rmsnorm on <2D/>3D input must be out-of-place"
-        return rmsnorm(input.reshape(-1, H), weight, eps).reshape(input.shape)
+        return _rmsnorm(input.reshape(-1, H), weight, eps, None, gemma).reshape(input.shape)
     assert input.stride(-1) == 1  # norm axis must be unit-stride (as flashinfer requires)
     if out is None:
         out = torch.empty_like(input)
@@ -136,13 +144,23 @@ def rmsnorm(input, weight, eps: float = 1e-6, out=None, enable_pdl: bool = False
     pdl = contig and is_sm90_supported()
     _rmsnorm_kernel[(A, B)](
         out, input, weight, eps, H, sxa, sxb, soa, sob,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl,
+        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
         num_warps=_num_warps(A * B), num_stages=1,
     )
     return out
 
 
-def fused_add_rmsnorm(input, residual, weight, eps: float = 1e-6, enable_pdl: bool = False):
+def rmsnorm(input, weight, eps: float = 1e-6, out=None, enable_pdl: bool = False):
+    return _rmsnorm(input, weight, eps, out, gemma=False)
+
+
+def gemma_rmsnorm(input, weight, eps: float = 1e-6, out=None, enable_pdl: bool = False):
+    """(1 + w)-scaled RMSNorm (Gemma/MiniMax-M3 semantics: the checkpoint stores
+    ``scale - 1``); drop-in for flashinfer's ``norm.gemma_rmsnorm``."""
+    return _rmsnorm(input, weight, eps, out, gemma=True)
+
+
+def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
     assert weight.ndim == 1 and input.shape[-1] == weight.shape[0]
     assert input.shape == residual.shape
     H = input.shape[-1]
@@ -154,9 +172,19 @@ def fused_add_rmsnorm(input, residual, weight, eps: float = 1e-6, enable_pdl: bo
     pdl = contig and is_sm90_supported()
     _fused_add_rmsnorm_kernel[(A, B)](
         input, residual, weight, eps, H, sxa, sxb, sra, srb,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl,
+        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
         num_warps=_num_warps(A * B), num_stages=1,
     )
 
 
-__all__ = ["rmsnorm", "fused_add_rmsnorm"]
+def fused_add_rmsnorm(input, residual, weight, eps: float = 1e-6, enable_pdl: bool = False):
+    _fused_add_rmsnorm(input, residual, weight, eps, gemma=False)
+
+
+def gemma_fused_add_rmsnorm(input, residual, weight, eps: float = 1e-6, enable_pdl: bool = False):
+    """In-place ``residual += input; input = gemma_rmsnorm(residual)`` (Gemma (1+w)
+    scaling); drop-in for flashinfer's ``norm.gemma_fused_add_rmsnorm``."""
+    _fused_add_rmsnorm(input, residual, weight, eps, gemma=True)
+
+
+__all__ = ["rmsnorm", "fused_add_rmsnorm", "gemma_rmsnorm", "gemma_fused_add_rmsnorm"]

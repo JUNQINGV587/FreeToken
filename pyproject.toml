@@ -10,11 +10,26 @@ build-backend = "setuptools.build_meta"
 name = "freetoken"
 # Single source of truth: python/freetoken/version.py (read via the attr directive below).
 dynamic = ["version"]
-description = "FreeToken inference runtime"
+description = "Local MoE-offload LLM inference runtime with OpenAI- and Anthropic-compatible APIs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+authors = [{ name = "FlashML Team" }]
+# No License:: classifier: setuptools>=77 rejects mixing one with the SPDX string above.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 # Version ranges are floor=last-verified, ceiling=next-major (kept loose enough to
 # resolve, tight enough to bar a silent breaking bump). These ranges are the contract;
 # there is no lockfile.
@@ -42,7 +57,7 @@ dependencies = [
     "torch>=2.11,<2.12",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
-    "triton==3.6.0",
+    "triton==3.6.0; platform_system == 'Linux'",
     "uvicorn>=0.30,<1",
 ]
 

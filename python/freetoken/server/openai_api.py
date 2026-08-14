@@ -37,8 +37,17 @@ from .generation import (
 )
 
 
-def chat_request_to_genspec(req: ChatCompletionRequest, model_sampling: dict[str, Any]) -> GenSpec:
+def chat_request_to_genspec(
+    req: ChatCompletionRequest,
+    model_sampling: dict[str, Any],
+    reasoning_parser: str | None = None,
+) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
+    from .model_meta import effort_toggle_kwargs
+
+    ctk = req.chat_template_kwargs
+    if req.reasoning_effort:
+        ctk = effort_toggle_kwargs(reasoning_parser, req.reasoning_effort, ctk)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
@@ -50,7 +59,7 @@ def chat_request_to_genspec(req: ChatCompletionRequest, model_sampling: dict[str
             model_sampling=model_sampling,
             stop=req.stop,
         ),
-        chat_template_kwargs=req.chat_template_kwargs,
+        chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
     )
@@ -133,7 +142,9 @@ async def handle_chat_completion(
         return create_error_response("Only n=1 is supported", param="n")
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        spec = chat_request_to_genspec(
+            req, model_sampling, reasoning_parser=getattr(state.config, "reasoning_parser", None)
+        )
     except ValueError as exc:
         return create_error_response(str(exc))
     uid = await submit_generation(spec, state)
@@ -182,7 +193,9 @@ async def stream_chat_completion_chunks(
 ) -> AsyncIterator[bytes]:
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
-        spec = chat_request_to_genspec(req, {})
+        spec = chat_request_to_genspec(
+            req, {}, reasoning_parser=getattr(state.config, "reasoning_parser", None)
+        )
     yield _sse(
         _chat_chunk(
             req,

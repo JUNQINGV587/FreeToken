@@ -67,6 +67,32 @@ def think_toggle_kwargs(reasoning_parser: str | None, enabled: bool) -> dict:
     return think_chat_template_kwargs(reasoning_parser, gear)
 
 
+_THINKING_KWARG_KEYS = ("enable_thinking", "thinking", "thinking_mode", "reasoning_effort")
+_DISABLE_EFFORTS = ("none", "off")
+
+
+def effort_toggle_kwargs(
+    reasoning_parser: str | None,
+    effort: str | None,
+    chat_template_kwargs: dict | None,
+) -> dict:
+    """Fold a protocol-level reasoning-effort request into the template kwargs.
+    An explicit thinking-related key wins wholesale; unrelated extras ride along.
+    Effort "none"/"off" (case-insensitive) disables thinking; any other or absent
+    effort enables it, forwarded for templates that grade it (gpt-oss)."""
+    ctk = dict(chat_template_kwargs or {})
+    if any(key in ctk for key in _THINKING_KWARG_KEYS):
+        return ctk
+    if isinstance(effort, str):
+        effort = effort.strip().lower()
+    disabled = effort in _DISABLE_EFFORTS
+    mapped = dict(think_toggle_kwargs(reasoning_parser, not disabled))
+    if effort and not disabled:
+        mapped.setdefault("reasoning_effort", effort)
+    mapped.update(ctk)
+    return mapped
+
+
 def moe_total_experts(config: Any) -> int:
     """Total routed-expert slots the model has: experts per layer x MoE layers. Matches the
     engine's own basis (``Engine._resolve_auto_moe_cache_size``), so a residency rate derived

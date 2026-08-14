@@ -867,7 +867,7 @@ def test_convert_reasoning_field_enables_thinking():
     spec = RP.convert_responses_to_genspec(req, {})
     assert spec.chat_template_kwargs == {"enable_thinking": True, "reasoning_effort": "high"}
 
-    # explicit chat_template_kwargs extra field wins over the reasoning mapping
+    # an explicit thinking-related chat_template_kwargs key wins over the mapping
     req2 = ResponsesRequest.model_validate(
         {"model": "m", "input": "hi", "reasoning": {"effort": "low"},
          "chat_template_kwargs": {"thinking_mode": "chat"}}
@@ -875,9 +875,18 @@ def test_convert_reasoning_field_enables_thinking():
     spec2 = RP.convert_responses_to_genspec(req2, {})
     assert spec2.chat_template_kwargs == {"thinking_mode": "chat"}
 
+    # unrelated extra kwargs ride along without discarding the reasoning mapping
+    req3 = ResponsesRequest.model_validate(
+        {"model": "m", "input": "hi", "reasoning": {"effort": "none"},
+         "chat_template_kwargs": {"custom_var": 1}}
+    )
+    assert RP.convert_responses_to_genspec(req3, {}).chat_template_kwargs == {
+        "enable_thinking": False, "custom_var": 1,
+    }
+
     # absent reasoning -> no kwargs
-    req3 = ResponsesRequest.model_validate({"model": "m", "input": "hi"})
-    assert RP.convert_responses_to_genspec(req3, {}).chat_template_kwargs == {}
+    req4 = ResponsesRequest.model_validate({"model": "m", "input": "hi"})
+    assert RP.convert_responses_to_genspec(req4, {}).chat_template_kwargs == {}
 
 
 def test_convert_reasoning_effort_none_disables_thinking():

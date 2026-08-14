@@ -77,6 +77,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
+    reasoning_effort: str | None = None
     ignore_eos: bool = False
     tools: list[Tool] | None = None
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceObject | None = None

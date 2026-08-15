@@ -22,7 +22,7 @@ See [docs/install.md](docs/install.md) for requirements and installation.
 
 ```bash
 ft serve --model ~/models/Qwen3.6-35B-A3B   # API server on http://127.0.0.1:1919
-ft launch claude                            # point an agent at it (codex / opencode / openclaw)
+ft launch claude                            # point an agent at it (codex / dsh / hermes / opencode / openclaw)
 ft shell                                    # or chat in the terminal
 ```
 

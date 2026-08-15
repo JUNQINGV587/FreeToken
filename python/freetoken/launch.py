@@ -29,6 +29,10 @@ OPENCLAW_PROVIDER = "freetoken"
 OPENCLAW_PROVIDER_NAME = "FreeToken"
 HERMES_API_KEY = "freetoken-local"
 HERMES_MIN_CONTEXT_LENGTH = 64_000  # Hermes refuses to start below this
+DSH_API_KEY = "freetoken"
+DSH_MIN_NODE = (22, 19)  # dsh's floor; its npm package declares no engines gate
+DSH_LAUNCH_SETTINGS_NAME = "freetoken-launch.settings.yaml"
+DSH_LAUNCH_PATCH_NAME = "freetoken-launch.cordis.patch.yml"
 CLOUD_PROVIDER_API_KEY_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_OAUTH_TOKEN",
@@ -112,6 +116,11 @@ AGENT_INSTALLERS = {
             "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup --non-interactive",
         ),
         dependencies=("bash", "curl", "git"),
+    ),
+    "dsh": AgentInstaller(
+        display_name="DeepSeek Harness",
+        argv=("npm", "install", "--global", "@deepseek-ai/dsh"),
+        dependencies=("npm", "node"),
     ),
 }
 
@@ -684,12 +693,105 @@ def prepare_hermes(ctx: LaunchContext) -> CommandSpec:
     return CommandSpec(argv=argv, env={})
 
 
+def _dsh_home() -> Path:
+    home = os.environ.get("DSH_HOME")
+    return Path(home).expanduser() if home else Path.home() / ".dsh"
+
+
+def _warn_dsh_node_version() -> None:
+    node = shutil.which("node")
+    if node is None:
+        return
+    try:
+        raw = subprocess.run(
+            [node, "--version"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        parts = raw.lstrip("v").split(".")
+        version = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return
+    if version < DSH_MIN_NODE:
+        floor = ".".join(str(part) for part in DSH_MIN_NODE)
+        print(
+            f"warning: dsh requires Node.js >={floor} and node reports {raw}.",
+            file=sys.stderr,
+        )
+
+
+def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
+    """DeepSeek Harness (dsh). Like the codex profile, the wiring lives in its
+    own settings document: a ``--patch`` overlay repoints dsh's settings row at
+    ``freetoken-launch.settings.yaml`` for this invocation only, so the user's
+    ``settings.yaml`` is never read or written. The llm-deepseek adapter (route
+    ``deepseek-official``) is used rather than a custom llm-pi-ai provider: it
+    replays tool-call arguments and assistant content verbatim, which prefix
+    caching depends on. The dummy DEEPSEEK_API_KEY satisfies dsh's non-empty
+    key requirement; FreeToken itself is unauthenticated."""
+    settings_path = _dsh_home() / DSH_LAUNCH_SETTINGS_NAME
+    patch_path = _dsh_home() / DSH_LAUNCH_PATCH_NAME
+    if not ctx.dry_run:
+        import yaml  # ships with transformers (a core dependency); only needed on this path
+
+        _warn_dsh_node_version()
+        # Preserve state dsh itself writes back into the active settings doc
+        # (model re-picks, onboarding acks); only our two sections are re-pinned.
+        config: dict[str, object] = {}
+        if settings_path.exists():
+            try:
+                loaded = yaml.safe_load(settings_path.read_text())
+            except yaml.YAMLError:
+                loaded = None
+            if isinstance(loaded, dict):
+                config = loaded
+
+        window, output = _context_window(ctx), _max_output_tokens(ctx)
+        config["llm-deepseek"] = {
+            "baseURL": ctx.server.openai_base_url,
+            "models": [
+                {
+                    "id": model_id,
+                    "name": f"{model_id} (FreeToken)",
+                    "contextWindow": window,
+                    "maxTokens": output,
+                }
+                for model_id in _ordered_model_ids(ctx)
+            ],
+        }
+        config["agent-default-model"] = {
+            "provider": "deepseek-official",
+            "model": ctx.model.model_id,
+        }
+        _write_text_with_backup(settings_path, yaml.safe_dump(config, sort_keys=False))
+
+        patch = [{"id": "settings", "config": {"path": str(settings_path)}}]
+        _write_text_with_backup(patch_path, yaml.safe_dump(patch, sort_keys=False))
+
+    # The `dsh web` alias rejects launcher flags like --patch; use the explicit
+    # --profile form and normalize a leading alias or --profile from extra args.
+    profile, app_args = "web", list(ctx.extra_args)
+    if app_args and app_args[0] == "web":
+        app_args = app_args[1:]
+    elif len(app_args) >= 2 and app_args[0] == "--profile":
+        profile, app_args = app_args[1], app_args[2:]
+    argv = ["dsh", "--profile", profile, "--patch", str(patch_path), *app_args]
+    return CommandSpec(
+        argv=argv,
+        env={
+            "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
+            "DEEPSEEK_API_KEY": DSH_API_KEY,
+            "DSH_TELEMETRY_DISABLED": "1",
+        },
+        unset_env=CLOUD_PROVIDER_API_KEY_ENV,
+    )
+
+
 PREPARERS = {
     "codex": prepare_codex,
     "claude": prepare_claude,
     "opencode": prepare_opencode,
     "openclaw": prepare_openclaw,
     "hermes": prepare_hermes,
+    "dsh": prepare_dsh,
 }
 
 
@@ -779,6 +881,8 @@ def _agent_binary_fallbacks(agent: str, binary: str) -> list[Path]:
         return [home / ".npm-global" / "bin" / filename]
     if agent == "hermes":
         return [home / ".local" / "bin" / filename]
+    if agent == "dsh":
+        return [home / ".npm-global" / "bin" / filename]
     return []
 
 

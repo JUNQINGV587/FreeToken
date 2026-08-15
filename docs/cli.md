@@ -108,7 +108,7 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 ## ft launch
 
 ```bash
-ft launch {claude,codex,hermes,openclaw,opencode} [options] [-- <agent args>]
+ft launch {claude,codex,dsh,hermes,openclaw,opencode} [options] [-- <agent args>]
 ```
 
 Discovers the served model via `/v1/models`, writes the agent's provider

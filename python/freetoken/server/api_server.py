@@ -56,6 +56,7 @@ _MODEL_SAMPLING: Dict[str, Any] = {}
 # signal handler). The backend supervisor reads this so a worker exiting AS PART of that
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
 _SHUTTING_DOWN = threading.Event()
+BACKEND_DEATH_EXIT_GRACE_S = 10.0
 
 
 def get_global_state() -> FrontendManager:
@@ -81,6 +82,19 @@ def _terminate_backend_workers(processes: List[Any]) -> None:
                 p.terminate()
         except Exception:  # noqa: BLE001 -- already-gone / unqueryable handle: nothing to do
             continue
+
+
+def _exit_after_backend_death(grace_s: float) -> threading.Timer:
+    def _stop() -> None:
+        if _SHUTTING_DOWN.is_set():
+            return  # an external stop got here first
+        logger.error("Backend worker is gone and cannot be restarted; stopping the API server")
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    timer = threading.Timer(grace_s, _stop)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
@@ -979,6 +993,10 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
+        # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
+        # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
+        if not run_shell:
+            _exit_after_backend_death(BACKEND_DEATH_EXIT_GRACE_S)
 
     def _on_meta(meta: dict) -> None:
         # Per-unit cache VRAM costs + the free-VRAM seed + per-pool floors + the actual pool

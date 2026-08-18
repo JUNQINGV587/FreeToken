@@ -388,6 +388,18 @@ def _leaked_special_tokens(state: Any) -> list[str]:
     return DSV4_SPECIAL_TOKENS if getattr(state.config, "reasoning_parser", None) == "deepseekv32" else []
 
 
+def _make_tool_parser(spec: GenSpec, state: Any) -> FunctionCallParser:
+    """Build the tool-call parser with its turn-start state read from the prompt:
+    a muse detector receives the raw turn bytes (opened by the template's
+    ``<|start|>assistant``) only when its reasoning parser is not stacked above,
+    which otherwise delivers tool slices with full headers."""
+    return FunctionCallParser(
+        spec.parser_tools or [],
+        getattr(state.config, "tool_call_parser", "llama3"),
+        turn_starts_open=getattr(state.config, "reasoning_parser", None) != "muse_glimmer",
+    )
+
+
 def _parse_tool_response(
     text: str,
     spec: GenSpec,
@@ -397,7 +409,7 @@ def _parse_tool_response(
         return None
     if not any(tag in text for tag in TOOLS_TAG_LIST):
         return None
-    parser = FunctionCallParser(spec.parser_tools or [], getattr(state.config, "tool_call_parser", "llama3"))
+    parser = _make_tool_parser(spec, state)
     result = parser.parse_non_stream(text)
     if not result.calls:
         return None
@@ -548,9 +560,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     tool_parser: FunctionCallParser | None = None
     if parse_tools:
         try:
-            candidate = FunctionCallParser(
-                spec.parser_tools or [], getattr(state.config, "tool_call_parser", "llama3")
-            )
+            candidate = _make_tool_parser(spec, state)
         except ValueError:
             candidate = None  # unsupported parser name: keep the buffered path's behavior
         if candidate is not None and candidate.supports_streaming():
@@ -678,9 +688,15 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     finish_reason = engine_finish_reason or "stop"
 
     if tool_parser is not None:
-        # End-of-stream drain: close a call whose end marker never arrived (truncated
-        # generation), best-effort recover a call cut off inside an unterminated tag
-        # block, then release text still held back for tag disambiguation.
+        # End-of-stream drain: let the detector finalize a call cut off mid-arguments
+        # (closing fragments keep the client's concatenated JSON valid), close a call
+        # whose end marker never arrived (truncated generation), best-effort recover a
+        # call cut off inside an unterminated tag block, then release text still held
+        # back for tag disambiguation.
+        for frag in tool_parser.finalize_stream():
+            if open_call is not None and frag.parameters:
+                open_call["params"] += frag.parameters
+                yield ToolCallArgsDelta(tool_index=open_call["ordinal"], fragment=frag.parameters)
         done = _close_open_call()
         if done is not None:
             yield done

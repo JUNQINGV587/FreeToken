@@ -18,6 +18,7 @@ preserves the block for the tool-call parser.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -546,6 +547,329 @@ class GemmaThoughtReasoningParser(BaseReasoningParser):
         )
 
 
+# Muse Glimmer ATEM protocol control tokens. Generation starts right after the
+# template's ``<|start|>assistant``, so the FIRST segment arrives as a bare header
+# continuation (`` to=self<|message|>...``) -- the parser is constructed
+# header-open and seeds a synthetic ``<|start|>`` so those bytes go through the
+# ordinary full-header machinery instead of a duplicate guessing path. Later
+# segments open with a full ``<|start|>assistant to=X<|message|>`` -- or, when
+# the model leaves a channel without emitting ``<|eom|>`` first, with a bare
+# ``to=X<|message|>`` (a complete match of that shape is a segment boundary;
+# vLLM applies the same rule). ``<|eom|>`` separates segments within one turn;
+# ``<|eot|>`` / ``<|end_of_text|>`` are the stops.
+ATEM_START = "<|start|>"
+ATEM_MESSAGE = "<|message|>"
+ATEM_CLOSING_TOKENS = ("<|eot|>", "<|eom|>", "<|end_of_text|>")
+ATEM_ALL_TOKENS = (ATEM_START, ATEM_MESSAGE) + ATEM_CLOSING_TOKENS
+# Recipient names cap at 64 chars in EVERY header shape (inline switches and the
+# bare stream-start header use the same bound below), so streaming and one-shot
+# agree on which recipients are valid and >64 degrades identically everywhere.
+ATEM_RECIPIENT_RE = re.compile(r"to=([^\s<]{1,64})")
+# A complete headerless channel switch: ``to=<name>`` abutting ``<|message|>``.
+# The name length is capped so the streaming hold-back below can bound how much
+# tail it withholds while a potential switch is still arriving.
+ATEM_INLINE_HEADER_RE = re.compile(r"to=([^\s<]{1,64})<\|message\|>")
+# Lookback window for the streaming hold-back's inline-switch scan: a headerless
+# ``to=<name><|message|>`` switch can occupy at most this many trailing bytes.
+_ATEM_HOLD_WINDOW = 96
+# Longest span after "<|start|>" a real header can occupy before its <|message|>
+# arrives ("assistant to=<name>" + slack). Past this, the marker cannot open a
+# header anymore and is released as literal content instead of held forever.
+ATEM_HEADER_SPAN = 128
+
+
+def atem_marker_inside(text: str, start: int, end: int) -> bool:
+    """True when a complete ATEM control token lies fully inside ``text[start:end]``.
+    A channel header can never contain one, so a header candidate with a marker
+    before its ``<|message|>`` is not a header."""
+    for tok in ATEM_ALL_TOKENS:
+        if tok == ATEM_MESSAGE:
+            continue  # the terminator being sought, not a header byte
+        if text.find(tok, start, end) != -1:
+            return True
+    return False
+
+
+def _longest_atem_partial_suffix(text: str) -> int:
+    """Length of the longest suffix of ``text`` that is a *proper* prefix of any ATEM
+    control token (the Harmony hold-back, for Muse Glimmer's marker set)."""
+    best = 0
+    for tok in ATEM_ALL_TOKENS:
+        for k in range(min(len(tok) - 1, len(text)), best, -1):
+            if text.endswith(tok[:k]):
+                best = k
+                break
+    return best
+
+
+def atem_hold_len(text: str) -> int:
+    """Streaming hold-back: the longest suffix of ``text`` that could still grow into
+    an ATEM marker OR a headerless ``to=<name><|message|>`` channel switch. Withheld
+    text is re-examined on the next chunk, so an emitted body never has to shrink
+    when the boundary completes."""
+    best = _longest_atem_partial_suffix(text)
+    window = text[-_ATEM_HOLD_WINDOW:]
+    i = window.rfind("to=")
+    if i != -1:
+        tail = window[i:]
+        if re.fullmatch(r"to=[^\s<]{0,64}", tail):
+            best = max(best, len(tail))  # name (or "to=") still streaming
+        else:
+            m = re.fullmatch(r"to=([^\s<]{1,64})(.+)", tail, re.DOTALL)
+            if m and ATEM_MESSAGE.startswith(m.group(2)):
+                best = max(best, len(tail))  # partial <|message|> after the name
+    for prefix in ("t", "to"):  # proper prefixes of "to=" (one-chunk delay at most)
+        if len(prefix) > best and text.endswith(prefix):
+            best = len(prefix)
+    return best
+
+
+class MuseGlimmerReasoningParser(BaseReasoningParser):
+    """Reasoning parser for Muse Glimmer's ATEM channel output.
+
+    Routes ``to=self`` segments to ``reasoning_text`` and ``to=user`` (or
+    recipient-less) segments, unwrapped, to ``normal_text``. A tool-recipient
+    segment (``to=<tool>``, carrying an ``<atem:function_calls>`` block) is
+    preserved verbatim (header included) in ``normal_text`` for the downstream
+    ``MuseGlimmerDetector`` -- when the channel ends without its own terminator
+    (an abutting ``<|start|>`` header or a headerless switch), a synthetic
+    ``<|eom|>`` is appended so the detector always receives a delimited block.
+    Segments open with ``<|start|>...`` headers or with a headerless
+    ``to=X<|message|>`` switch (the model leaves a channel without ``<|eom|>``;
+    vLLM's rule). The parser is initialized from the prompt it continues:
+    every request that reaches it is a templated chat generation whose prompt
+    ends with ``<|start|>assistant``, so ``header_open=True`` (the default)
+    seeds a synthetic ``<|start|>`` and the turn's first bytes go through the
+    ordinary full-header machinery -- a real ``<|message|>`` closes the header
+    (a junk recipient yields the empty channel the model asked for), and a
+    header that never gets its ``<|message|>`` falls to the unfinished-header
+    end-of-stream rule below. This replaces a prefix-guessing "start" mode that
+    kept misclassifying content shaped like a header (the same mechanism
+    ``force_reasoning`` is for the ``<think>`` families, read from the prompt
+    instead of re-derived). Text with no ATEM markers at all passes through as
+    content.
+
+    Streaming consumes the buffer as it emits (O(n) over the stream; the naive
+    re-scan of the full buffer per chunk was quadratic and stalled the serving
+    loop on this family's long default CoT). At end-of-stream, held text is
+    delivered as content rather than dropped -- a whole reply that merely looks
+    like a bare-header prefix, or prose stranded after a literal closer, must
+    not vanish. All three methods are overridden; the base ``<think>`` machinery
+    is unused.
+    """
+
+    def __init__(
+        self,
+        force_reasoning: bool = False,
+        stream_reasoning: bool = True,
+        header_open: bool = True,
+    ) -> None:
+        super().__init__(
+            think_start_token="",
+            think_end_token="",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+        self._header_open = header_open
+        # header_open: the prompt ended inside a channel header (the template's
+        # ``<|start|>assistant``); seed the marker so the turn's first bytes are
+        # parsed by the same machinery as every later header. The seed is
+        # synthetic -- if it is ever ruled a non-header (released past the span
+        # bound, or unfinished at end of stream), the marker text itself is NOT
+        # delivered: the model never emitted it.
+        self._buffer = ATEM_START if header_open else ""
+        self._synthetic_open = header_open
+        # "body" (streaming a segment body) | "seek" (between segments, looking
+        # for the next header).
+        self._mode = "seek"
+        self._recipient = "user"
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        # Closers count as markers too: a literal stray <|eot|> must take the same
+        # replay path as streaming (which strips it), not pass through verbatim.
+        if not any(tok in text for tok in ATEM_ALL_TOKENS):
+            return ReasoningParseResult(normal_text=text)
+        clone = type(self)(header_open=self._header_open)
+        first = clone.parse_streaming_increment(text)
+        rest = clone.flush()
+        return ReasoningParseResult(
+            reasoning_text=(first.reasoning_text + rest.reasoning_text).strip(),
+            normal_text=(first.normal_text + rest.normal_text).strip(),
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        self._buffer += new_text
+        return self._drain(final=False)
+
+    def flush(self) -> ReasoningParseResult:
+        return self._drain(final=True)
+
+    @staticmethod
+    def _segment_body_end(buf: str):
+        """Earliest segment-body boundary in ``buf``: ``(end, kind, payload)`` with
+        kind "closer" (payload = the token), "start" (an abutting ``<|start|>``),
+        "inline" (payload = the headerless ``to=X<|message|>`` match), or
+        ``(len(buf), None, None)`` while the body is still streaming."""
+        best = (len(buf), None, None)
+        for tok in ATEM_CLOSING_TOKENS:
+            pos = buf.find(tok)
+            if pos != -1 and pos < best[0]:
+                best = (pos, "closer", tok)
+        pos = buf.find(ATEM_START)
+        if pos != -1 and pos < best[0]:
+            best = (pos, "start", None)
+        m = ATEM_INLINE_HEADER_RE.search(buf)
+        if m is not None and m.start() < best[0]:
+            best = (m.start(), "inline", m)
+        return best
+
+    def _drain(self, *, final: bool) -> ReasoningParseResult:
+        out_reasoning: list[str] = []
+        out_content: list[str] = []
+
+        def emit(recipient: str, piece: str) -> None:
+            if not piece:
+                return
+            if recipient == "self":
+                out_reasoning.append(piece)
+            else:  # user bodies unwrapped, tool slices verbatim
+                out_content.append(piece)
+
+        def begin_body(recipient: str, header_text: str) -> None:
+            self._recipient = recipient
+            self._mode = "body"
+            if recipient not in ("self", "user"):
+                emit(recipient, header_text)  # tool slices keep their header
+
+        def emit_seek(piece: str) -> None:
+            # Inter-segment text is content (deliver, don't drop); redundant closer
+            # tokens in it are protocol debris and are stripped -- the same filter
+            # the detector applies on its text path.
+            for tok in ATEM_CLOSING_TOKENS:
+                piece = piece.replace(tok, "")
+            if piece:
+                out_content.append(piece)
+
+        while True:
+            buf = self._buffer
+            if not buf:
+                break
+
+            if self._mode == "seek":
+                s = buf.find(ATEM_START)
+                m = ATEM_INLINE_HEADER_RE.search(buf)
+                if m is not None and (s == -1 or m.start() < s):
+                    emit_seek(buf[: m.start()])
+                    self._buffer = buf[m.end():]
+                    begin_body(m.group(1), buf[m.start(): m.end()])
+                    continue
+                if s != -1:
+                    # While the header-open seed is unconsumed it is the leftmost
+                    # marker, so every consuming branch below owns clearing the
+                    # synthetic flag; a synthetic marker ruled a non-header is
+                    # dropped, never delivered (the model did not emit it).
+                    synthetic = self._synthetic_open
+                    msg = buf.find(ATEM_MESSAGE, s + len(ATEM_START))
+                    if atem_marker_inside(
+                        buf, s + len(ATEM_START), msg if msg != -1 else len(buf)
+                    ):
+                        # A control token inside the candidate: headers never
+                        # contain markers, so this <|start|> is literal content
+                        # (and a synthetic seed is simply dropped). Decides
+                        # immediately -- no waiting for the span bound or EOS.
+                        emit_seek(buf[:s])
+                        if not synthetic:
+                            out_content.append(ATEM_START)
+                        self._synthetic_open = False
+                        self._buffer = buf[s + len(ATEM_START):]
+                        continue
+                    if msg != -1 and msg - s - len(ATEM_START) > ATEM_HEADER_SPAN:
+                        # The found <|message|> is too far away to belong to THIS
+                        # marker (a stray literal <|start|>, junk, then the NEXT
+                        # segment's real header): the marker is literal content --
+                        # the span bound applies whether or not a <|message|> is
+                        # already in the buffer, or one-shot and streaming diverge.
+                        emit_seek(buf[:s])
+                        if not synthetic:
+                            out_content.append(ATEM_START)
+                        self._synthetic_open = False
+                        self._buffer = buf[s + len(ATEM_START):]
+                        continue
+                    if msg != -1:
+                        emit_seek(buf[:s])
+                        header = buf[s + len(ATEM_START): msg]
+                        rm = ATEM_RECIPIENT_RE.search(header)
+                        body_start = msg + len(ATEM_MESSAGE)
+                        self._buffer = buf[body_start:]
+                        self._synthetic_open = False
+                        begin_body(rm.group(1) if rm else "user", buf[s:body_start])
+                        continue
+                    # A complete <|start|> whose <|message|> hasn't arrived: text
+                    # before it is content NOW (never re-dropped), the candidate is
+                    # held -- bounded, with slack for a <|message|> mid-arrival (a
+                    # protocol-legal long-name header must not be cut at the nominal
+                    # span). Past the bound it cannot open a header anymore: release
+                    # the marker as literal content and resume scanning behind it,
+                    # so a degenerate wire neither stalls nor eats the turn.
+                    emit_seek(buf[:s])
+                    self._buffer = buf[s:]
+                    if len(self._buffer) - len(ATEM_START) > ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
+                        if not synthetic:
+                            out_content.append(ATEM_START)  # verbatim: deliver, don't drop
+                        self._synthetic_open = False
+                        self._buffer = self._buffer[len(ATEM_START):]
+                        continue
+                    if final:
+                        # At end of stream a candidate that never received its
+                        # <|message|> is NOT a header: deliver the tail, drop only
+                        # the marker. (A capped discard here kept a drop window
+                        # whose edge moved between layers; removing it makes the
+                        # detector's agreement trivial -- both deliver.)
+                        emit_seek(self._buffer[len(ATEM_START):])
+                        self._synthetic_open = False
+                        self._buffer = ""
+                    break
+                # No marker in sight: stream eagerly as content, holding only the
+                # tail that could still grow into one. The buffer is CONSUMED here
+                # -- the previous hold-until-flush was quadratic (re-scanned from
+                # byte 0 per chunk) and stalled the stream on long headerless
+                # continuations.
+                hold = 0 if final else atem_hold_len(buf)
+                piece = buf[: len(buf) - hold] if hold else buf
+                emit_seek(piece)
+                self._buffer = buf[len(piece):]
+                break
+
+            # self._mode == "body"
+            recipient = self._recipient
+            end, kind, payload = self._segment_body_end(buf)
+            if kind is None:
+                hold = 0 if final else atem_hold_len(buf)
+                piece = buf[: len(buf) - hold] if hold else buf
+                emit(recipient, piece)
+                self._buffer = buf[len(piece):]
+                break
+            body = buf[:end]
+            if recipient not in ("self", "user"):
+                # A closing terminator belongs to the preserved block; a channel
+                # left without one (abutting header / headerless switch) gets a
+                # synthetic <|eom|> so the detector still sees a delimited block.
+                body += payload if kind == "closer" else "<|eom|>"
+            emit(recipient, body)
+            if kind == "closer":
+                self._buffer = buf[end + len(payload):]
+                self._mode = "seek"
+            elif kind == "start":
+                self._buffer = buf[end:]
+                self._mode = "seek"
+            else:  # headerless switch: the next segment is fully known
+                self._buffer = buf[payload.end():]
+                begin_body(payload.group(1), buf[end: payload.end()])
+        return ReasoningParseResult(
+            reasoning_text="".join(out_reasoning), normal_text="".join(out_content)
+        )
+
+
 class ReasoningParser:
     """Wraps a reasoning detector for streaming and non-streaming use."""
 
@@ -556,6 +880,7 @@ class ReasoningParser:
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
         "minimax_m3": MiniMaxM3ReasoningParser,
+        "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
     }
 

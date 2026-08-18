@@ -27,6 +27,16 @@ from partial_json_parser.core.options import Allow
 from pydantic import BaseModel
 
 from .api_models import Function, Tool
+from .reasoning_parser import (
+    ATEM_CLOSING_TOKENS,
+    ATEM_HEADER_SPAN,
+    ATEM_INLINE_HEADER_RE,
+    ATEM_MESSAGE,
+    ATEM_RECIPIENT_RE,
+    ATEM_START,
+    atem_hold_len,
+    atem_marker_inside,
+)
 
 try:
     import orjson
@@ -68,6 +78,7 @@ TOOLS_TAG_LIST = [
     "<｜DSML｜function_calls>",
     "<｜DSML｜tool_calls>",
     "<｜DSML｜invoke",
+    "<atem:function_calls>",
 ]
 
 
@@ -680,6 +691,11 @@ class InvokeParamStreamMixin:
             return self._convert_param_value(raw, key, self._ps_param_config, "")
         return _parse_loose_json_value(raw)
 
+    def _ps_canonical_name(self, name: str) -> str:
+        """Hook: normalize an invoke's function name before validation (identity by
+        default; muse_glimmer collapses template-doubled ``name.name`` recipients)."""
+        return name
+
     def _ps_trim_leading(self, text: str) -> str:
         if self._ps_trim_single:
             return text[1:] if text[:1] and text[:1] in self._ps_trim else text
@@ -754,7 +770,7 @@ class InvokeParamStreamMixin:
                     m = self._ps_invoke_open_re.search(buf, inv)
                     if m is None:
                         break  # invoke tag still streaming
-                    func_name = m.group(1).strip()
+                    func_name = self._ps_canonical_name(m.group(1).strip())
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
                     while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -3042,6 +3058,460 @@ class GptOssDetector(BaseFormatDetector):
 
 
 
+class MuseGlimmerDetector(InvokeParamStreamMixin, BaseFormatDetector):
+    """Detector for Muse Glimmer's ATEM tool-call protocol.
+
+    Wire format (inside a ``<|start|>assistant to=<tool><|message|> ... <|eot|>``
+    channel; the ``MuseGlimmerReasoningParser`` upstream preserves such blocks
+    verbatim and unwraps everything else):
+
+    ```
+    <atem:function_calls>
+    <atem:invoke name="tool.fn">
+    <atem:parameter name="param">value</atem:parameter>
+    </atem:invoke>
+    </atem:function_calls>
+    ```
+
+    The invoke/parameter body is the InvokeParamStreamMixin grammar; per the
+    template's own contract values are parsed with regexes (not strict XML) and
+    string values are NOT whitespace-trimmed (``_ps_trim = ""``). A channel layer
+    around the mixin swallows the ``<|start|>...<|message|>`` headers and the
+    ``<|eot|>/<|eom|>`` terminators, streams ``to=user`` bodies as text, and drops
+    ``to=self`` bodies (they only reach this detector when no reasoning parser
+    runs upstream). Channels also open with a mid-stream headerless
+    ``to=X<|message|>`` switch (the model leaves a channel without ``<|eom|>``).
+
+    ``header_open`` initializes the detector from the prompt it continues:
+    True when the detector receives the raw turn bytes directly (no muse
+    reasoning parser stacked above), whose templated prompt ends with
+    ``<|start|>assistant`` -- a synthetic ``<|start|>`` is seeded so the bare
+    first header goes through the ordinary full-header machinery. False (the
+    default) downstream of ``MuseGlimmerReasoningParser``, which delivers tool
+    slices with their full headers and everything else already classified.
+
+    ATEM markup is EXECUTED only inside a tool-recipient channel (vLLM's rule).
+    A block quoted in a ``to=user`` body -- or the system prompt's own ATEM
+    example echoed back -- renders as plain text instead of becoming a real
+    call.
+    """
+
+    # <atem:function_calls> is not a unique tool opener under the channel-scoped
+    # execution rule (a to=user body may quote it), so no checkpoint anchor.
+    toolcall_opener = None
+    _ps_trim = ""  # "spaces for string values are not stripped" (chat-template contract)
+    _ps_missing_type = "string"
+    accepts_header_open = True  # FunctionCallParser passes the turn-start state
+
+    def __init__(self, header_open: bool = False):
+        super().__init__()
+        self.bot_token = "<atem:function_calls>"
+        self.eot_token = "</atem:function_calls>"
+        self.tool_call_separator = "\n"
+
+        # InvokeParamStreamMixin grammar
+        self._ps_outer_open = "<atem:function_calls>"
+        self._ps_outer_close = "</atem:function_calls>"
+        self._ps_invoke_open_prefix = "<atem:invoke"
+        self._ps_invoke_open_re = re.compile(r'<atem:invoke name="([^"]*)">')
+        self._ps_invoke_close = "</atem:invoke>"
+        self._ps_param_open_prefix = "<atem:parameter"
+        self._ps_param_open_re = re.compile(r'<atem:parameter name="([^"]*)">')
+        self._ps_param_close = "</atem:parameter>"
+        self._ps_reset()
+
+        # Channel layer state: "text" (to=user / outside channels) | "skip"
+        # (non-user, non-tool channel body) | "tool" (tool channel body,
+        # delegated to the mixin).
+        self._ch_mode = "text"
+        self._header_open = header_open
+        # The seed is synthetic: if it is ever ruled a non-header, the marker
+        # text itself is not delivered -- the model never emitted it.
+        self._buffer = ATEM_START if header_open else ""
+        self._synthetic_open = header_open
+        # A channel boundary fired mid-invoke: until the NEXT boundary, incoming
+        # text is that broken channel's residue (raw ATEM markup), not content.
+        self._truncated_channel = False
+        # Dropped tool-channel prose, accumulated for ONE warning per channel
+        # (a per-fragment warning logs once per generated character).
+        self._dropped_prose: List[str] = []
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def block_close_tokens(self) -> tuple:
+        return (self.eot_token,) + ATEM_CLOSING_TOKENS
+
+    def _ps_canonical_name(self, name: str) -> str:
+        """The template renders a bare-name tool's recipient namespace as
+        ``name.*``, so the model emits ``get_weather.get_weather``: collapse the
+        doubled form to the registered head (never when the doubled form itself
+        is a registered tool)."""
+        head, dot, tail = name.partition(".")
+        indices = getattr(self, "_tool_indices", {})
+        if dot and head == tail and head in indices and name not in indices:
+            return head
+        return name
+
+    # ------------------------------------------------------------------
+    # streaming
+    # ------------------------------------------------------------------
+    def _enter_recipient(self, recipient: str) -> None:
+        if recipient == "self":
+            self._ch_mode = "skip"
+        elif recipient == "user":
+            self._ch_mode = "text"
+        else:
+            self._ch_mode = "tool"
+
+    @staticmethod
+    def _channel_boundary(buf: str):
+        """Earliest channel boundary in ``buf``: ``(pos, kind, payload)`` with kind
+        "closer" (payload = token), "start", or "inline" (payload = the headerless
+        ``to=X<|message|>`` match); ``(-1, None, None)`` when none is present."""
+        best = (len(buf) + 1, None, None)
+        for tok in ATEM_CLOSING_TOKENS:
+            pos = buf.find(tok)
+            if pos != -1 and pos < best[0]:
+                best = (pos, "closer", tok)
+        pos = buf.find(ATEM_START)
+        if pos != -1 and pos < best[0]:
+            best = (pos, "start", None)
+        m = ATEM_INLINE_HEADER_RE.search(buf)
+        if m is not None and m.start() < best[0]:
+            best = (m.start(), "inline", m)
+        if best[1] is None:
+            return -1, None, None
+        return best
+
+    def _finalize_truncated_invoke(self, reason: str = "tool channel closed") -> List[ToolCallItem]:
+        """The channel (or the whole stream) ended while the ATEM machinery was
+        mid-flight. If an invoke already streamed its Start, close its argument
+        JSON so the streamed fragments stay valid (never emit broken arguments),
+        ledger the completed parameters, and advance the ordinal so the next
+        call cannot merge into this one. Anything less than an open invoke is
+        markup debris: warn and reset."""
+        self._warn_dropped_prose()
+        mode = getattr(self, "_ps_mode", "idle")
+        if mode == "idle":
+            return []
+        self._truncated_channel = True  # what follows is the broken channel's residue
+        calls: List[ToolCallItem] = []
+        if mode in ("invoke", "pstr", "pbuf"):
+            ledger = self.streamed_args_for_tool[self.current_tool_id]
+            if mode == "pstr":
+                frag = '"}'  # the ledger ends inside an open string value
+            elif ledger:
+                frag = "}"  # ends after a complete "key": value pair
+            else:
+                frag = "{}"  # invoke opened, no parameter emitted yet
+            self.streamed_args_for_tool[self.current_tool_id] += frag
+            calls.append(
+                ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=frag)
+            )
+            try:
+                parsed = json.loads(self.streamed_args_for_tool[self.current_tool_id])
+            except (json.JSONDecodeError, ValueError):
+                parsed = {}
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                parsed if isinstance(parsed, dict) else {}
+            )
+            self.streamed_args_for_tool[self.current_tool_id] = ""
+            self.current_tool_id += 1
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
+            logger.warning("muse_glimmer: %s mid-invoke; arguments truncated", reason)
+        else:  # block / invoke_skip / pskip: no open call, just partial markup
+            logger.warning("muse_glimmer: %s mid-block; partial tool markup dropped", reason)
+        self._ps_reset()
+        return calls
+
+    def finalize_streaming(self) -> List[ToolCallItem]:
+        """End-of-stream hook (FunctionCallParser.finalize_stream): the generation
+        ran out (max_tokens) while an invoke was still streaming -- close it the
+        same way a channel boundary would, so the client's concatenated argument
+        fragments end as valid JSON instead of an unterminated string."""
+        return self._finalize_truncated_invoke("generation ended")
+
+    # The truncated channel's trailing-markup shapes: what a broken-off invoke
+    # leaves behind when the model closes the tags it opened.
+    _CLOSING_MARKUP = ("</atem:parameter>", "</atem:invoke>", "</atem:function_calls>")
+
+    @classmethod
+    def _channel_residue_end(cls, buf: str) -> tuple[int, bool]:
+        """Length of the leading run of ATEM closing markup (closing tags plus
+        whitespace) in ``buf``, and whether the scan DECIDED. False means the
+        buffer ends inside the run or a partial tag: hold for more input.
+
+        Known cost of shape-based dropping: a reply that literally BEGINS with a
+        complete closing tag ("</atem:parameter> is the closing tag") loses that
+        leading tag. Partial-tag-shaped prose ("</a", "</atem") is held and
+        released intact, so no ordinary word can be eaten -- only a verbatim
+        full tag right after a truncated invoke, which is indistinguishable from
+        the residue this filter exists to drop."""
+        i = 0
+        while i < len(buf):
+            if buf[i] in " \t\r\n":
+                i += 1
+                continue
+            matched = False
+            for tag in cls._CLOSING_MARKUP:
+                if buf.startswith(tag, i):
+                    i += len(tag)
+                    matched = True
+                    break
+            if matched:
+                continue
+            rest = buf[i:]
+            if any(tag.startswith(rest) for tag in cls._CLOSING_MARKUP):
+                return i, False  # a partial closing tag at the end: hold
+            return i, True  # first non-markup character: the residue ended
+        return i, False  # consumed the whole buffer; the run may continue
+
+    def _drop_channel_prose(self, text: str) -> None:
+        """Text inside a tool channel that is not ATEM markup is discarded (only
+        tool-recipient markup is executed; the template puts nothing else there).
+        Accumulated and logged ONCE per channel by ``_warn_dropped_prose`` --
+        token-by-token serving would otherwise warn per generated character."""
+        if text and text.strip():
+            self._dropped_prose.append(text)
+
+    def _warn_dropped_prose(self) -> None:
+        if not self._dropped_prose:
+            return
+        dropped = "".join(self._dropped_prose)
+        self._dropped_prose = []
+        logger.warning(
+            "muse_glimmer: dropped %d chars of non-markup text inside a tool channel: %.120r",
+            len(dropped),
+            dropped,
+        )
+
+    def _run_mixin(self, atem_part: str, remainder: str, tools: List[Tool]) -> StreamingParseResult:
+        """Feed ``atem_part`` through the invoke/parameter machinery; whatever the
+        mixin leaves unconsumed stays buffered ahead of ``remainder``."""
+        self._buffer = atem_part
+        result = InvokeParamStreamMixin.parse_streaming_increment(self, "", tools)
+        self._buffer += remainder
+        return result
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        while True:
+            buf = self._buffer
+            if not buf:
+                break
+
+            if self._ch_mode == "text":
+                if calls:
+                    break  # text after a call defers to the next step (wire order)
+                if self._truncated_channel:
+                    # After a mid-invoke channel break, drop the broken channel's
+                    # trailing markup BY SHAPE (closing tags + whitespace) and
+                    # clear at the first non-markup character -- a real reply
+                    # following the break must flow, not be swallowed until some
+                    # later boundary that the production pipeline never delivers.
+                    consumed, decided = self._channel_residue_end(buf)
+                    if consumed:
+                        self._buffer = buf[consumed:]
+                    if not decided:
+                        break
+                    self._truncated_channel = False
+                    self._warn_dropped_prose()
+                    continue
+                pos, kind, payload = self._channel_boundary(buf)
+                if pos == -1:
+                    hold = atem_hold_len(buf)
+                    release = buf[: len(buf) - hold] if hold else buf
+                    if release:
+                        normal_parts.append(release)
+                        self._buffer = buf[len(release):]
+                    break
+                if pos > 0:
+                    normal_parts.append(buf[:pos])
+                    self._buffer = buf[pos:]
+                    continue
+                if kind == "closer":
+                    self._buffer = buf[len(payload):]  # stray terminator: drop
+                    continue
+                if kind == "inline":
+                    self._enter_recipient(payload.group(1))
+                    self._buffer = buf[payload.end():]
+                    continue
+                # kind == "start": parse the channel header. While the header-open
+                # seed is unconsumed it is the leftmost marker, so each consuming
+                # branch owns the synthetic flag: a synthetic marker ruled a
+                # non-header is dropped, never delivered (the model never emitted it).
+                synthetic = self._synthetic_open
+                msg = buf.find(ATEM_MESSAGE)
+                if atem_marker_inside(
+                    buf, len(ATEM_START), msg if msg != -1 else len(buf)
+                ):
+                    # A control token inside the candidate: headers never contain
+                    # markers, so this <|start|> is literal text (a synthetic
+                    # seed is simply dropped) -- mirrors the reasoning parser.
+                    if not synthetic:
+                        normal_parts.append(ATEM_START)
+                    self._synthetic_open = False
+                    self._buffer = buf[len(ATEM_START):]
+                    continue
+                if msg == -1:
+                    # +len(<|message|>) slack: a protocol-legal header whose marker
+                    # is still mid-arrival must not be cut at the nominal span.
+                    if len(buf) > len(ATEM_START) + ATEM_HEADER_SPAN + len(ATEM_MESSAGE):
+                        # Past a plausible header span the marker cannot open a
+                        # header anymore: release it as literal text and move on
+                        # (mirrors the reasoning parser's bound).
+                        if not synthetic:
+                            normal_parts.append(ATEM_START)
+                        self._synthetic_open = False
+                        self._buffer = buf[len(ATEM_START):]
+                        continue
+                    break  # header still streaming
+                if msg - len(ATEM_START) > ATEM_HEADER_SPAN:
+                    # The found <|message|> is too far away to belong to THIS
+                    # marker (a stray literal <|start|> followed by junk, then the
+                    # NEXT segment's real header): the marker is literal text.
+                    if not synthetic:
+                        normal_parts.append(ATEM_START)
+                    self._synthetic_open = False
+                    self._buffer = buf[len(ATEM_START):]
+                    continue
+                m = ATEM_RECIPIENT_RE.search(buf[len(ATEM_START):msg])
+                self._enter_recipient(m.group(1) if m else "user")
+                self._synthetic_open = False
+                self._buffer = buf[msg + len(ATEM_MESSAGE):]
+                continue
+
+            pos, kind, payload = self._channel_boundary(buf)
+
+            if self._ch_mode == "skip":
+                if pos == -1:
+                    hold = atem_hold_len(buf)
+                    self._buffer = buf[len(buf) - hold:] if hold else ""
+                    break
+                # Drop the skipped body; transition exactly like text mode would.
+                self._buffer = buf[pos:]
+                self._ch_mode = "text"
+                continue
+
+            # self._ch_mode == "tool": the body up to the channel boundary belongs
+            # to the ATEM machinery; text the mixin releases inside the channel is
+            # not executed (only tool-recipient markup is) and is dropped.
+            if pos == -1:
+                hold = atem_hold_len(buf)
+                atem_part = buf[: len(buf) - hold] if hold else buf
+                if not atem_part:
+                    break
+                result = self._run_mixin(atem_part, buf[len(atem_part):], tools)
+                self._drop_channel_prose(result.normal_text)
+                calls.extend(result.calls)
+                if self._buffer == buf:
+                    break  # no progress: the mixin is holding a partial marker
+                continue
+            result = self._run_mixin(buf[:pos], buf[pos:], tools)
+            self._drop_channel_prose(result.normal_text)
+            calls.extend(result.calls)
+            if self._buffer != buf:
+                # The mixin advanced (it stops after each call's close, wire-order):
+                # more blocks may still precede the boundary -- a second invoke block
+                # in the same undrained buffer must parse, not vanish as debris.
+                continue
+            # Inert: nothing before the boundary the machinery can still consume.
+            # Finalize a mid-flight invoke (its Start already streamed) instead of
+            # letting the next channel's call merge into it, then transition; any
+            # residue ahead of the boundary is markup debris and drops with it.
+            calls.extend(self._finalize_truncated_invoke())
+            if kind == "closer":
+                self._buffer = buf[pos + len(payload):]
+                self._ch_mode = "text"
+                # NOTE: the truncation mark (when finalize set it) survives the
+                # closer on purpose: on the production pipeline the broken
+                # channel's markup residue arrives AFTER the reasoning parser's
+                # synthetic terminator. Text mode clears the mark by SHAPE -- at
+                # the first non-markup character -- so a real reply flows
+                # immediately while trailing closing tags are dropped.
+            elif kind == "inline":
+                self._enter_recipient(payload.group(1))
+                self._buffer = buf[payload.end():]
+            else:  # abutting <|start|>: reprocess it in text mode
+                self._buffer = buf[pos:]
+                self._ch_mode = "text"
+            continue
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def finish_streaming(self) -> str:
+        self._warn_dropped_prose()
+        residual, self._buffer = self._buffer, ATEM_START if self._header_open else ""
+        ch_mode, self._ch_mode = self._ch_mode, "text"
+        synthetic, self._synthetic_open = self._synthetic_open, self._header_open
+        truncated, self._truncated_channel = self._truncated_channel, False
+        ps_mode = getattr(self, "_ps_mode", "idle")
+        self._ps_reset()
+        if ch_mode != "text" or ps_mode != "idle" or truncated:
+            return ""
+        if synthetic:
+            residual = residual[len(ATEM_START):]  # the seed: never model output
+        # At end of stream a <|start|> that never received its <|message|> is NOT
+        # a header: deliver the text, drop only the marker(s). Any capped discard
+        # here diverged from the layer above -- its span runs on raw bytes while
+        # this layer sees closer-stripped text, so the two edges can never agree;
+        # removing the drop window entirely makes the agreement trivial.
+        residual = residual.replace(ATEM_START, "")
+        for tok in ATEM_CLOSING_TOKENS:
+            residual = residual.replace(tok, "")
+        if self.prev_tool_call_arr and residual.strip() == "":
+            return ""
+        return residual
+
+    # ------------------------------------------------------------------
+    # one-shot
+    # ------------------------------------------------------------------
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """One-shot parse by replaying the streaming machinery on a fresh clone,
+        so both paths share one definition of channel classification (a raw
+        ``to=self`` body never leaks into content), execution scoping and value
+        semantics. Streamed fragments are reassembled into complete calls; a
+        call truncated by end-of-input closes from the parse ledger, exactly as
+        the serving layer would."""
+        clone = type(self)(header_open=self._header_open)
+        raw_calls: List[ToolCallItem] = []
+        normal_parts: List[str] = []
+        result = clone.parse_streaming_increment(text, tools)
+        normal_parts.append(result.normal_text)
+        raw_calls.extend(result.calls)
+        while True:  # drain wire-order deferrals (one call boundary per step)
+            result = clone.parse_streaming_increment("", tools)
+            if not result.normal_text and not result.calls:
+                break
+            normal_parts.append(result.normal_text)
+            raw_calls.extend(result.calls)
+        raw_calls.extend(clone._finalize_truncated_invoke("input ended"))  # mid-invoke
+        normal_parts.append(clone.finish_streaming())
+
+        order: List[int] = []
+        by_index: Dict[int, Dict[str, str]] = {}
+        for item in raw_calls:
+            if item.name is not None and item.tool_index not in by_index:
+                by_index[item.tool_index] = {"name": item.name, "params": ""}
+                order.append(item.tool_index)
+            if item.parameters and item.tool_index in by_index:
+                by_index[item.tool_index]["params"] += item.parameters
+        calls = [
+            ToolCallItem(
+                tool_index=ordinal,
+                name=by_index[idx]["name"],
+                parameters=by_index[idx]["params"] or "{}",
+            )
+            for ordinal, idx in enumerate(order)
+        ]
+        return StreamingParseResult(normal_text="".join(normal_parts).strip(), calls=calls)
+
+
 class FunctionCallParser:
     """
     Parser for function/tool calls in model outputs.
@@ -3061,18 +3531,24 @@ class FunctionCallParser:
         "minimax": MiniMaxDetector,
         "minimax_m3": MiniMaxM3Detector,
         "mistral": MistralDetector,
+        "muse_glimmer": MuseGlimmerDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(self, tools: List[Tool], tool_call_parser: str, turn_starts_open: bool = False):
         detector: Type[BaseFormatDetector] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
-        if detector_class:
-            detector = detector_class()
-        else:
+        if detector_class is None:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+        if getattr(detector_class, "accepts_header_open", False):
+            # Turn-start parse state read from the prompt: the templated chat
+            # prompt ends inside a channel header (``<|start|>assistant``), so a
+            # detector that receives the raw turn bytes starts header-open.
+            detector = detector_class(header_open=turn_starts_open)
+        else:
+            detector = detector_class()
 
         self.detector = detector
         self.tools = _coerce_tools(tools)
@@ -3211,9 +3687,20 @@ class FunctionCallParser:
         arr = self.detector.prev_tool_call_arr
         if 0 <= tool_ordinal < len(arr):
             args = arr[tool_ordinal].get("arguments")
-            if args:
+            # `is not None`, not truthiness: {} is a legitimate ledger entry (an
+            # empty-argument call) and must serialize instead of falling through.
+            if args is not None:
                 return json.dumps(args, ensure_ascii=False)
         return None
+
+    def finalize_stream(self) -> List[ToolCallItem]:
+        """End-of-stream finalize: argument fragments that CLOSE a call cut off
+        mid-arguments, from detectors that can (muse_glimmer closes the streamed
+        JSON so the fragments the client concatenated stay valid). The serving
+        layer routes these before it closes the open call; [] for detectors
+        without the hook."""
+        finalize = getattr(self.detector, "finalize_streaming", None)
+        return finalize() if finalize is not None else []
 
 
 SUPPORTED_TOOL_CALL_PARSERS = list(FunctionCallParser.ToolCallParserEnum.keys())

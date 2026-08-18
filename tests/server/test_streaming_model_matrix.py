@@ -93,6 +93,12 @@ CALL_BLOCKS = {
         "<|start|>assistant<|channel|>commentary to=functions.read "
         '<|constrain|>json<|message|>{"filePath": "/tmp/test_calc.py"}<|end|>'
     ),
+    "muse_glimmer": (
+        "<|start|>assistant to=read<|message|><atem:function_calls>\n"
+        '<atem:invoke name="read">\n'
+        "<atem:parameter name=\"filePath\">/tmp/test_calc.py</atem:parameter>\n"
+        "</atem:invoke>\n</atem:function_calls><|eot|>"
+    ),
 }
 
 # Substrings that must never leak into user-visible content.
@@ -107,6 +113,7 @@ MARKUP_MARKERS = {
     "mistral": ["[TOOL_CALLS]"],
     "llama3": ["<|python_tag|>"],
     "gpt_oss": ["<|channel|>", "to=functions."],
+    "muse_glimmer": ["<atem:", "<|message|>", "<|eot|>"],
 }
 
 # (tool_call_parser, reasoning_parser, think_open, think_close) per reasoning-capable
@@ -123,6 +130,7 @@ REASONING_FAMILIES = {
     "minimax-m3": ("minimax_m3", "minimax_m3", "<mm:think>", "</mm:think>"),
     "gemma4": ("gemma4", "gemma4", "<|channel>thought\n", "<channel|>"),
     "gpt-oss": ("gpt_oss", "gpt_oss", None, None),  # harmony channels; custom fixture
+    "muse-glimmer": ("muse_glimmer", "muse_glimmer", None, None),  # ATEM channels; custom fixture
 }
 
 
@@ -274,6 +282,15 @@ def _reasoning_fixture(name):
             f"<|message|>{json.dumps(READ_ARGS)}<|call|>"
         )
         return tool, reasoning, text
+    if name == "muse-glimmer":
+        # Generation resumes after the template's <|start|>assistant, so the first
+        # segment is a bare header continuation.
+        text = (
+            f" to=self<|message|>{THINKING}<|eom|>"
+            f"<|start|>assistant to=user<|message|>{ANSWER}<|eom|>"
+            + CALL_BLOCKS[tool]
+        )
+        return tool, reasoning, text
     text = f"{think_open}{THINKING}{think_close}{ANSWER} {CALL_BLOCKS[tool]}"
     return tool, reasoning, text
 
@@ -419,6 +436,12 @@ ARGS_STREAMING_BLOCKS = {
     "gpt_oss": (
         "<|start|>assistant<|channel|>commentary to=functions.read <|constrain|>json"
         f"<|message|>{json.dumps({'filePath': LONG_VALUE})}<|call|>"
+    ),
+    "muse_glimmer": (
+        "<|start|>assistant to=read<|message|><atem:function_calls>\n"
+        '<atem:invoke name="read">\n'
+        f"<atem:parameter name=\"filePath\">{LONG_VALUE}</atem:parameter>\n"
+        "</atem:invoke>\n</atem:function_calls><|eot|>"
     ),
 }
 
@@ -642,7 +665,7 @@ def test_empty_arguments_call_emitted_exactly_once(tool, block):
 @pytest.mark.parametrize(
     "family",
     ["qwen25", "qwen3_coder", "glm47", "gemma4", "minimax", "minimax_m3",
-     "deepseekv32", "gpt_oss"],
+     "deepseekv32", "gpt_oss", "muse_glimmer"],
 )
 def test_call_then_trailing_text_in_one_chunk_keeps_order(family):
     # Worst case: the whole generation arrives as ONE chunk. Text after the call

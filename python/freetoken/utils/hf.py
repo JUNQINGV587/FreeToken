@@ -129,12 +129,63 @@ def load_generation_sampling(model_path: str) -> dict[str, Any]:
     return out
 
 
+class RawConfigShim:
+    """Attribute view over a checkpoint's raw ``config.json``.
+
+    Fallback for model types NEWER than the installed transformers (AutoConfig raises
+    on an unknown ``model_type`` when the checkpoint ships no ``auto_map``, e.g.
+    Muse-Glimmer on transformers < 5.15). FreeToken only reads config fields
+    (parse_config) and never instantiates modeling code, so the raw JSON is enough.
+    ``*_config`` sub-dicts are wrapped for attribute access, matching
+    PretrainedConfig's nested-config behavior; every other value is served raw
+    (``rope_parameters`` and friends stay plain dicts, as they do on the real class).
+    """
+
+    def __init__(self, data: dict | None = None, **kwargs: Any) -> None:
+        self._data = {**(data or {}), **kwargs}
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "_name_or_path":
+            # PretrainedConfig carries the checkpoint path under this name and
+            # DSV4's parse_config reads it (to find inference/config.json), so it
+            # must survive the underscore guard below.
+            return self.__dict__.get("_data", {}).get("_name_or_path", "")
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            value = self._data[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        if name.endswith("_config") and isinstance(value, dict):
+            return RawConfigShim(value)
+        return value
+
+    def to_dict(self) -> dict:
+        return json.loads(json.dumps(self._data))  # deep copy, callers may mutate
+
+
+def _raw_config_json(model_path: str) -> dict:
+    if os.path.isdir(model_path):
+        path = os.path.join(model_path, "config.json")
+    else:
+        path = hf_hub_download(repo_id=model_path, filename="config.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
     # trust_remote_code: checkpoints that ship a custom config class via ``auto_map``
     # (e.g. MiniMax-M2) refuse to load without it. FreeToken only reads config fields
     # (parse_config) and never instantiates the checkpoint's modeling code.
-    return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    try:
+        return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except ValueError as exc:
+        # Unknown model_type on this transformers version: serve off the raw JSON.
+        # Anything else (bad path, malformed JSON) stays fatal.
+        if "model type" not in str(exc):
+            raise
+        return RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:
@@ -148,6 +199,8 @@ def cached_load_hf_config(model_path: str) -> PretrainedConfig:
 
         return build_gguf_shim(gguf_src)
     config = _load_hf_config(model_path)
+    if isinstance(config, RawConfigShim):
+        return RawConfigShim(config.to_dict())
     return type(config)(**config.to_dict())
 
 

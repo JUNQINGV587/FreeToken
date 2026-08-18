@@ -7,6 +7,7 @@ from freetoken.models.config import (
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
+    detect_compressed_tensors_nvfp4,
 )
 
 
@@ -62,25 +63,9 @@ def _expert_quant(hf_config: Any) -> str:
     return "none"
 
 
-def _compressed_tensors_nvfp4(hf_config: Any) -> bool:
-    """Detect a compressed-tensors NVFP4 (W4A16) checkpoint (e.g. dense Qwen3.6-27B).
-
-    llm-compressor stores ``quant_method == "compressed-tensors"`` with a ``config_groups``
-    map whose ``weights`` are ``num_bits=4, type="float", group_size=16`` -- the NVFP4 layout
-    (``weight_packed`` uint8 + ``weight_scale`` fp8 block + scalar ``weight_global_scale``).
-    All ``targets: ["Linear"]`` are NVFP4 except the per-module ``ignore`` list (lm_head,
-    GDN in_proj_*, vision, mtp)."""
-    get = _quant_accessor(hf_config)
-    if get is None:
-        return False
-    if str(get("quant_method") or "").lower() != "compressed-tensors":
-        return False
-    groups = get("config_groups") or {}
-    for g in (groups.values() if isinstance(groups, dict) else []):
-        w = (g or {}).get("weights") or {}
-        if int(w.get("num_bits", 0) or 0) == 4 and str(w.get("type", "")).lower() == "float":
-            return True
-    return False
+# Detection now lives in models/config.py (shared with muse_glimmer); weight.py imports
+# it under this name.
+_compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
 
 
 def _lm_head_quant(hf_config: Any) -> str:

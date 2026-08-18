@@ -663,9 +663,12 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
         profile = await asyncio.to_thread(manager.effort_profile)
     except Exception:  # noqa: BLE001 -- metadata only; the generation path reports real faults
         return None, None
-    if not profile.consumes_effort:
+    from freetoken.tokenizer.effort import effective_efforts
+
+    served = effective_efforts(profile)
+    if not served:
         return None, None
-    ordered = sorted(profile.supported, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
+    ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
     return ordered, profile.default
 
 

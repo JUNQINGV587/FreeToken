@@ -60,8 +60,16 @@ class TokenizeManager:
         # TODO: batch tokenization
         for msg in msgs:
             prompt = self.render_prompt(msg)
+            # A jinja chat template owns every special token (HF's apply_chat_template
+            # tokenizes with add_special_tokens=False for the same reason): tokenizers
+            # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
+            # the template already rendered one. Raw-string prompts and the dsv4
+            # encoder path keep the default.
+            templated = isinstance(msg.text, list) and self._dsv4_encoder is None
             input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(prompt, return_tensors="pt")
+                self.tokenizer.encode(
+                    prompt, return_tensors="pt", add_special_tokens=not templated
+                )
             )
             results.append(input_ids.view(-1).to(torch.int32))
         return results
@@ -88,6 +96,15 @@ class TokenizeManager:
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs
+            )
+        # Broadcast the effort in every spelling the ecosystem's templates read
+        # (muse-glimmer grades ``reasoning_strength``; Jinja ignores undeclared
+        # variables) -- the same rule the thinking toggles use. An explicit
+        # caller-provided spelling wins over the broadcast.
+        if "reasoning_effort" in chat_template_kwargs:
+            chat_template_kwargs = dict(chat_template_kwargs)
+            chat_template_kwargs.setdefault(
+                "reasoning_strength", chat_template_kwargs["reasoning_effort"]
             )
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}

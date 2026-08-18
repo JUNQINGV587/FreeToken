@@ -18,9 +18,12 @@ class FakeTokenizer:
         self.chat_template_kwargs = kwargs
         return "rendered prompt"
 
-    def encode(self, prompt, return_tensors=None):
+    def encode(self, prompt, return_tensors=None, add_special_tokens=True):
         assert prompt == "rendered prompt"
         assert return_tensors == "pt"
+        # The template rendered every special token already; encode must not
+        # add another bos on top (the muse-glimmer/llama double-bos bug).
+        assert add_special_tokens is False
         return torch.tensor([[1, 2, 3]], dtype=torch.long)
 
 
@@ -78,9 +81,11 @@ class FakeDsv4Tokenizer:
         self.name_or_path = str(model_path)
         self.prompt = None
 
-    def encode(self, prompt, return_tensors=None):
+    def encode(self, prompt, return_tensors=None, add_special_tokens=True):
         self.prompt = prompt
         assert return_tensors == "pt"
+        # dsv4's own encoder path keeps the default special-token behavior.
+        assert add_special_tokens is True
         return torch.tensor([[4, 5, 6]], dtype=torch.long)
 
 
@@ -197,7 +202,7 @@ class Qwen38LikeTokenizer:
             return f"prompt effort={effort}"
         return "prompt effort=off"
 
-    def encode(self, prompt, return_tensors=None):
+    def encode(self, prompt, return_tensors=None, add_special_tokens=True):
         return torch.tensor([[7, 8]], dtype=torch.long)
 
 

@@ -13,11 +13,11 @@ from typing import Any, Tuple
 
 from freetoken.tokenizer.effort import (
     EFFORT_SCALE,
-    OPENAI_EFFORT_TRIPLE,
     THINKING_ADAPTIVE_KWARGS,
     THINKING_OFF_KWARGS,
     THINKING_ON_KWARGS,
     ThinkingProfile,
+    effective_efforts,
 )
 
 
@@ -38,8 +38,8 @@ def derive_think_gears(
     controls -- the checkpoint owns this knowledge; nothing here is keyed by
     model family. ``None`` when there is nothing controllable to offer.
 
-    A template that grades effort without validating it gets the OpenAI triple
-    (the only vocabulary such a template is known to understand); an always-on
+    A template that grades effort without validating it gets the graded ladder
+    (its trained levels; never-advertised dialects quantize onto it); an always-on
     model with a reasoning parser but no observable knob shows a single "on"
     gear so clients can still label the state."""
     efforts = profile.efforts
@@ -53,11 +53,10 @@ def derive_think_gears(
         kwargs["adaptive"] = dict(THINKING_ADAPTIVE_KWARGS)
 
     if efforts.consumes_effort:
-        names = (
-            [n for n in efforts.supported if n in EFFORT_SCALE]
-            if efforts.validates
-            else list(OPENAI_EFFORT_TRIPLE)
-        )
+        # The served vocabulary: a validating template's own probed set; a
+        # non-validating grader gets the graded ladder (incl. xhigh -- muse's
+        # model card recommends it for agentic use) rather than the OpenAI triple.
+        names = [n for n in effective_efforts(efforts) if n in EFFORT_SCALE]
         for name in sorted(names, key=lambda n: EFFORT_SCALE[n]):
             gears.append(name)
             gear_kwargs = dict(THINKING_ON_KWARGS) if profile.toggleable else {}

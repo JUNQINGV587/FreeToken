@@ -317,6 +317,13 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=((4, 512), (16, 256)),
     ),
     AotModel(
+        name="meta-models/Muse-Glimmer-30B",
+        architecture="MuseGlimmerForConditionalGeneration",
+        hidden_size=6656,
+        kv_groups=((2, 128),),  # sliding and full (NoPE) layers share the same geometry
+        aliases=("RedHatAI/Muse-Glimmer-30B-NVFP4",),
+    ),
+    AotModel(
         name="meta-llama/Llama-3.1-8B-Instruct",
         architecture="LlamaForCausalLM",
         hidden_size=4096,

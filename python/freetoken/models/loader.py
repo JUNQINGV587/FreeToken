@@ -133,6 +133,125 @@ def iter_merged_tensors(
     )
 
 
+# ---------------------------------------------------------------------------------
+# compressed-tensors NVFP4 (llm-compressor) dense-weight helpers, shared by the
+# models that serve such checkpoints natively (qwen3_5_moe, muse_glimmer). Storage:
+# ``weight_packed`` (uint8 [O, IN//2]) + ``weight_scale`` (fp8-e4m3 block [O, IN//16])
+# + a scalar ``weight_global_scale``. The stored global is the *quant-side* scale, so
+# the dequant/native global is its reciprocal (vLLM inverts it identically).
+# ---------------------------------------------------------------------------------
+
+# Quant scales consumed with their ``weight_packed`` (or unused: the input scales are
+# for W4A4 activation quant, which FreeToken does not run).
+CT_SCALE_SUFFIXES = (
+    ".weight_scale", ".weight_global_scale", ".input_global_scale", ".input_scale",
+)
+
+
+class ShardReader:
+    """Serves tensors by name across safetensors shards (handles opened lazily).
+
+    The quant scales of a ``weight_packed`` can land in a DIFFERENT shard than the
+    packed weight itself (Muse-Glimmer-30B-NVFP4 splits layer 49's down_proj across
+    the shard boundary), so sibling lookups must go through the index's weight_map
+    rather than the shard the packed weight came from."""
+
+    def __init__(self, model_path: str, device: torch.device):
+        folder = download_hf_weight(model_path)
+        index = os.path.join(folder, "model.safetensors.index.json")
+        if os.path.exists(index):
+            with open(index, encoding="utf-8") as f:
+                weight_map = json.load(f)["weight_map"]
+            self._map = {
+                name: os.path.join(folder, shard) for name, shard in weight_map.items()
+            }
+        else:  # single-file checkpoint
+            import safetensors
+
+            self._map = {}
+            for file in iter_weight_files(model_path):
+                with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+                    for name in f.keys():
+                        self._map[name] = file
+        self._device = str(device)
+        self._handles: dict[str, object] = {}
+
+    def files(self) -> list[str]:
+        return sorted(set(self._map.values()))
+
+    def names_in(self, file: str) -> list[str]:
+        return [name for name, shard in self._map.items() if shard == file]
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        import safetensors
+
+        file = self._map[name]
+        h = self._handles.get(file)
+        if h is None:
+            h = safetensors.safe_open(file, framework="pt", device=self._device).__enter__()
+            self._handles[file] = h
+        return h.get_tensor(name)
+
+    def close(self) -> None:
+        for h in self._handles.values():
+            try:
+                h.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 -- best-effort handle cleanup
+                pass
+        self._handles.clear()
+
+
+def nvfp4_parts_ct(f, raw_base: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """compressed-tensors NVFP4 -> ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16],
+    per-output-row global fp16 [O])`` for the W4A16 kernels."""
+    w = f.get_tensor(raw_base + ".weight_packed")
+    s = f.get_tensor(raw_base + ".weight_scale")
+    wg = f.get_tensor(raw_base + ".weight_global_scale").reshape(1).to(torch.float32)
+    g = (1.0 / wg).to(torch.float16).expand(w.shape[0]).contiguous()
+    return w, s, g
+
+
+def ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict, groups: dict[str, tuple[str, ...]]):
+    """Buffer a native NVFP4 fusion part ``(w, s, g)``; emit the concatenated native parts
+    (``.weight``/``.weight_scale``/``.weight_global``, output-dim concat with each part
+    keeping its own scales, so the fused FP4 weight is exact) once complete, ``[]`` while
+    incomplete, ``None`` if ``base`` is not a fusion part of any group in ``groups``."""
+    for fused_suffix, parts in groups.items():
+        for idx, part in enumerate(parts):
+            if base.endswith(part):
+                key = base[: -len(part)] + fused_suffix
+                slots = buf.setdefault(key, {})
+                slots[idx] = parts_tuple
+                if len(slots) < len(parts):
+                    return []
+                del buf[key]
+                ws = [slots[i][0] for i in range(len(parts))]
+                ss = [slots[i][1] for i in range(len(parts))]
+                gs = [slots[i][2] for i in range(len(parts))]
+                return [
+                    (key + ".weight", torch.cat(ws, dim=0)),
+                    (key + ".weight_scale", torch.cat(ss, dim=0)),
+                    (key + ".weight_global", torch.cat(gs, dim=0)),
+                ]
+    return None
+
+
+def ct_bf16_fuse(base: str, tensor: torch.Tensor, buf: dict, groups: dict[str, tuple[str, ...]]):
+    """Buffer a bf16 fusion part; emit the concatenated ``.weight`` once complete, ``[]``
+    while incomplete, ``None`` if ``base`` is not a part of any group in ``groups``."""
+    for fused_suffix, parts in groups.items():
+        for idx, part in enumerate(parts):
+            if base.endswith(part):
+                key = base[: -len(part)] + fused_suffix
+                slots = buf.setdefault(key, {})
+                slots[idx] = tensor
+                if len(slots) < len(parts):
+                    return []
+                del buf[key]
+                return [(key + ".weight", torch.cat([slots[i] for i in range(len(parts))], dim=0))]
+    return None
+
+
 def _expert_stack_info(key: str, expert_pattern: re.Pattern[str]) -> tuple[str, int] | None:
     match = expert_pattern.match(key)
     if match is None:

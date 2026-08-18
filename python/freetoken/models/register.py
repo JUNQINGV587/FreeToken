@@ -65,6 +65,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",
     ),
+    # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
+    # text_config, weights under model.language_model.); served text-only. Dense gated GQA
+    # with a [SWA x3, full] pattern -- full layers are NoPE -- weightless qk norms, centered
+    # (1+w) sandwich norms and softcapped logits; the NVFP4 release is compressed-tensors
+    # W4A16 on every text Linear.
+    "MuseGlimmerForConditionalGeneration": ModelSpec(
+        "freetoken.models.muse_glimmer",
+        "MuseGlimmerForCausalLM",
+    ),
     "MistralForCausalLM": ModelSpec(
         "freetoken.models.mistral",
         "MistralForCausalLM",

@@ -30,10 +30,38 @@ EFFORT_SCALE: dict[str, float] = {
 KNOWN_REASONING_EFFORTS = tuple(EFFORT_SCALE)
 
 
-#: OpenAI's effort triple -- the common-denominator vocabulary offered for a
-#: template that grades effort without validating it (nothing observable
-#: narrows its gears, so offer what every dialect understands).
+#: OpenAI's effort triple -- the common-denominator vocabulary every dialect
+#: understands.
 OPENAI_EFFORT_TRIPLE = ("low", "medium", "high")
+
+#: The graded ladder served to a template that grades effort WITHOUT validating
+#: it (muse-glimmer's "Reasoning strength"). Such a template interpolates any
+#: string, so its probed ``supported`` set is the whole scale -- but the
+#: checkpoint's trained levels are the ladder names, and never-advertised
+#: dialects (minimal / none / max) must quantize onto them instead of reaching
+#: the model verbatim.
+GRADED_EFFORT_LADDER = ("low", "medium", "high", "xhigh")
+
+
+def effective_efforts(profile: EffortProfile) -> frozenset[str]:
+    """The vocabulary a checkpoint is actually served (and advertised) with.
+
+    A NARROWED ``supported`` set is authoritative -- narrowing only ever comes
+    from observed rejections. A grader that accepted the whole scale validated
+    nothing, so pass-through would interpolate off-vocabulary values
+    ("minimal", "max") into the prompt verbatim: it is capped to its dialect's
+    ladder instead -- the strength dialect's documented levels top out at xhigh
+    (muse-glimmer's model card), a plain effort grader keeps the OpenAI triple
+    (the only vocabulary such a template is known to understand)."""
+    if not profile.consumes_effort:
+        return frozenset()
+    if profile.validates or profile.supported != frozenset(KNOWN_REASONING_EFFORTS):
+        return profile.supported
+    ladder = GRADED_EFFORT_LADDER if profile.strength_dialect else OPENAI_EFFORT_TRIPLE
+    vocab = {name for name in ladder if name in profile.supported}
+    if profile.default:
+        vocab.add(profile.default)
+    return frozenset(vocab)
 
 #: Protocol-level thinking toggles, broadcast in every spelling the ecosystem's
 #: templates read (``enable_thinking`` bool: qwen/glm/gemma/dsv4;
@@ -53,13 +81,17 @@ class EffortProfile:
     ever changed its output or raised -- the template ignores the knob, so
     requests should not carry it. ``validates`` True means the probe observed a
     rejection: only then is ``supported`` a real vocabulary rather than "this
-    template interpolates anything".
+    template interpolates anything". ``strength_dialect`` True means the
+    template reads the ``reasoning_strength`` spelling (muse-glimmer's family,
+    whose documented ladder tops out at xhigh) rather than only
+    ``reasoning_effort``.
     """
 
     supported: frozenset[str]
     default: str | None
     consumes_effort: bool
     validates: bool = False
+    strength_dialect: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,15 +128,16 @@ def quantize_effort(value: Any, profile: EffortProfile) -> str | None:
     the template default. With "max" excluded the remaining scale values are
     unique, so quantization is deterministic across processes.
     """
-    if not profile.consumes_effort:
+    supported = effective_efforts(profile)
+    if not supported:
         return None
-    if isinstance(value, str) and value in profile.supported:
+    if isinstance(value, str) and value in supported:
         return value
     position = EFFORT_SCALE.get(value) if isinstance(value, str) else None
     if position is None:
         return None
     ranked = sorted(
-        (name for name in profile.supported if name != "max"),
+        (name for name in supported if name != "max"),
         key=lambda name: (abs(EFFORT_SCALE[name] - position), -EFFORT_SCALE[name]),
     )
     if ranked and abs(EFFORT_SCALE[ranked[0]] - position) <= _MAX_QUANTIZE_DISTANCE:
@@ -170,6 +203,16 @@ def probe_effort_profile(
         # Nothing learnable: sending no effort is the only safe rendering.
         return EffortProfile(supported=frozenset(), default=None, consumes_effort=False)
 
+    # Which spelling does the template read? A render that moves on the
+    # reasoning_strength kwarg alone marks the muse dialect (its ladder differs).
+    strength_dialect = False
+    try:
+        baseline = render({}, None)
+        moved = render({"reasoning_strength": "low"}, None)
+        strength_dialect = _renderings_differ(moved, baseline)
+    except Exception:  # noqa: BLE001 -- a rejecting template is not this dialect
+        strength_dialect = False
+
     supported = frozenset(name for name in KNOWN_REASONING_EFFORTS if name not in rejected)
     consumes = bool(rejected or diverged)
     default = None
@@ -182,6 +225,7 @@ def probe_effort_profile(
         default=default,
         consumes_effort=consumes,
         validates=bool(rejected),
+        strength_dialect=strength_dialect,
     )
 
 

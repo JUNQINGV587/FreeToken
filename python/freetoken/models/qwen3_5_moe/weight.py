@@ -9,7 +9,15 @@ import safetensors
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
-from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.loader import (
+    CT_SCALE_SUFFIXES,
+    ShardReader,
+    ct_bf16_fuse,
+    ct_nvfp4_fuse,
+    drop_page_cache,
+    iter_weight_files,
+    nvfp4_parts_ct,
+)
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
@@ -525,59 +533,15 @@ _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
         ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
     ),
 }
-# Activation/quant scales consumed with weight_packed (or unused: this is W4A16, the input
-# scales are for W4A4 which FreeToken does not run).
-_CT_SCALE_SUFFIXES = (".weight_scale", ".weight_global_scale", ".input_global_scale", ".input_scale")
-
-
-def _nvfp4_parts_ct(f, raw_base: str):
-    """compressed-tensors NVFP4 -> ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16],
-    per-output-row global fp16 [O])`` for the W4A16 kernels. The native/dequant global is
-    ``1/weight_global_scale`` (compressed-tensors stores the quant-side global)."""
-    w = f.get_tensor(raw_base + ".weight_packed")
-    s = f.get_tensor(raw_base + ".weight_scale")
-    wg = f.get_tensor(raw_base + ".weight_global_scale").reshape(1).to(torch.float32)
-    g = (1.0 / wg).to(torch.float16).expand(w.shape[0]).contiguous()
-    return w, s, g
+# The scale suffixes and parts/fuse machinery are shared with muse_glimmer and live
+# in models/loader.py.
+_CT_SCALE_SUFFIXES = CT_SCALE_SUFFIXES
+_nvfp4_parts_ct = nvfp4_parts_ct
+_ct_bf16_fuse = ct_bf16_fuse
 
 
 def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
-    """Buffer a native NVFP4 fusion part ``(w, s, g)``; emit the concatenated native parts once
-    complete, ``[]`` while incomplete, ``None`` if ``base`` is not a fusion part."""
-    for fused_suffix, parts in _CT_NVFP4_FUSE.items():
-        for idx, part in enumerate(parts):
-            if base.endswith(part):
-                key = base[: -len(part)] + fused_suffix
-                slots = buf.setdefault(key, {})
-                slots[idx] = parts_tuple
-                if len(slots) < len(parts):
-                    return []
-                del buf[key]
-                ws = [slots[i][0] for i in range(len(parts))]
-                ss = [slots[i][1] for i in range(len(parts))]
-                gs = [slots[i][2] for i in range(len(parts))]
-                return [
-                    (key + ".weight", torch.cat(ws, dim=0)),
-                    (key + ".weight_scale", torch.cat(ss, dim=0)),
-                    (key + ".weight_global", torch.cat(gs, dim=0)),
-                ]
-    return None
-
-
-def _ct_bf16_fuse(base: str, tensor: torch.Tensor, buf: dict, groups: dict):
-    """Buffer a bf16 fusion part; emit the concatenated ``.weight`` once complete, ``[]`` while
-    incomplete, ``None`` if ``base`` is not a part of any group in ``groups``."""
-    for fused_suffix, parts in groups.items():
-        for idx, part in enumerate(parts):
-            if base.endswith(part):
-                key = base[: -len(part)] + fused_suffix
-                slots = buf.setdefault(key, {})
-                slots[idx] = tensor
-                if len(slots) < len(parts):
-                    return []
-                del buf[key]
-                return [(key + ".weight", torch.cat([slots[i] for i in range(len(parts))], dim=0))]
-    return None
+    return ct_nvfp4_fuse(base, parts_tuple, buf, _CT_NVFP4_FUSE)
 
 
 def _iter_weights_compressed_tensors(
@@ -612,13 +576,17 @@ def _iter_weights_compressed_tensors(
             tensor = tensor + 1.0  # (1 + weight) baked into the stored norm weight
         yield name, tensor
 
-    for file in tqdm(
-        iter_weight_files(model_path),
-        desc="Loading compressed-tensors weights",
-        disable=not tp_info.is_primary(),
-    ):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for raw_name in f.keys():
+    # Scale lookups go through the shard-map reader: a weight_packed's quant scales
+    # can land in a different shard than the packed weight (the Muse-Glimmer layer-49
+    # shape; nothing prevents an llm-compressor Qwen export from splitting the same way).
+    reader = ShardReader(model_path, device)
+    try:
+        for file in tqdm(
+            reader.files(),
+            desc="Loading compressed-tensors weights",
+            disable=not tp_info.is_primary(),
+        ):
+            for raw_name in reader.names_in(file):
                 if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
                     continue
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
@@ -631,7 +599,7 @@ def _iter_weights_compressed_tensors(
                 if raw_name.endswith(".weight_packed"):  # NVFP4 projection
                     base = name[: -len(".weight_packed")]
                     raw_base = raw_name[: -len(".weight_packed")]
-                    w, s, g = _nvfp4_parts_ct(f, raw_base)
+                    w, s, g = _nvfp4_parts_ct(reader, raw_base)
                     # GDN in_proj_* compute in bf16 (model contract) but some checkpoints
                     # (e.g. sakamakismile/Qwen3.6-27B-NVFP4) quantize them too: dequant to
                     # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual.
@@ -659,11 +627,13 @@ def _iter_weights_compressed_tensors(
                     continue
 
                 if name.endswith(".weight"):
-                    yield from _emit_bf16_weight(name, f.get_tensor(raw_name))
+                    yield from _emit_bf16_weight(name, reader.get_tensor(raw_name))
                     continue
 
                 # A_log / dt_bias (kept fp32 by the model; the load downcast exempts them).
-                yield name, f.get_tensor(raw_name)
+                yield name, reader.get_tensor(raw_name)
+    finally:
+        reader.close()
 
     assert not nvfp4_buf, f"Incomplete NVFP4 fusions: {list(nvfp4_buf.keys())}"
     assert not bf16_buf, f"Incomplete bf16 fusions: {list(bf16_buf.keys())}"

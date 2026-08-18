@@ -35,6 +35,19 @@ FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for
 - [Supported models](docs/models.md)
 - [CLI reference](docs/cli.md)
 
+## Citation
+
+If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
+
+```bibtex
+@article{yang2026freetoken,
+  title={FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution},
+  author={Yang, Shuo and Fan, Xiaoze and Pan, Melissa and Xi, Haocheng and Wang, Zhe and Sun, Shanlin and Keutzer, Kurt and Han, Song and Zaharia, Matei and Xu, Chenfeng and Stoica, Ion},
+  journal={arXiv preprint arXiv:2608.16157},
+  year={2026}
+}
+```
+
 ## Acknowledgment
 
 FreeToken was deeply inspired by [mini-sglang](https://github.com/sgl-project/mini-sglang), and

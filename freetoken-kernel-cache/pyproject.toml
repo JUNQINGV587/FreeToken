@@ -22,9 +22,10 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = ["apache-tvm-ffi==0.1.13.post3"]
 
-# cu130 wheels are not published to PyPI, and uv applies these to build-system.requires
-# when this directory is the build root — without them an isolated build pulls PyPI's
-# default-CUDA torch and stamps the wheel +cu126/+cu128. Mirrors ../pyproject.toml.
+# Provenance pin: PyPI's torch 2.11.0 is itself the cu130 build, but this index serves
+# ONLY cu130 wheels, so an isolated build can never resolve a different-CUDA torch and
+# stamp the wheel +cu126/+cu128. uv applies these to build-system.requires when this
+# directory is the build root. Mirrors ../pyproject.toml.
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 

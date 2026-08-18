@@ -13,8 +13,9 @@ ft <command> [args]
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate the MoE backend |
 
-`ft --version` prints the installed version (torch-free; release wheels
-include the `+g<sha>` build stamp). Every command supports `--help`.
+`ft --version` prints the installed version (torch-free; nightly wheels carry a
+`+g<sha>` build stamp, tagged releases a bare version). Every command supports
+`--help`.
 
 ## ft serve
 

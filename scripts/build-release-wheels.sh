@@ -13,6 +13,14 @@
 #   FREETOKEN_BUILD_KEEP_TEMP     keep setuptools/tvm build leftovers when true (default: 0)
 #   FREETOKEN_BUILD_STRIP         strip debug symbols from the runtime wheel's .so (default: 1)
 #   FREETOKEN_BUILD_NO_STAMP      skip the +g<sha> commit stamp -- dev builds only (default: 0)
+#   FREETOKEN_BUILD_RELEASE       tagged-release mode: no stamp, and HEAD must be at the
+#                                 tag v<version.py> exactly (default: 0)
+#   FREETOKEN_BUILD_DEV_STAMP     stamp .dev<N> instead of +g<sha> -- PEP 440-legal without
+#                                 a local segment, so TestPyPI rehearsals get a unique,
+#                                 uploadable version per run (default: unset)
+#   FREETOKEN_BUILD_SKIP_KERNEL_CACHE  build only the runtime wheel -- for the 2nd..Nth
+#                                 interpreter of a matrix build; the kernel cache is
+#                                 py3-none and only needs building once (default: 0)
 #   FREETOKEN_KERNEL_CACHE_SPECS  optional comma-separated subset of kernel spec names
 set -euo pipefail
 
@@ -26,6 +34,9 @@ CLEAN="${FREETOKEN_BUILD_CLEAN:-1}"
 KEEP_TEMP="${FREETOKEN_BUILD_KEEP_TEMP:-0}"
 STRIP="${FREETOKEN_BUILD_STRIP:-1}"
 NO_STAMP="${FREETOKEN_BUILD_NO_STAMP:-0}"
+RELEASE="${FREETOKEN_BUILD_RELEASE:-0}"
+DEV_STAMP="${FREETOKEN_BUILD_DEV_STAMP:-}"
+SKIP_KERNEL_CACHE="${FREETOKEN_BUILD_SKIP_KERNEL_CACHE:-0}"
 
 TRUE_VALUES=" 1 true yes on "
 
@@ -124,6 +135,30 @@ restore_version() {
   fi
 }
 stamp_version() {
+  if [[ -n "$DEV_STAMP" ]] && { enabled "$RELEASE" || enabled "$NO_STAMP"; }; then
+    die "FREETOKEN_BUILD_DEV_STAMP cannot be combined with RELEASE or NO_STAMP modes"
+  fi
+  # Release mode: the runtime wheel must carry a bare PEP 440 version (PyPI rejects
+  # any +local segment), so no stamp -- provenance comes from the tag instead, which
+  # is verified to point at exactly this commit and this version.py. The kernel-cache
+  # wheel then comes out as <version>+cu130 (no .g<sha>): build_backend.py appends
+  # .g<sha> only when version.py already carries one.
+  if enabled "$RELEASE"; then
+    enabled "$NO_STAMP" \
+      && die "FREETOKEN_BUILD_RELEASE and FREETOKEN_BUILD_NO_STAMP are mutually exclusive"
+    if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+      die "working tree is not clean -- a release build must come from exactly the tagged commit."
+    fi
+    local version tag
+    version="$(sed -nE 's/^__version__ = "([^"+]+)".*$/\1/p' "$VERSION_FILE")"
+    [[ -n "$version" ]] || die "cannot read a version from $VERSION_FILE"
+    tag="$(git -C "$ROOT" describe --exact-match --tags HEAD 2>/dev/null)" \
+      || die "FREETOKEN_BUILD_RELEASE: HEAD is not at a tag (expected tag v$version)."
+    [[ "$tag" == "v$version" ]] \
+      || die "FREETOKEN_BUILD_RELEASE: HEAD tag is '$tag' but version.py says '$version' (expected tag v$version)."
+    say "release build: $version (tag $tag)"
+    return 0
+  fi
   if enabled "$NO_STAMP"; then
     warn "FREETOKEN_BUILD_NO_STAMP is set -- building UNSTAMPED dev wheels (do not release)"
     return 0
@@ -134,7 +169,7 @@ stamp_version() {
   # exactly that leftover (version.py is the only change, and it carries a stamp) and
   # restore it instead of dying "not clean" at the operator.
   if [[ "$(git -C "$ROOT" status --porcelain)" == " M python/freetoken/version.py" ]] \
-    && grep -qE '^__version__ = "[0-9][^"]*\+g[0-9a-f]{7,}"' "$VERSION_FILE"; then
+    && grep -qE '^__version__ = "[0-9][^"]*(\+g[0-9a-f]{7,}|\.dev[0-9]+)"' "$VERSION_FILE"; then
     git -C "$ROOT" checkout --quiet -- "python/freetoken/version.py"
     say "recovered a leftover version stamp from an interrupted build"
   fi
@@ -145,11 +180,18 @@ stamp_version() {
   if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
     die "working tree is not clean -- a stamped wheel would lie about its commit. Commit/stash (and clean untracked files) first, or set FREETOKEN_BUILD_NO_STAMP=1 for an unstamped dev build."
   fi
-  local sha
-  sha="$(git -C "$ROOT" rev-parse --short=9 HEAD)"
+  local suffix version
+  if [[ -n "$DEV_STAMP" ]]; then
+    [[ "$DEV_STAMP" =~ ^[0-9]+$ ]] || die "FREETOKEN_BUILD_DEV_STAMP must be a plain number (got '$DEV_STAMP')"
+    suffix=".dev${DEV_STAMP}"
+  else
+    suffix="+g$(git -C "$ROOT" rev-parse --short=9 HEAD)"
+  fi
+  version="$(sed -nE 's/^__version__ = "([^"+]+)".*$/\1/p' "$VERSION_FILE")"
+  [[ -n "$version" ]] || die "cannot read a version from $VERSION_FILE"
   # In-place edit, not overwrite: anything in version.py beyond the version line survives.
-  sed -i -E "s/^(__version__ = \"[0-9][^\"+]*)\"/\1+g${sha}\"/" "$VERSION_FILE"
-  grep -qE "^__version__ = \"[0-9][^\"+]*\+g${sha}\"" "$VERSION_FILE" \
+  sed -i -E "s/^(__version__ = \"[0-9][^\"+]*)\"/\1${suffix}\"/" "$VERSION_FILE"
+  grep -qF "__version__ = \"${version}${suffix}\"" "$VERSION_FILE" \
     || die "failed to stamp $VERSION_FILE"
   STAMPED=1
   say "stamped version: $(sed -nE 's/^__version__ = "([^"]+)".*$/\1/p' "$VERSION_FILE")"
@@ -186,16 +228,23 @@ warn_arch_override
 say "building freetoken runtime wheel"
 uv "${BUILD_ARGS[@]}" .
 
-# CLEAN wiped old wheels, so the sole freetoken-*.whl (NOT the kernel-cache) is what we just built.
-rt_whl="$(find "$OUT_DIR" -maxdepth 1 -name 'freetoken-*.whl' \
-  ! -name 'freetoken-kernel-cache-*.whl' -print | sort | tail -1)"
-[ -n "$rt_whl" ] && strip_wheel "$rt_whl"
+# Select the wheel THIS interpreter just built by its cp tag -- a matrix build runs
+# this script once per interpreter with CLEAN=0, so several freetoken-*.whl coexist.
+cptag="$("$PYTHON_BIN" -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
+rt_whl="$(find "$OUT_DIR" -maxdepth 1 -name "freetoken-*-${cptag}-*.whl" -printf '%T@ %p\n' \
+  | sort -n | tail -1 | cut -d' ' -f2-)"
+[ -n "$rt_whl" ] || die "runtime wheel for $cptag not found in $OUT_DIR"
+strip_wheel "$rt_whl"
 
-say "building freetoken-kernel-cache wheel"
-warn_arch_override
-export FREETOKEN_KERNEL_CACHE_VERBOSE="${FREETOKEN_KERNEL_CACHE_VERBOSE:-1}"
-export FREETOKEN_KERNEL_CACHE_BUILD_DIR="${FREETOKEN_KERNEL_CACHE_BUILD_DIR:-$ROOT/build/freetoken-kernel-cache}"
-uv "${BUILD_ARGS[@]}" freetoken-kernel-cache
+if enabled "$SKIP_KERNEL_CACHE"; then
+  say "skipping freetoken-kernel-cache wheel (FREETOKEN_BUILD_SKIP_KERNEL_CACHE)"
+else
+  say "building freetoken-kernel-cache wheel"
+  warn_arch_override
+  export FREETOKEN_KERNEL_CACHE_VERBOSE="${FREETOKEN_KERNEL_CACHE_VERBOSE:-1}"
+  export FREETOKEN_KERNEL_CACHE_BUILD_DIR="${FREETOKEN_KERNEL_CACHE_BUILD_DIR:-$ROOT/build/freetoken-kernel-cache}"
+  uv "${BUILD_ARGS[@]}" freetoken-kernel-cache
+fi
 
 say "wheels written to $OUT_DIR"
 find "$OUT_DIR" -maxdepth 1 -type f \

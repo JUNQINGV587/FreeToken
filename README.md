@@ -25,10 +25,27 @@ FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for
 
 ## Getting Started
 
-**Desktop app** — download FreeToken for Windows or Linux at
-[flashml.ai](https://www.flashml.ai/). It sets the engine up for you and gives you a GUI for running models, chatting, and tuning the engine.
+### Desktop app
 
-**CLI**:
+Download FreeToken for Windows or Linux at [flashml.ai](https://www.flashml.ai/). It sets the engine up for you and gives you a GUI for running models, chatting, and tuning the engine.
+
+### CLI
+
+Install FreeToken with [uv](https://docs.astral.sh/uv/) (recommended) or pip:
+
+```bash
+uv pip install "freetoken[accel]"
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/FlashML-org/FreeToken.git && cd FreeToken
+uv venv && source .venv/bin/activate
+uv pip install -e ".[accel]"
+```
+
+For More details:
 
 - [Install FreeToken](docs/install.md)
 - [Quick start](docs/quickstart.md)

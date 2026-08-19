@@ -10,26 +10,64 @@
 | <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/xzwSnMdsX"><b>Community Discord</b></a> |
 </p>
 
-A local, MoE-offload inference runtime with an OpenAI- and Anthropic-compatible
-HTTP API — Run DeepSeek-V4-Flash on your 5090 with 20+ TPS.
 
+Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 
+## About
 
-## Quick start
+FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for running frontier-scale open-weight models on personal and consumer hardware. It treats heterogeneous edge resources—GPUs, CPUs, host memory, and interconnects—as a unified, elastic inference platform. Its core features include:  
 
-See [docs/install.md](docs/install.md) for requirements and installation.
+- **Fast Edge-Native Runtime**: Provides efficient MoE serving with bandwidth-adaptive CPU–GPU co-execution ($q^\star$ policy), full-layer double-buffered prefill streaming, global LRU expert caching, graph-compatible execution, and the FTW fast weight format.  
+- **Semantic-Aware Caching**: Features semantic anchor checkpoints for recurrent state and KV caches, allowing agentic context edits (e.g., tool calls, thinking blocks) to avoid redundant context recomputation.  
+- **Elastic Memory Management**: Supports dynamic, runtime VRAM re-allocation between expert caches and KV memory without engine restarts or weight reloading.  
+- **Broad MoE & Ecosystem Support**: Supports frontier open-weight MoE models (e.g., DeepSeek-V4-Flash, Qwen3.6-35B-A3B, GLM-5.2) across various parameter scales and quantization formats (e.g., MXFP4, NVFP4, FP8, BF16), with Anthropic/OpenAI-compatible APIs for seamless integration with real-world coding and tool-calling agents (e.g., Codex, Claude Code, OpenCode, OpenClaw, DeepSeek Harness). 
+- **Diverse Consumer Hardware**: Scales across consumer laptops, gaming desktops, and workstation GPUs, with native support for NVIDIA RTX 30, RTX 40, and RTX 50 series GPUs.  
+
+## Getting Started
+
+### Desktop app
+
+Download FreeToken for Windows or Linux at [flashml.ai](https://www.flashml.ai/). It sets the engine up for you and gives you a GUI for running models, chatting, and tuning the engine.
+
+<div align="center">
+  <img alt="FreeToken Desktop" src="./assets/desktop-console.png" width=92%>
+</div>
+
+### CLI
+
+Install FreeToken with [uv](https://docs.astral.sh/uv/) (recommended) or pip:
 
 ```bash
-ft serve --model ~/models/Qwen3.6-35B-A3B   # API server on http://127.0.0.1:1919
-ft launch claude                            # point an agent at it (codex / dsh / hermes / opencode / openclaw)
-ft shell                                    # or chat in the terminal
+uv pip install "freetoken[accel]"
 ```
 
-## Documentation
+Or build from source:
 
-- [Install](docs/install.md) — requirements and setup
-- [Supported models](docs/models.md) — model × quantization
-- [CLI reference](docs/cli.md) — `ft` commands and environment variables
+```bash
+git clone https://github.com/FlashML-org/FreeToken.git && cd FreeToken
+uv venv && source .venv/bin/activate
+uv pip install -e ".[accel]"
+```
+
+For More details:
+
+- [Install FreeToken](docs/install.md)
+- [Quick start](docs/quickstart.md)
+- [Supported models](docs/models.md)
+- [CLI reference](docs/cli.md)
+
+## Citation
+
+If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
+
+```bibtex
+@article{yang2026freetoken,
+  title={FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution},
+  author={Yang, Shuo and Fan, Xiaoze and Pan, Melissa and Xi, Haocheng and Wang, Zhe and Sun, Shanlin and Keutzer, Kurt and Han, Song and Zaharia, Matei and Xu, Chenfeng and Stoica, Ion},
+  journal={arXiv preprint arXiv:2608.16157},
+  year={2026}
+}
+```
 
 ## Acknowledgment
 

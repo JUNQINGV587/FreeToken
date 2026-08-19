@@ -1,8 +1,8 @@
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/freetoken-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/freetoken-logo-light.svg">
-    <img alt="FreeToken" src="./assets/freetoken-logo.svg" width=65%>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-light.svg">
+    <img alt="FreeToken" src="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo.svg" width=65%>
   </picture>
 </div>
 
@@ -30,7 +30,7 @@ FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for
 Download FreeToken for Windows or Linux at [flashml.ai](https://www.flashml.ai/). It sets the engine up for you and gives you a GUI for running models, chatting, and tuning the engine.
 
 <div align="center">
-  <img alt="FreeToken Desktop" src="./assets/desktop-console.png" width=92%>
+  <img alt="FreeToken Desktop" src="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/desktop-console.png" width=92%>
 </div>
 
 ### CLI
@@ -51,10 +51,10 @@ uv pip install -e ".[accel]"
 
 For More details:
 
-- [Install FreeToken](docs/install.md)
-- [Quick start](docs/quickstart.md)
-- [Supported models](docs/models.md)
-- [CLI reference](docs/cli.md)
+- [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)
+- [Quick start](https://github.com/FlashML-org/FreeToken/blob/main/docs/quickstart.md)
+- [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
+- [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
 
 ## Citation
 
@@ -81,4 +81,4 @@ learned the design and reused code from the following projects:
 
 ## License
 
-[Apache License 2.0](LICENSE).
+[Apache License 2.0](https://github.com/FlashML-org/FreeToken/blob/main/LICENSE).

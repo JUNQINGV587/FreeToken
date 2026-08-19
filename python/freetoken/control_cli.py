@@ -212,7 +212,8 @@ def _format_stats(doc: dict[str, Any]) -> str:
         (
             f"requests active={requests.get('active', 0)} "
             f"completed={requests.get('completed', 0)} "
-            f"p95_ms={requests.get('p95_ms', 0)}"
+            f"p95_ms={requests.get('p95_ms', 0)} "
+            f"ttft_mean_ms={requests.get('ttft_mean_ms', 0)}"
         ),
         f"vram_bytes={doc.get('vram_bytes', 0)}",
     ]

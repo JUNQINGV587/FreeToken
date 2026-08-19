@@ -127,7 +127,7 @@ def _swa_page_size(config: Any) -> int:
     return 1
 
 
-def build_stats(state: Any, p95_ms: int) -> dict:
+def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
     pages + the pool's own page_size (tokens = pages x page_size)."""
@@ -166,6 +166,7 @@ def build_stats(state: Any, p95_ms: int) -> dict:
             "active": tr.active,
             "completed": tr.completed,
             "p95_ms": p95_ms,
+            "ttft_mean_ms": ttft_mean_ms,
             "prompt_tokens_total": tr.prompt_tokens_total,
             "completion_tokens_total": tr.completion_tokens_total,
         },

@@ -19,6 +19,7 @@ class RequestRecord:
     status: int
     model: str | None
     duration_ms: int
+    ttft_ms: int | None
     prompt_tokens: int | None
     completion_tokens: int | None
     stream: bool | None
@@ -59,6 +60,13 @@ class RequestRing:
         k = max(0, math.ceil(0.95 * len(durs)) - 1)
         return int(durs[k])
 
+    def ttft_mean_ms(self) -> int:
+        """Mean TTFT over the records that have one."""
+        vals = [rec.ttft_ms for _idx, rec in self._buf if rec.ttft_ms is not None]
+        if not vals:
+            return 0
+        return int(round(sum(vals) / len(vals)))
+
     def count(self) -> int:
         return self._next
 
@@ -77,6 +85,10 @@ def requests_since(cursor: int, limit: int) -> tuple[list[dict], int]:
 
 def requests_p95_ms() -> int:
     return _RING.p95_ms()
+
+
+def requests_ttft_mean_ms() -> int:
+    return _RING.ttft_mean_ms()
 
 
 def requests_count() -> int:

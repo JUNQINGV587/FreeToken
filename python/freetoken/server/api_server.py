@@ -465,6 +465,7 @@ async def _record_request_middleware(request: Request, call_next):
             status=response.status_code,
             model=_served_model_name(),
             duration_ms=duration_ms,
+            ttft_ms=None,
             prompt_tokens=None,
             completion_tokens=None,
             stream=ctype.startswith("text/event-stream"),

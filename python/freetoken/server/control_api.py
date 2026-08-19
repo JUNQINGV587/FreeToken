@@ -70,7 +70,9 @@ def register_control_routes(
 
     @app.get("/v1/stats")
     async def stats():
-        doc = build_stats(get_state(), request_ring.requests_p95_ms())
+        doc = build_stats(
+            get_state(), request_ring.requests_p95_ms(), request_ring.requests_ttft_mean_ms()
+        )
         # Surface the model's recommended sampling (from its generation_config.json / GGUF
         # metadata) so clients can seed their sampling controls per-model instead of guessing.
         if get_model_sampling is not None:

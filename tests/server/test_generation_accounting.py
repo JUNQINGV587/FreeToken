@@ -4,13 +4,27 @@ stream (it fires before the totals are known)."""
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from freetoken.message import UserReply
-from freetoken.server import api_server, request_ring
-from freetoken.server.generation import GenDone, GenSpec, generate_events, generate_full
+# Same shim as the sibling server tests: the venv may hold a non-editable install, and without
+# this the file only tests the source tree when a test that does insert it collects first.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PY = os.path.join(_ROOT, "python")
+if _PY not in sys.path:
+    sys.path.insert(0, _PY)
+
+from freetoken.message import UserReply  # noqa: E402
+from freetoken.server import api_server, request_ring  # noqa: E402
+from freetoken.server.generation import (  # noqa: E402
+    GenDone,
+    GenSpec,
+    generate_events,
+    generate_full,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +75,14 @@ def _ack(prompt: int = 0, completion: int = 0, out: str = "", finished: bool = F
 
 def _spec() -> GenSpec:
     return GenSpec(messages=[{"role": "user", "content": "hi"}], sampling_params=SimpleNamespace())
+
+
+def _row(*, ttft_ms: int | None) -> request_ring.RequestRecord:
+    return request_ring.RequestRecord(
+        ts="2026-01-01T00:00:00Z", method="POST", path="/v1/messages", status=200,
+        model="unit-model", duration_ms=1000, ttft_ms=ttft_ms, prompt_tokens=1,
+        completion_tokens=1, stream=True, error=None,
+    )
 
 
 def _last_row() -> dict:
@@ -133,3 +155,40 @@ def test_no_source_opts_out_of_recording():
     asyncio.run(generate_full(42, _spec(), st))  # no source
     rows, _ = request_ring.requests_since(0, 1000)
     assert rows == []
+
+
+def test_stream_records_a_ttft_within_the_request_duration():
+    request_ring.reset()
+    st = FakeState([_ack(prompt=3, completion=1, out="a"), _ack(completion=1, out="b", finished=True)])
+
+    async def drain():
+        async for _ev in generate_events(42, _spec(), st, source="/v1/messages"):
+            pass
+
+    asyncio.run(drain())
+    row = _last_row()
+    assert row["ttft_ms"] is not None and 0 <= row["ttft_ms"] <= row["duration_ms"]
+
+
+def test_non_stream_records_no_ttft():
+    """generate_full hands the client one response: there is no first-token instant to observe."""
+    request_ring.reset()
+    st = FakeState([_ack(prompt=3, completion=2, out="ab", finished=True)])
+    asyncio.run(generate_full(42, _spec(), st, source="/v1/chat/completions"))
+    assert _last_row()["ttft_ms"] is None
+
+
+def test_ttft_mean_covers_only_the_rows_that_have_one():
+    """Non-streaming generations and middleware-logged rows carry no TTFT; averaging them in
+    as zeros would drag the mean toward 0 as soon as anything hits /health."""
+    request_ring.reset()
+    for ms in (100, 200, 300):
+        request_ring.record_request(_row(ttft_ms=ms))
+    request_ring.record_request(_row(ttft_ms=None))
+    assert request_ring.requests_ttft_mean_ms() == 200
+
+
+def test_ttft_mean_is_zero_without_samples():
+    request_ring.reset()
+    request_ring.record_request(_row(ttft_ms=None))
+    assert request_ring.requests_ttft_mean_ms() == 0

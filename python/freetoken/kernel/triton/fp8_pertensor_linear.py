@@ -25,8 +25,14 @@ import torch
 import triton
 import triton.language as tl
 from freetoken.layers import BaseOP
+from freetoken.layers.base import _concat_prefix
 
-from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native_cx, e4m3_u8_to_f32
+from freetoken.kernel.triton.e4m3_compat import (
+    e4m3_kernel_view,
+    e4m3_native,
+    e4m3_native_cx,
+    e4m3_u8_to_f32,
+)
 
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
@@ -171,23 +177,108 @@ def _gemm(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     return out
 
 
+# ======================================================================================
+# Batched decode (M > 1) W8A8: quantize the activation with the checkpoint's static
+# per-tensor ``input_scale`` and hand both fp8 operands to cuBLASLt via torch._scaled_mm.
+#
+# ``_gemm`` above is a *prefill* kernel: grid is (cdiv(M, BLOCK_M), cdiv(N, 128)) with no
+# split-K, so at decode batch sizes the M axis contributes a single block row and the whole
+# GEMM runs on cdiv(N, 128) CTAs -- 8 of them for N=1024, on a 188-SM part. Its runtime then
+# tracks K and ignores both N and M: latency-bound, not bandwidth-bound. Measured on
+# Qwen3.5-27B's projections (RTX PRO 6000, 1461 GB/s copy roof): 594 GB/s flat across
+# M=2..16, against 1334 GB/s for the M=1 GEMV over the same weights. Routing M>=2 to
+# cuBLASLt restores ~1300 GB/s -- 10.15 ms -> 5.56 ms of per-decode-step GEMM.
+#
+# Requires sm_89+ (torch._scaled_mm's floor; Ampere has no FP8 tensor cores) *and* a
+# checkpoint carrying ``input_scale``. Without either, ``_gemm`` still runs: glm_moe_dsa
+# quantizes to fp8 at load with genuine per-row scales and has no activation scale at all.
+# ======================================================================================
+_E4M3_MAX = 448.0  # largest finite e4m3 magnitude
+
+
+@triton.jit
+def _static_quant_kernel(x_ptr, out_ptr, scale_ptr, n_elements, BLOCK: tl.constexpr):
+    """bf16 activation -> fp8-e4m3 under one broadcast per-tensor scale."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
+    v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32) * inv
+    v = tl.minimum(tl.maximum(v, -448.0), 448.0)
+    tl.store(out_ptr + offs, v.to(tl.float8e4nv), mask=mask)
+
+
+def _static_quant(a: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:
+    """One launch, no host sync: the scale is read from device memory inside the kernel, so
+    this stays CUDA-graph safe (fixed shapes, no dependence on tensor *values* on the host)."""
+    n = a.numel()
+    out = torch.empty_like(a, dtype=FP8)
+    BLOCK = 1024
+    _static_quant_kernel[(triton.cdiv(n, BLOCK),)](
+        a, out, input_scale, n, BLOCK=BLOCK, num_warps=4,
+    )
+    return out
+
+
+def _scaled_mm(
+    a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    input_scale: torch.Tensor, uniform_scale: bool, out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """``a @ (weight_fp8 * weight_scale)^T`` as a W8A8 cuBLASLt GEMM.
+
+    ``weight`` stays in the checkpoint-native row-major ``[N, K]``: ``.t()`` is exactly the
+    column-major ``[K, N]`` operand cuBLASLt wants, so the transpose is a stride change and
+    never a copy (unlike Marlin, or our own NVFP4 path's K-major repack).
+
+    A genuine per-tensor weight (one scalar repeated down ``weight_scale``) takes the
+    tensor-wise path. A fused projection, whose ``weight_scale`` is piecewise-constant
+    because each part carries its own scalar, takes the row-wise path -- that keeps every
+    part's scale exact, where vLLM/SGLang instead requantize the parts onto a shared maximum
+    and eat the precision loss. Row-wise costs ~4% here (5.56 ms vs 5.39 ms per step)."""
+    qa = _static_quant(a, input_scale)
+    wt = weight.t()  # [N, K] row-major -> [K, N] column-major, stride-only
+    if uniform_scale:
+        return torch._scaled_mm(
+            qa, wt, scale_a=input_scale.reshape(()), scale_b=weight_scale[0].reshape(()),
+            out_dtype=out_dtype,
+        )
+    return torch._scaled_mm(
+        qa, wt,
+        scale_a=input_scale.reshape(1, 1).expand(a.shape[0], 1).contiguous(),
+        scale_b=weight_scale.reshape(1, -1),
+        out_dtype=out_dtype,
+    )
+
+
 def fp8_pertensor_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
+    input_scale: torch.Tensor | None = None,
+    uniform_scale: bool = False,
 ) -> torch.Tensor:
-    """``y = x @ (weight_fp8 * weight_scale)^T``. Decode (M=1) -> split-K GEMV; prefill -> GEMM.
-    ``weight`` [N, K] fp8-e4m3, ``weight_scale`` [N] fp32 (per output row)."""
+    """``y = x @ (weight_fp8 * weight_scale)^T``. ``weight`` [N, K] fp8-e4m3, ``weight_scale``
+    [N] fp32 (per output row).
+
+    Whether the activation is quantized is a property of the *deployment*, never of the batch:
+    with ``input_scale`` on sm_89+ every M runs W8A8, otherwise every M runs W8A16 (split-K
+    GEMV at M=1, GEMM above it). Picking per-M would make a request's numerics depend on how
+    many unrelated requests happened to be in flight, so a reply would not reproduce at bs=1 --
+    and W8A16 at M=1 is worth only ~0.5% (5.53 ms vs 5.56 ms of per-step GEMM) anyway. vLLM and
+    SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores."""
     *lead, K = x.shape
     N = weight.shape[0]
     if _USE_REF:  # numeric-reference fallback (debug / A-B)
         w = weight.to(x.dtype) * weight_scale.to(x.dtype)[:, None]
         out = (x.reshape(-1, K) @ w.t()).reshape(*lead, N)
+    elif input_scale is not None and e4m3_native():
+        out = _scaled_mm(
+            x.reshape(-1, K), weight, weight_scale, input_scale, uniform_scale, x.dtype,
+        ).reshape(*lead, N)
+    elif x.numel() // K == 1:
+        out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)
     else:
-        w8 = e4m3_kernel_view(weight)
-        if x.numel() // K == 1:
-            out = _gemv(x.reshape(K), w8, weight_scale, x.dtype).reshape(*lead, N)
-        else:
-            out = _gemm(x.reshape(-1, K), w8, weight_scale, x.dtype).reshape(*lead, N)
+        out = _gemm(
+            x.reshape(-1, K), e4m3_kernel_view(weight), weight_scale, x.dtype,
+        ).reshape(*lead, N)
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out
@@ -199,7 +290,11 @@ def fp8_pertensor_linear(
 class Fp8PerTensorLinear(BaseOP):
     """Replicated per-tensor-FP8 linear: fp8-e4m3 ``weight`` ``[out, in]`` + per-row fp32
     ``weight_scale`` ``[out]`` (a genuine per-tensor weight stores the same scalar in every
-    row; a fused projection stores each part's scalar across its own rows)."""
+    row; a fused projection stores each part's scalar across its own rows).
+
+    ``input_scale`` (modelopt's calibrated per-tensor activation scale) is optional: when the
+    checkpoint ships it, batched decode runs W8A8 through cuBLASLt; when it does not (models
+    that quantize to fp8 at load, e.g. glm_moe_dsa), every batch size stays W8A16."""
 
     def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
         self.in_features = in_features
@@ -207,9 +302,28 @@ class Fp8PerTensorLinear(BaseOP):
         self.weight = torch.empty(out_features, in_features, dtype=FP8)
         self.weight_scale = torch.empty(out_features, dtype=torch.float32)
         self.bias = torch.empty(out_features) if has_bias else None
+        # Set from the state dict when present. Left as None (not a tensor) so BaseOP's
+        # reflective state_dict/load_state_dict skip it entirely on checkpoints without one.
+        self.input_scale: torch.Tensor | None = None
+        self._uniform_scale = False
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        # Taken out before BaseOP's reflective pass (so it is not an "unexpected key") and
+        # put back after (so that pass does not try to pop it a second time on a reload).
+        input_scale = state_dict.pop(_concat_prefix(prefix, "input_scale"), None)
+        self.input_scale = None
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        self.input_scale = input_scale
+        # Tensor-wise scaling needs one scalar for the whole weight; a fused projection is
+        # only piecewise-constant, so decide once here rather than syncing on every forward.
+        scale = self.weight_scale
+        self._uniform_scale = bool((scale == scale[0]).all().item())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return fp8_pertensor_linear(x, self.weight, self.weight_scale, self.bias)
+        return fp8_pertensor_linear(
+            x, self.weight, self.weight_scale, self.bias,
+            self.input_scale, self._uniform_scale,
+        )
 
 
 class Fp8PerTensorColMerged(Fp8PerTensorLinear):

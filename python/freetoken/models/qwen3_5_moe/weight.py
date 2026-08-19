@@ -316,25 +316,36 @@ def _per_row_scale(scalar: torch.Tensor, rows: int) -> torch.Tensor:
     return scalar.reshape(1).to(torch.float32).expand(rows)
 
 
-def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor, buf: dict):
-    """Buffer an fp8 fusion part ``(weight, scalar)``; once all parts arrive emit the
-    concatenated ``(.weight fp8, .weight_scale per-row fp32)``. ``[]`` while incomplete,
-    ``None`` if ``base`` is not an fp8 fusion part."""
+def _pt_fp8_fuse(base: str, weight: torch.Tensor, scalar: torch.Tensor,
+                 act_scale: torch.Tensor | None, buf: dict):
+    """Buffer an fp8 fusion part ``(weight, scalar, act_scale)``; once all parts arrive emit
+    the concatenated ``(.weight fp8, .weight_scale per-row fp32)`` plus the shared
+    ``.input_scale``. ``[]`` while incomplete, ``None`` if ``base`` is not an fp8 fusion part.
+
+    The fused parts all read the *same* activation, so modelopt calibrates one activation
+    range for all of them and their ``input_scale`` values come out bit-identical (verified on
+    Qwen3.8-27B-NVFP4: q/k/v all 0.2053571492, GDN qkv/z both 0.1121651828). Taking the max is
+    therefore exact here, and stays correct if a future checkpoint lets them drift."""
     for fused_suffix, parts in _PT_FP8_FUSE.items():
         for idx, part in enumerate(parts):
             if base.endswith(part):
                 key = base[: -len(part)] + fused_suffix
                 slots = buf.setdefault(key, {})
-                slots[idx] = (weight, scalar)
+                slots[idx] = (weight, scalar, act_scale)
                 if len(slots) < len(parts):
                     return []
                 del buf[key]
                 ws = [slots[i][0] for i in range(len(parts))]
                 ss = [_per_row_scale(slots[i][1], slots[i][0].shape[0]) for i in range(len(parts))]
-                return [
+                emit = [
                     (key + ".weight", torch.cat(ws, dim=0)),
                     (key + ".weight_scale", torch.cat(ss, dim=0).contiguous()),
                 ]
+                acts = [slots[i][2] for i in range(len(parts))]
+                if all(a is not None for a in acts):
+                    emit.append((key + ".input_scale", torch.stack(
+                        [a.reshape(()).to(torch.float32) for a in acts]).max()))
+                return emit
     return None
 
 
@@ -466,13 +477,20 @@ def _iter_weights_attn_fp8(
                     if has_s and not has_s2:  # per-tensor FP8 dense projection
                         w = f.get_tensor(raw_name)  # fp8-e4m3, kept verbatim
                         sc = f.get_tensor(raw_base + ".weight_scale")
-                        emit = _pt_fp8_fuse(base, w, sc, fp8_buf)
+                        # modelopt's calibrated activation scale: kept (not dropped with the
+                        # other scale suffixes) so batched decode can run W8A8 instead of
+                        # W8A16. Absent -> the layer stays on the W8A16 kernel.
+                        act = (f.get_tensor(raw_base + ".input_scale")
+                               if raw_base + ".input_scale" in keyset else None)
+                        emit = _pt_fp8_fuse(base, w, sc, act, fp8_buf)
                         if emit is not None:
                             yield from emit
                             continue
                         # standalone fp8 (self_attn.o_proj, linear_attn.out_proj)
                         yield base + ".weight", w
                         yield base + ".weight_scale", _per_row_scale(sc, w.shape[0]).contiguous()
+                        if act is not None:
+                            yield base + ".input_scale", act.reshape(()).to(torch.float32)
                         continue
                     if has_s2:  # NVFP4 dense: keep native (W4A16) where the model expects it
                         emit = _dense_nvfp4_emit(

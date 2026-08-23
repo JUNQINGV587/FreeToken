@@ -582,19 +582,36 @@ def load_ftw_banks(
 
     from freetoken.moe.expert_banks import ExpertBanks
 
-    unpinned = [i for i, r in enumerate(residency) if r != HostResidency.PINNED.value]
+    # a failed mlock leaves a LOCKED layer pageable; the log and labels report what the banks actually settled at
+    applied = list(residency)
+    for banks in row_hb.values():
+        for layer_id, bank in enumerate(banks):
+            if (applied[layer_id] == HostResidency.LOCKED.value
+                    and bank.residency is not HostResidency.LOCKED):
+                applied[layer_id] = HostResidency.PAGEABLE.value
+    unpinned = [i for i, r in enumerate(applied) if r != HostResidency.PINNED.value]
     if unpinned:
         by_layer = [0] * num_layers
         for name, banks in row_hb.items():
             for layer_id, bank in enumerate(banks):
                 by_layer[layer_id] += bank.nbytes
+        locked = [i for i in unpinned if applied[i] == HostResidency.LOCKED.value]
+        pageable = [i for i in unpinned if i not in set(locked)]
         pinned_b = sum(b for i, b in enumerate(by_layer) if i not in set(unpinned))
-        locked_b = sum(by_layer[i] for i in unpinned)
+        locked_b = sum(by_layer[i] for i in locked)
+        pageable_part = ""
+        if pageable:
+            pageable_b = sum(by_layer[i] for i in pageable)
+            pageable_part = (
+                f" + {pageable_b / 2**30:.2f} GiB pageable "
+                f"(lock failed, {len(pageable)} CPU layers: {pageable})"
+            )
         logger.info(
             f"MoE bank split residency: {pinned_b / 2**30:.2f} GiB pinned "
             f"({'born-pinned cudaHostAlloc' if born else 'cudaHostRegister'}, "
             f"{num_layers - len(unpinned)} GPU layers) + "
-            f"{locked_b / 2**30:.2f} GiB OS-locked ({len(unpinned)} CPU layers: {unpinned})"
+            f"{locked_b / 2**30:.2f} GiB OS-locked ({len(locked)} CPU layers: {locked})"
+            f"{pageable_part}"
         )
 
     # alphas are the small per-expert scale vectors, distinguished by their reserved names
@@ -602,7 +619,7 @@ def load_ftw_banks(
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
     return ExpertBanks(
         reader.meta("quant_format"), sources, **alpha_kw,
-        layer_residency=list(residency),
+        layer_residency=applied,
     )
 
 

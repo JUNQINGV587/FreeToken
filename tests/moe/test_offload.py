@@ -839,3 +839,32 @@ def test_echo_residency_stamps_honored_requests_only():
     stale = _ResidencyPlan(labels)  # never consulted -> keep None + warn
     assert _echo_residency(banks, labels, stale).layer_residency is None
     assert _echo_residency(banks, None, None) is banks
+
+
+def test_lock_failure_downgrades_echoed_residency(monkeypatch):
+    # a failed mlock leaves the bank pageable; the plan and the echoed labels must report that instead of the requested LOCKED
+    import freetoken.moe.host_banks as hb
+    from freetoken.moe.expert_banks import ExpertBanks, _echo_residency
+
+    def boom(addr, nbytes):
+        raise OSError(12, "mlock denied")
+
+    monkeypatch.setattr(hb, "_os_lock", boom)
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")  # keep the pinned layer off CUDA
+    labels = [hb.HostResidency.PINNED.value, hb.HostResidency.LOCKED.value]
+
+    banks = {"gate_up": [hb.HostBank((4,), torch.uint8) for _ in range(2)]}
+    with hb.requested_residency(labels) as plan:
+        hb.pin_banks(banks)
+    assert plan.actual == {1: hb.HostResidency.PAGEABLE.value}
+    echoed = _echo_residency(ExpertBanks("bf16", {}), labels, plan)
+    assert echoed.layer_residency == [
+        hb.HostResidency.PINNED.value, hb.HostResidency.PAGEABLE.value,
+    ]
+
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    with hb.requested_residency(labels) as plan2:
+        with hb.PinPipeline() as pins:
+            pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
+    assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}

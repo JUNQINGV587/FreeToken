@@ -219,16 +219,22 @@ class _ResidencyPlan:
 
     Installed by ``load_expert_banks`` around the provider dispatch so every loader honors --moe-cpu-layers without a new parameter in each signature. ``applied`` flips once a settle point consults the plan."""
 
-    __slots__ = ("labels", "applied", "has_unpinned")
+    __slots__ = ("labels", "applied", "has_unpinned", "actual")
 
     def __init__(self, labels: list[str]):
         self.labels = list(labels)
         self.applied = False
         self.has_unpinned = any(r != HostResidency.PINNED.value for r in labels)
+        self.actual: dict[int, str] = {}
 
     def residency_for(self, layer_id: int) -> str:
         self.applied = True
         return self.labels[layer_id]
+
+    def record(self, layer_id: int, achieved: str) -> None:
+        """One pageable bank downgrades the whole layer (a failed lock settles PAGEABLE)."""
+        if self.actual.get(layer_id) != HostResidency.PAGEABLE.value:
+            self.actual[layer_id] = achieved
 
 
 _requested_residency: _ResidencyPlan | None = None
@@ -264,11 +270,13 @@ def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
     for bank in banks.values():
         if isinstance(bank, list):
             for layer_id, layer_bank in enumerate(bank):
-                _settle(
-                    layer_bank,
+                residency = (
                     HostResidency.PINNED.value if plan is None
-                    else plan.residency_for(layer_id),
+                    else plan.residency_for(layer_id)
                 )
+                _settle(layer_bank, residency)
+                if plan is not None and residency == HostResidency.LOCKED.value:
+                    plan.record(layer_id, layer_bank.residency.value)
         else:
             bank.pin()
 
@@ -294,14 +302,17 @@ class PinPipeline:
                 return
             if self._exc is not None:
                 continue  # drain without settling after a failure
-            bank, residency = item
+            bank, residency, plan, layer_id = item
             try:
                 _settle(bank, residency)
+                if plan is not None and residency == HostResidency.LOCKED.value:
+                    plan.record(layer_id, bank.residency.value)
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 
-    def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value) -> None:
-        self._q.put((bank, residency))
+    def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value,
+               plan=None, layer_id: int | None = None) -> None:
+        self._q.put((bank, residency, plan, layer_id))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
         """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label."""
@@ -310,7 +321,7 @@ class PinPipeline:
             HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)
         )
         for bank in banks.values():
-            self.submit(bank, residency)
+            self.submit(bank, residency, plan, layer_id)
 
     def _join(self) -> None:
         self._q.put(None)

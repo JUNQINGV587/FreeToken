@@ -500,7 +500,15 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
     if plan is not None and plan.applied:
         import dataclasses
 
-        return dataclasses.replace(banks, layer_residency=list(requested))
+        labels = [plan.actual.get(i, r) for i, r in enumerate(requested)]
+        downgraded = [i for i, r in enumerate(requested) if labels[i] != r]
+        if downgraded:
+            logger.warning_rank0(
+                f"--moe-cpu-layers: layers {downgraded} settled pageable instead of "
+                f"OS-locked (lock failed); they still decode on the CPU executor but "
+                f"may swap under memory pressure"
+            )
+        return dataclasses.replace(banks, layer_residency=labels)
     from freetoken.moe.host_banks import HostResidency
 
     if any(r != HostResidency.PINNED.value for r in requested):

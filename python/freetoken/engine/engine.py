@@ -535,10 +535,12 @@ class Engine:
         )
         if config.moe_backend == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
-            from freetoken.moe.expert_banks import ftw_bank_bytes
+            from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
             budget = _pin_budget_bytes()
-            bank_bytes = ftw_bank_bytes(config.model_path) if budget is not None else None
+            bank_bytes = None
+            if budget is not None:
+                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
             if bank_bytes and bank_bytes > budget:
                 split_residency = True
                 logger.info_rank0(
@@ -1159,9 +1161,9 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int
     """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
 
     Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
-    from freetoken.moe.expert_banks import ftw_bank_bytes
+    from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-    bank_bytes = ftw_bank_bytes(config.model_path)
+    bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
     if not bank_bytes:
         return frozenset()
     budget = _pin_budget_bytes()

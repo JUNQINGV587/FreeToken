@@ -24,7 +24,7 @@ import torch
 
 from freetoken.utils import init_logger
 
-from .offload_cache import _BANK_SCHEMAS
+from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
 
@@ -384,6 +384,25 @@ def ftw_bank_bytes(model_path: str) -> int | None:
     with open(meta, encoding="utf-8") as f:
         tensors = json.load(f).get("tensors", [])
     return sum(t["nbytes"] for t in tensors if t.get("kind") == "experts_bank")
+
+
+def bank_bytes_estimate(model_config) -> int | None:
+    """Estimated total expert-bank bytes of a raw checkpoint, from the model config alone.
+
+    Sizes the pin-budget decisions where FTW metadata is not available; ``None`` for unknown formats or missing dims (callers then skip the pre-load sizing).
+    nvfp4 uses the native-row formula, a slight over-estimate for the repacked backends."""
+    expert_quant = getattr(model_config, "expert_quant", "none")
+    fmt = expert_quant if expert_quant != "none" else (
+        getattr(model_config, "moe_weight_format", None) or "bf16"
+    )
+    per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
+    layers = getattr(model_config, "num_moe_layers", None)
+    experts = getattr(model_config, "num_experts", None)
+    hidden = getattr(model_config, "hidden_size", None)
+    inter = getattr(model_config, "moe_intermediate_size", None)
+    if per_expert is None or not all((layers, experts, hidden, inter)):
+        return None
+    return layers * experts * per_expert(hidden, inter)
 
 
 def load_expert_banks(

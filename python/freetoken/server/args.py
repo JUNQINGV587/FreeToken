@@ -529,10 +529,13 @@ def parse_args(
         type=str,
         default=ServerArgs.moe_cpu_layers,
         help=(
-            "Hybrid decode with --moe-backend offload: which MoE layers compute on the "
-            "CPU executor instead of the GPU offload/PCIe path. Explicit id list "
-            "('3,7,11'), a count ('8' = 8 layers evenly strided), or a fraction ('0.5'). "
-            "Unset = all layers on GPU."
+            "With --moe-backend offload/hybrid: which MoE layers compute on the "
+            "CPU executor instead of the GPU offload/PCIe path (where CUDA pinning "
+            "is quota-capped, e.g. WSL, their banks are OS-locked instead of pinned). Explicit id list ('3,7,11'), a count ('8' = 8 "
+            "layers evenly strided), or a fraction ('0.5'). Unset = automatic where "
+            "CUDA pinning is quota-capped, e.g. WSL (locks just enough head+tail "
+            "layers when the banks exceed the pin budget, none otherwise); '0' "
+            "forces all layers on GPU."
         ),
     )
 

@@ -118,3 +118,100 @@ def test_normal_completion_sends_no_abort():
         assert 7 in state.ack_map  # wait_for_ack owns normal-path cleanup, not the stream
 
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# Non-streaming handlers: a disconnected client must abort the engine request
+# (same shielded abort_user as the streaming path) instead of letting it run to
+# max_tokens while later requests queue behind it.
+# --------------------------------------------------------------------------- #
+
+from freetoken.server import openai_api
+from freetoken.server.api_models import ChatCompletionRequest, CompletionRequest
+
+
+def _ack(text, finished=False):
+    return SimpleNamespace(
+        error=None,
+        incremental_output=text,
+        finished=finished,
+        prompt_tokens_delta=0,
+        completion_tokens_delta=1,
+        cached_tokens=0,
+        finish_reason="stop" if finished else None,
+        matched_stop=None,
+        logprobs=None,
+    )
+
+
+class _ApiState:
+    """State fake for the openai_api handlers: hangs forever when given no acks."""
+
+    def __init__(self, acks=None):
+        self.config = SimpleNamespace(
+            model_path="/models/unit-model",
+            served_model_name="unit-model",
+            tool_call_parser="llama3",
+            reasoning_parser=None,
+        )
+        self.acks = acks
+        self.sent = []
+        self.aborted = []
+
+    def new_user(self):
+        return 7
+
+    async def send_one(self, msg):
+        self.sent.append(msg)
+
+    async def wait_for_ack(self, uid):
+        if self.acks is None:
+            await asyncio.sleep(3600)
+        for ack in self.acks or []:
+            yield ack
+
+    async def abort_user(self, uid):
+        self.aborted.append(uid)
+
+
+def _chat_req(**kwargs):
+    payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+    payload.update(kwargs)
+    return ChatCompletionRequest(**payload)
+
+
+def test_chat_non_stream_disconnect_delivers_abort(monkeypatch):
+    monkeypatch.setattr(openai_api, "_DISCONNECT_POLL_SECONDS", 0.01)
+    state = _ApiState(acks=None)  # generation never finishes on its own
+
+    resp = asyncio.run(
+        openai_api.handle_chat_completion(_chat_req(), _Request(disconnected=True), state, {})
+    )
+
+    assert resp.status_code == 499
+    assert state.aborted == [7]
+
+
+def test_completion_non_stream_disconnect_delivers_abort(monkeypatch):
+    monkeypatch.setattr(openai_api, "_DISCONNECT_POLL_SECONDS", 0.01)
+    state = _ApiState(acks=None)
+    req = CompletionRequest(model="m", prompt="hello", max_tokens=8)
+
+    resp = asyncio.run(
+        openai_api.handle_completion(req, _Request(disconnected=True), state, {})
+    )
+
+    assert resp.status_code == 499
+    assert state.aborted == [7]
+
+
+def test_non_stream_connected_client_gets_result_without_abort(monkeypatch):
+    monkeypatch.setattr(openai_api, "_DISCONNECT_POLL_SECONDS", 0.01)
+    state = _ApiState(acks=[_ack("Hi", finished=True)])
+
+    result = asyncio.run(
+        openai_api.handle_chat_completion(_chat_req(), _Request(disconnected=False), state, {})
+    )
+
+    assert result["choices"][0]["message"]["content"] == "Hi"
+    assert state.aborted == []

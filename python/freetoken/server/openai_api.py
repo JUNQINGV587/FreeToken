@@ -183,9 +183,8 @@ async def _await_watching_disconnect(awaitable, request: Request | None, state: 
             logger.exception("Failed to deliver abort for user %s", uid)
         gen.cancel()
         raise
-    # Client gone. Claim + AbortMsg first (abort_user is a no-op once the ack
-    # loop's own cleanup has run), then wind down the drain task; its result is
-    # undeliverable either way.
+    # Client gone. Deliver the AbortMsg first (the decode stops sooner), then
+    # wind down the drain task; its result is undeliverable either way.
     try:
         await asyncio.shield(state.abort_user(uid))
     except Exception:  # noqa: BLE001

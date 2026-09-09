@@ -23,6 +23,7 @@ def _state(send_impl=None):
     st = SimpleNamespace(
         ack_map={7: [object()]},
         event_map={7: asyncio.Event()},
+        aborted_uids={},
         stats=_Stats(),
     )
     sent = []
@@ -99,6 +100,84 @@ def test_abort_user_is_idempotent():
         assert len(state.sent) == 1
 
         await FrontendManager.abort_user(state, 7)
+        assert len(state.sent) == 1
+        assert state.stats.aborts == [7]
+
+    asyncio.run(run())
+
+
+def test_cancellation_after_ack_loop_cleanup_still_aborts():
+    """The production disconnect path: the CancelledError lands on wait_for_ack's
+    innermost await, and its finally empties both maps BEFORE the stream wrapper
+    gets to run. A claim keyed on the maps no-ops exactly then; the AbortMsg must
+    still reach the scheduler (which acks aborts for uids it no longer has)."""
+
+    async def run():
+        state = _state()
+
+        async def drain_like_wait_for_ack():
+            try:
+                await asyncio.sleep(3600)
+                yield b""  # pragma: no cover
+            finally:
+                state.ack_map.pop(7, None)
+                state.event_map.pop(7, None)
+
+        async def consume():
+            state.abort_user = lambda uid: FrontendManager.abort_user(state, uid)
+            async for _ in FrontendManager.stream_with_cancellation(
+                state, drain_like_wait_for_ack(), _Request(), 7
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert state.ack_map == {} and state.event_map == {}
+        assert [type(m) for m in state.sent] == [AbortMsg]
+        assert state.sent[0].uid == 7
+        assert state.stats.aborts == [7]
+
+    asyncio.run(run())
+
+
+def test_late_close_delivers_abort():
+    """A body closed after the response started surfaces as aclose() on the stream
+    wrapper: GeneratorExit, which `except CancelledError` never sees. The finally
+    must deliver the abort for any stream that did not run to completion."""
+
+    async def run():
+        state = _state()
+        state.abort_user = lambda uid: FrontendManager.abort_user(state, uid)
+
+        async def chunks():
+            while True:
+                yield b"data: x\n\n"
+
+        agen = FrontendManager.stream_with_cancellation(state, chunks(), _Request(), 7)
+        assert await agen.__anext__() == b"data: x\n\n"
+        await agen.aclose()
+
+        assert [type(m) for m in state.sent] == [AbortMsg]
+        assert state.sent[0].uid == 7
+        assert state.stats.aborts == [7]
+
+    asyncio.run(run())
+
+
+def test_concurrent_aborts_send_one_message():
+    """The accounting drain gathers abort_user over every in-flight uid and can race
+    a disconnect abort for the same request; the claim set must collapse them."""
+
+    async def run():
+        state = _state()
+        await asyncio.gather(
+            FrontendManager.abort_user(state, 7),
+            FrontendManager.abort_user(state, 7),
+        )
         assert len(state.sent) == 1
         assert state.stats.aborts == [7]
 

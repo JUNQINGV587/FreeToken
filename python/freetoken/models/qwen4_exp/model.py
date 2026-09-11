@@ -210,7 +210,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        hidden = self.model.forward(batch.input_ids, batch)
+        # Project only the rows the sampler reads. engine.forward_batch keeps
+        # logits[:batch.size]; the rest of the forward window is overlap context whose
+        # logits nobody looks at. At this vocab (248,320) a full 8192-token prefill chunk
+        # would allocate 4.07 GiB of bf16 logits and run a vocab GEMM 1024x larger than
+        # needed, both on the TTFT path. lm_head is row-wise, so slicing first is exact.
+        return self.lm_head.forward(hidden[: batch.size])
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

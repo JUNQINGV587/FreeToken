@@ -257,7 +257,7 @@ def _rename(raw_name: str, keep_scale_inv: bool = False) -> str | None:
     ``keep_scale_inv`` retains the block-FP8 ``weight_scale_inv`` tensors, which the
     fp8 linears need alongside their weight; they are dropped otherwise (a rank that
     dequantized its dense weights has no use for the reciprocal scale)."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table

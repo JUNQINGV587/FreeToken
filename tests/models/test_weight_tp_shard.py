@@ -43,7 +43,9 @@ def _patch(monkeypatch, reader):
         "_spec_for_model_path",
         lambda path: (
             None,
-            SimpleNamespace(module="fake.mod", iter_weights="iter_weights"),
+            # encoders=() mirrors ModelSpec: only a family that registers a tower is asked
+            # about include_vision, so this fake reader is never handed that kwarg.
+            SimpleNamespace(module="fake.mod", iter_weights="iter_weights", encoders=()),
         ),
     )
     monkeypatch.setattr(weight_mod, "_load_attr", lambda module, name: reader)

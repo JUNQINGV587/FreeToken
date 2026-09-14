@@ -125,6 +125,27 @@ class LinearQKVMerged(_LinearTPImpl):
         )
 
 
+def _row_parallel_forward(layer, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
+    """Forward of a row-parallel linear: shard the input, then sum the ranks' partials.
+
+    The bias belongs to the summed output, not to one rank's partial: a row-parallel layer is
+    built with ``local_osize == output_size``, so every rank holds the whole bias and letting
+    the quant method add it would contribute ``tp_size`` copies once the all-reduce sums them
+    (at TP=2 every biased output came out with twice its bias -- invisible on a bias-free text
+    tower, fatal to the biased vision tower). Hold it out of the local compute, add it once.
+    """
+    bias = layer.bias
+    if bias is not None:
+        layer.bias = None
+    try:
+        y = layer.quant_method.apply(layer, x)
+    finally:
+        layer.bias = bias
+    if layer._tp_size > 1 and reduce:
+        y = layer._comm.all_reduce(y)
+    return y if bias is None else y + bias.to(y.dtype)
+
+
 class LinearOProj(_LinearTPImpl):
     def __init__(
         self,
@@ -148,10 +169,7 @@ class LinearOProj(_LinearTPImpl):
         )
 
     def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
-        y = self.quant_method.apply(self, x)
-        if self._tp_size > 1 and reduce:
-            y = self._comm.all_reduce(y)
-        return y
+        return _row_parallel_forward(self, x, reduce=reduce)
 
 
 class LinearRowParallel(_LinearTPImpl):
@@ -175,7 +193,4 @@ class LinearRowParallel(_LinearTPImpl):
         )
 
     def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
-        y = self.quant_method.apply(self, x)
-        if self._tp_size > 1 and reduce:
-            y = self._comm.all_reduce(y)
-        return y
+        return _row_parallel_forward(self, x, reduce=reduce)

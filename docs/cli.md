@@ -154,6 +154,10 @@ Discovers the served model via `/v1/models`, writes the agent's provider
 config, installs the agent CLI if missing, then launches it. Cloud API keys
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are cleared from the child
 environment so the agent cannot silently fall back to a paid endpoint.
+When `/v1/stats` reports `image` among `model.input_modalities`, the written
+config declares the model image-capable, which Codex, OpenCode, OpenClaw and
+dsh require before their image tools and attachments send anything; Claude
+Code and Hermes need no declaration.
 
 | Flag | Meaning |
 |---|---|

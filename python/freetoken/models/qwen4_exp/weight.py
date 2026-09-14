@@ -6,7 +6,7 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is kept only when the model built the tower.
 """
 
 from __future__ import annotations
@@ -21,6 +21,9 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.models.qwen3_vl.weight import rename_vl_prefix
+
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.qwen4_exp.config import dense_quant_mode
 from freetoken.models.nvfp4_banks import (
@@ -264,11 +267,7 @@ def _rename(raw_name: str, keep_scale_inv: bool = False) -> str | None:
         keep_scale_inv and raw_name.endswith(".weight_scale_inv")
     ):
         return None
-    if raw_name.startswith("model.language_model."):
-        return "model." + raw_name[len("model.language_model.") :]
-    if raw_name.startswith("language_model."):
-        return "model." + raw_name[len("language_model.") :]
-    return raw_name
+    return rename_vl_prefix(raw_name)
 
 
 def _split_kind(name: str) -> tuple[str, str]:
@@ -394,6 +393,7 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
     tp_shard: bool = False,
     config=None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -445,6 +445,8 @@ def iter_weights(
             for raw_name in f.keys():
                 name = _rename(raw_name, keep_scale_inv=serve_block_fp8)
                 if name is None:
+                    continue
+                if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
                 tensor = (
                     f.get_tensor(raw_name)

@@ -413,6 +413,18 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     return cache, total_bytes
 
 
+def _restage_full_layer(cache) -> None:
+    """Re-arm the staged-layer marker before a repeated ``copy_missing()``.
+
+    ``OffloadMoeCache.copy_missing`` consumes its staged state once (it clears
+    ``_pending_src_layer`` so a caller can tell "nothing staged" from "staged two
+    layers ago"). This rig stages a single synthetic layer and copies it in a loop,
+    so the marker has to be re-armed each iteration; the staged tensors
+    (``src_indices`` / ``evict_slots`` / ``num_indices``) are not consumed.
+    """
+    cache._pending_src_layer = 0
+
+
 def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: int = 20) -> dict:
     """Real PCIe gather bandwidth (GB/s): pinned host banks -> GPU slot cache.
 
@@ -426,6 +438,7 @@ def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: 
     E = cache.num_experts
 
     for _ in range(3):
+        _restage_full_layer(cache)
         cache.copy_missing()
     torch.cuda.synchronize(device)
     start = torch.cuda.Event(enable_timing=True)
@@ -434,6 +447,7 @@ def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: 
         torch.cuda._sleep(10**7)  # keep the CPU from running the launches ahead of the timer
     start.record()
     for _ in range(iters):
+        _restage_full_layer(cache)
         cache.copy_missing()
     end.record()
     end.synchronize()
@@ -562,6 +576,7 @@ def measure_overlap_bw(fmt: str, wl: Workload, device: torch.device,
     for i in range(8):  # warm both sides (JIT, page faults, clocks)
         set_ids(i)
         run_step()
+        _restage_full_layer(cache)
         cache.copy_missing()
     torch.cuda.synchronize(device)
 
@@ -585,6 +600,7 @@ def measure_overlap_bw(fmt: str, wl: Workload, device: torch.device,
     t0 = time.perf_counter()
     copies = 0
     while time.perf_counter() - t0 < seconds:
+        _restage_full_layer(cache)
         cache.copy_missing()
         torch.cuda.synchronize(device)
         copies += 1

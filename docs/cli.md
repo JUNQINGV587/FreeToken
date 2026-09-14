@@ -103,8 +103,10 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 
 Experimental. Needs a vision-capable checkpoint (Qwen3.6, Qwen3.8-Flash-Next, Qwen3-VL); a request carrying images is
 rejected otherwise. Images are accepted on all three protocols (OpenAI `image_url`,
-Anthropic `image` blocks, Responses `input_image`) as an http(s) URL or base64. Images inside Anthropic
-`tool_result` blocks are rejected with a 400: chat templates render tool messages as plain text.
+Anthropic `image` blocks, Responses `input_image`) as an http(s) URL or base64. Images inside a tool
+result (an Anthropic `tool_result` block from Claude Code's Read, a Responses `function_call_output`
+from Codex's view_image) are moved to the user turn that follows the tool message, as vLLM does,
+because chat templates render tool messages as plain text.
 `GET /v1/stats` reports what the server accepts as `model.input_modalities` (`["text"]` or `["text", "image"]`),
 so a client can gate its attachment controls without reading the checkpoint config.
 

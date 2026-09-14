@@ -280,13 +280,14 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
             }
         ]
     if itype == "function_call_output":
-        return [
-            {
-                "role": "tool",
-                "tool_call_id": item.get("call_id", ""),
-                "content": _stringify(item.get("output")),
-            }
-        ]
+        output = item.get("output")
+        content = _input_content(output) if isinstance(output, list) else _stringify(output)
+        tool_msg = {"role": "tool", "tool_call_id": item.get("call_id", ""), "content": content}
+        if isinstance(content, str):
+            return [tool_msg]
+        # Chat templates render tool messages as text, so the images ride on a user turn after the tool message (the Anthropic path does the same).
+        tool_msg["content"] = "".join(p["text"] for p in content if p["type"] == "text")
+        return [tool_msg, {"role": "user", "content": [p for p in content if p["type"] == "image"]}]
     if itype == "reasoning":
         # Folded into its assistant turn by _merge_assistant_run; summary-only /
         # encrypted items carry no recoverable text.

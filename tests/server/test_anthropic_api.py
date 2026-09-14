@@ -889,7 +889,69 @@ def test_count_tokens_reads_the_real_manager_return_contract():
     assert r.json() == {"input_tokens": 5}
 
 
-def test_tool_result_image_is_rejected_not_dropped():
+def test_tool_result_image_moves_to_the_following_user_turn():
+    # Claude Code's Read on an image file: the tool_result carries the image, the user turn carries the reminder text.
+    body = {
+        "model": "claude-x",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "shot taken"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                        ],
+                    },
+                    {"type": "text", "text": "<system-reminder>look</system-reminder>"},
+                ],
+            },
+        ],
+    }
+    messages, _, _, _ = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
+    assert messages[-2] == {"role": "tool", "tool_call_id": "toolu_1", "content": "shot taken"}
+    assert messages[-1] == {
+        "role": "user",
+        "content": [
+            {"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}},
+            {"type": "text", "text": "<system-reminder>look</system-reminder>"},
+        ],
+    }
+    # On a server without vision the image is refused as an image input, not dropped.
+    r = _client(FakeState([])).post("/v1/messages", json=body)
+    assert r.status_code == 400, r.text
+    assert "vision" in r.json()["error"]["message"]
+
+
+def test_tool_result_image_outside_a_user_message_is_rejected():
+    # Anthropic only allows tool_result in user messages; an image there has no user turn to ride on.
+    body = {
+        "model": "claude-x",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}],
+                    }
+                ],
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="user message"):
+        A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
+
+
+def test_image_only_tool_result_keeps_an_empty_tool_message():
     body = {
         "model": "claude-x",
         "max_tokens": 16,
@@ -908,8 +970,9 @@ def test_tool_result_image_is_rejected_not_dropped():
             },
         ],
     }
-    with pytest.raises(ValueError, match="tool results"):
-        A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate(body), {})
-    r = _client(FakeState([])).post("/v1/messages", json=body)
-    assert r.status_code == 400, r.text
-    assert "tool results" in r.json()["error"]["message"]
+    messages, _, _, _ = A.convert_anthropic_prompt(AnthropicMessagesRequest.model_validate(body))
+    assert messages[-2] == {"role": "tool", "tool_call_id": "toolu_1", "content": ""}
+    assert messages[-1] == {
+        "role": "user",
+        "content": [{"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}],
+    }

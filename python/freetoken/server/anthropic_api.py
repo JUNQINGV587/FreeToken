@@ -218,21 +218,7 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                src = block.source or {}
-                stype = src.get("type")
-                data = src.get("data") if stype == "base64" else src.get("url")
-                if not data:
-                    # an unsupported image source must fail the request, not degrade to a text-only answer
-                    raise ValueError(f"unsupported image source type: {stype!r}")
-                content_parts.append(
-                    {
-                        "type": "image",
-                        "freetoken_ref": {
-                            "kind": "b64" if stype == "base64" else "url",
-                            "data": data,
-                        },
-                    }
-                )
+                content_parts.append(_image_part(block.source))
                 continue
             elif block.type == "tool_use":
                 tool_calls.append(
@@ -246,21 +232,21 @@ def convert_anthropic_prompt(
                     }
                 )
             elif block.type == "tool_result":
+                text, images = _tool_result_parts(block.content)
                 if msg.role == "user":
                     other.append(
                         {
                             "role": "tool",
                             "tool_call_id": block.tool_use_id or block.id or "",
-                            "content": _tool_result_text(block.content),
+                            "content": text,
                         }
                     )
+                    # Chat templates render tool messages as text, so the images ride on the user turn that follows the tool messages (vLLM does the same).
+                    content_parts.extend(images)
                 else:
-                    content_parts.append(
-                        {
-                            "type": "text",
-                            "text": f"Tool result: {_tool_result_text(block.content)}",
-                        }
-                    )
+                    if images:
+                        raise ValueError("images inside a tool_result are only accepted in a user message")
+                    content_parts.append({"type": "text", "text": f"Tool result: {text}"})
 
         openai_msg: dict[str, Any] = {"role": msg.role}
         if thinking_parts:
@@ -353,21 +339,36 @@ def _content_text(content) -> str:
     return "".join(b.text for b in content if getattr(b, "type", None) == "text" and b.text)
 
 
-def _tool_result_text(content) -> str:
+def _image_part(source: dict[str, Any] | None) -> dict[str, Any]:
+    src = source or {}
+    stype = src.get("type")
+    data = src.get("data") if stype == "base64" else src.get("url")
+    if not data:
+        # an unsupported image source must fail the request, not degrade to a text-only answer
+        raise ValueError(f"unsupported image source type: {stype!r}")
+    return {
+        "type": "image",
+        "freetoken_ref": {"kind": "b64" if stype == "base64" else "url", "data": data},
+    }
+
+
+def _tool_result_parts(content) -> tuple[str, list[dict[str, Any]]]:
+    """The text of a tool_result and its image blocks as image parts."""
     if content is None:
-        return ""
+        return "", []
     if isinstance(content, str):
-        return content
-    parts: list[str] = []
+        return content, []
+    texts: list[str] = []
+    images: list[dict[str, Any]] = []
     for item in content:
         if isinstance(item, dict):
             if item.get("type") == "image":
-                # chat templates render tool messages as plain text, so an image here has nowhere to go
-                raise ValueError("images inside tool results are not supported")
-            parts.append(item.get("text") or "")
+                images.append(_image_part(item.get("source")))
+            else:
+                texts.append(item.get("text") or "")
         else:
-            parts.append(str(item))
-    return "".join(parts)
+            texts.append(str(item))
+    return "".join(texts), images
 
 
 # --------------------------------------------------------------------------- #

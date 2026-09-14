@@ -212,6 +212,7 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    include_vision: bool = True,
     tp_shard: bool = False,
     tp_config=None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -221,40 +222,43 @@ def load_weight(
     # fails loudly in load_state_dict (strict missing/unexpected expert keys), so the reader
     # just yields the stored weight tensors regardless of the include_moe_experts flag.
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
-    from freetoken.models.config import VISION_KEY_PREFIXES, vision_load_enabled
+    from freetoken.models.config import VISION_KEY_PREFIXES
 
     if is_ftw_checkpoint(model_path):
         # The FTW dense shard stores whatever existed at conversion, including the vision
-        # stack. Vision is opt-in (default OFF, see vision_load_enabled): when it is off the
-        # model never builds the tower, so replaying those tensors would trip load_state_dict's
-        # strict unexpected-key check. Skip them here to match the model the engine built.
+        # stack. A text-only serve passes include_vision=False and never builds the tower, so
+        # replaying those tensors would trip load_state_dict's strict unexpected-key check;
+        # the shared skip below drops them to match the model the engine built.
         #
         # ``tp_shard`` is a no-op on this path: the FTW dense shard is written POST-shard, so
         # it is already rank-local. The engine asks for tp_shard on every TP>1 launch, so
         # rejecting the combination here would break FTW checkpoints at TP>1.
-        skip_vision = not vision_load_enabled()
-        for name, tensor in iter_ftw_weights(model_path):
-            if skip_vision and name.startswith(VISION_KEY_PREFIXES):
-                continue
-            yield name, tensor
-        return
-
-    _config, spec = _spec_for_model_path(model_path)
-    iter_weights = _load_attr(spec.module, spec.iter_weights)
-    kwargs = dict(include_moe_experts=include_moe_experts, include_non_moe=True)
-    parameters = inspect.signature(iter_weights).parameters
-    if "tp_shard" in parameters:
-        # Readers that declare ``tp_shard`` slice the RAW checkpoint tensors themselves.
-        kwargs["tp_shard"] = tp_shard
-        if tp_config is not None and "config" in parameters:
-            kwargs["config"] = tp_config
-    # Readers that do NOT declare ``tp_shard`` already shard inside ``iter_weights`` (they call
-    # ``shard_tensor`` with ``tp_info.rank``/``tp_info.size``: llama, qwen2, qwen3, qwen3_moe,
-    # mistral, gpt_oss, minimax_m2), so TP>1 is handled and the flag must NOT be forwarded --
-    # forwarding it raised and turned a working TP>1 launch into a startup failure.
-    # Architectures that cannot shard at all still fail loudly in ``load_state_dict``'s shape
-    # check, exactly as they did before this flag existed.
-    yield from iter_weights(model_path, device, **kwargs)
+        weights = iter_ftw_weights(model_path)
+    else:
+        _config, spec = _spec_for_model_path(model_path)
+        iter_weights = _load_attr(spec.module, spec.iter_weights)
+        kwargs = dict(include_moe_experts=include_moe_experts, include_non_moe=True)
+        # only a family that registers an encoder is asked about the tower; the others never load one
+        if spec.encoders:
+            kwargs["include_vision"] = include_vision
+        parameters = inspect.signature(iter_weights).parameters
+        if "tp_shard" in parameters:
+            # Readers that declare ``tp_shard`` slice the RAW checkpoint tensors themselves.
+            kwargs["tp_shard"] = tp_shard
+            if tp_config is not None and "config" in parameters:
+                kwargs["config"] = tp_config
+        # Readers that do NOT declare ``tp_shard`` already shard inside ``iter_weights`` (they call
+        # ``shard_tensor`` with ``tp_info.rank``/``tp_info.size``: llama, qwen2, qwen3, qwen3_moe,
+        # mistral, gpt_oss, minimax_m2), so TP>1 is handled and the flag must NOT be forwarded --
+        # forwarding it raised and turned a working TP>1 launch into a startup failure.
+        # Architectures that cannot shard at all still fail loudly in ``load_state_dict``'s shape
+        # check, exactly as they did before this flag existed.
+        weights = iter_weights(model_path, device, **kwargs)
+    for name, tensor in weights:
+        # the FTW replay has no reader to skip the tower; a text-only engine never built it
+        if not include_vision and name.startswith(VISION_KEY_PREFIXES):
+            continue
+        yield name, tensor
 
 
 def load_q4_0_moe_expert_sources(

@@ -281,6 +281,9 @@ def _materialize_loaded_weight_state_dict(
     for key, weight in weights:
         expected = model_state.get(key)
         if expected is None:
+            # NOTE: the quant scheme may declare no input_scale for a layer whose FTW still stores one
+            if key.endswith(".input_scale"):
+                continue
             state_dict[key] = weight.to(device=device)
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)

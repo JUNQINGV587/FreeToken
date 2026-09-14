@@ -569,7 +569,11 @@ def test_read_range_into_rejects_a_short_destination(blob):
 def test_iter_weights_tp_shard_reassembles_every_dense_buffer(checkpoint, monkeypatch):
     """TP2 loader contract: `tp_shard=True` emits rank-local buffers whose concatenation
     equals the TP1 loader's output for every dense tensor, and the fused groups keep their
-    head boundaries. No model is constructed; the comparison is against `iter_weights` TP1."""
+    head boundaries. No model is constructed; the comparison is against `iter_weights` TP1.
+
+    Text-only (`include_vision=False`), the configuration this loader serves at TP>1: the
+    vision tower is neither sharded nor replicated here (its own loader refuses TP>1), and
+    the engine builds it only inside `--text-model-only`'s absence at TP1."""
     import freetoken.distributed.info as info
 
     folder, _raw = checkpoint
@@ -584,7 +588,8 @@ def test_iter_weights_tp_shard_reassembles_every_dense_buffer(checkpoint, monkey
     tp1 = {
         name: tensor
         for name, tensor in iter_weights(
-            folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True
+            folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True,
+            include_vision=False,
         )
     }
 
@@ -596,7 +601,7 @@ def test_iter_weights_tp_shard_reassembles_every_dense_buffer(checkpoint, monkey
                 name: tensor
                 for name, tensor in iter_weights(
                     folder, torch.device("cpu"), include_moe_experts=False,
-                    include_non_moe=True, tp_shard=True, config=config,
+                    include_non_moe=True, include_vision=False, tp_shard=True, config=config,
                 )
             }
         )

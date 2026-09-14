@@ -577,6 +577,7 @@ def test_iter_weights_tp_shard_reassembles_every_dense_buffer(checkpoint, monkey
     import freetoken.distributed.info as info
 
     folder, _raw = checkpoint
+    install_quant_config(folder)  # the reader needs the process-wide scheme, as the engine sets it
     config = SimpleNamespace(
         num_qo_heads=QH,
         num_kv_heads=KVH,
@@ -800,3 +801,60 @@ def test_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, quan
     (tmp_path / "config.json").write_text(json.dumps(_config_json(quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+def test_vision_tower_sharding_matches_the_tp2_model(monkeypatch):
+    """The reader must cut the tower exactly as `Qwen3VLVisionModel` builds it under TP.
+
+    `VisionAttention` keeps `div_even(num_heads, tp)` heads and lays its fused buffer out
+    ``[q | k | v]``, while the MLP and merger projections are column/row parallel. A `visual.*`
+    tensor that is not cut to that rank-local shape trips `load_state_dict`'s shape assert on a
+    TP>1 launch, so the shapes are compared against the model itself (meta device, no GPU)
+    rather than a hand-written table.
+    """
+    import freetoken.distributed.info as info
+    from freetoken.models.qwen3_vl.config import VisionConfig
+    from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel
+
+    vc = VisionConfig(  # real parallel geometry (4 heads, 2x2 merge) on a tiny tower
+        hidden_size=64, depth=2, num_heads=4, intermediate_size=128, patch_size=2,
+        temporal_patch_size=1, spatial_merge_size=2, num_position_embeddings=16,
+        out_hidden_size=32, in_channels=3,
+    )
+
+    def shapes(size: int) -> dict[str, tuple[int, ...]]:
+        monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=size))
+        with torch.device("meta"):
+            sd = Qwen3VLVisionModel(vc, quant_config=None, prefix="visual").state_dict(prefix="visual")
+        return {k: tuple(v.shape) for k, v in sd.items()}
+
+    full_shapes, tp2_shapes = shapes(1), shapes(2)
+    config = SimpleNamespace(vision_config=vc)
+    section = vc.num_heads * (vc.hidden_size // vc.num_heads)
+    assert full_shapes["visual.blocks.0.attn.qkv.weight"] == (3 * section, vc.hidden_size)
+    for key, full_shape in full_shapes.items():
+        numel = 1
+        for dim in full_shape:
+            numel *= dim
+        full = torch.arange(1, numel + 1, dtype=torch.float32).reshape(full_shape)
+        leaf = key.rsplit(".", 1)[-1]
+        stem = key[: -len(leaf) - 1]
+        for rank in range(2):
+            got = shard_qwen4_exp_dense_tensor(key, full, config=config, rank=rank, world_size=2)
+            assert got.shape == tp2_shapes[key], (key, rank, got.shape, tp2_shapes[key])
+            if ".attn.qkv." in key:  # [q | k | v], each rank taking consecutive heads of every section
+                expected = torch.cat(
+                    [p.narrow(0, rank * (section // 2), section // 2) for p in torch.split(full, [section] * 3, dim=0)],
+                    dim=0,
+                )
+            elif stem.endswith(".linear_fc1"):  # column parallel: output rows (and their bias)
+                expected = full.narrow(0, rank * (full_shape[0] // 2), full_shape[0] // 2)
+            elif key.endswith((".attn.proj.weight", ".linear_fc2.weight")):  # row parallel: input columns
+                expected = full.narrow(1, rank * (full_shape[1] // 2), full_shape[1] // 2)
+            else:  # patch embed, position table, norms, output biases: replicated verbatim
+                expected = full
+            assert torch.equal(got, expected), (key, rank)
+    assert shard_qwen4_exp_dense_tensor(
+        "visual.blocks.0.attn.qkv.weight", torch.zeros(full_shapes["visual.blocks.0.attn.qkv.weight"]),
+        config=config, rank=0, world_size=1,
+    ).shape == full_shapes["visual.blocks.0.attn.qkv.weight"]

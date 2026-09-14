@@ -125,6 +125,46 @@ def _shard_dim1(tensor: torch.Tensor, *, rank: int, world_size: int) -> torch.Te
     return tensor.narrow(1, start, local).contiguous()
 
 
+def _shard_vision_tensor(
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    config,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    """TP sharding for the ViT tower, which the model builds head- and projection-parallel.
+
+    ``VisionAttention`` holds ``div_even(num_heads, tp)`` heads and ``LinearQKVMerged`` lays its
+    local buffer out ``[q | k | v]``, while ``LinearColParallelMerged``/``LinearRowParallel`` hold
+    a rank's slice of the MLP and merger projections -- so those rows/columns are cut here. The
+    patch embedding, the position table, every norm and the row-parallel *biases* (an output-axis
+    bias is not split) are replicated, and the caller leaves them alone.
+    """
+    vc = config.vision_config
+    leaf = key.rsplit(".", 1)[-1]
+    stem = key[: -len(leaf) - 1]
+    if stem.endswith(".attn.qkv"):
+        head_dim = vc.hidden_size // vc.num_heads
+        q, k, v = torch.split(tensor, [vc.num_heads * head_dim] * 3, dim=0)
+        return torch.cat(
+            [
+                _shard_head_rows(
+                    part, num_heads=vc.num_heads, rows_per_head=head_dim,
+                    rank=rank, world_size=world_size,
+                )
+                for part in (q, k, v)
+            ],
+            dim=0,
+        ).contiguous()
+    if stem.endswith(".linear_fc1"):  # column parallel: output rows, and the bias that goes with them
+        start, local = _partition(tensor.shape[0], rank, world_size)
+        return tensor.narrow(0, start, local).contiguous()
+    if leaf == "weight" and stem.endswith((".attn.proj", ".linear_fc2")):  # row parallel: input columns
+        return _shard_dim1(tensor, rank=rank, world_size=world_size)
+    return tensor
+
+
 def shard_qwen4_exp_dense_tensor(
     key: str,
     tensor: torch.Tensor,
@@ -142,6 +182,11 @@ def shard_qwen4_exp_dense_tensor(
     """
     if world_size == 1:
         return tensor
+
+    if key.startswith("visual."):
+        return _shard_vision_tensor(
+            key, tensor, config=config, rank=rank, world_size=world_size
+        )
 
     linear = config.linear_attention_group()
     if key in {"model.embed_tokens.weight", "lm_head.weight"}:

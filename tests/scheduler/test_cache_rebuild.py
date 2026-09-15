@@ -168,3 +168,41 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
     cache_manager.prefill_chunk_budget = 1000  # the (stubbed) engine rebuild shrank the pool
     Scheduler.rebuild_cache(sched, num_pages=16)
     assert sched.prefill_budget == 1000  # tracks the shrunk cap, not the stale 5000
+
+
+def _pool_engine(calls, *, moe_slots=512, num_pages=4096, mamba_slots=9):
+    """An engine carrying only the three pools _resize_pools touches, each logging its resize."""
+    from types import SimpleNamespace
+
+    engine = SimpleNamespace(num_pages=num_pages)
+    engine.moe_offload_cache = SimpleNamespace(
+        cache_size=moe_slots, rebuild=lambda n: calls.append(("moe", n)))
+    engine.linear_state_pool = SimpleNamespace(
+        num_slots=mamba_slots, rebuild=lambda n: calls.append(("mamba", n)))
+    engine._resize_kv_pool = lambda config, pages, swa: calls.append(("kv", pages, swa))
+    return engine
+
+
+def test_resize_pools_frees_shrinking_pools_before_growing_ones():
+    """#5: MoE 512 -> 1024 slots with KV 4096 -> 1024 pages OOMed on a full card because the MoE
+    pool was reallocated while the KV pool still held its old pages."""
+    from freetoken.engine.engine import Engine
+
+    calls = []
+    Engine._resize_pools(_pool_engine(calls), None, moe_cache_size=1024, num_pages=1024,
+                         num_mamba_slots=4, num_swa_pages=None)
+    assert calls == [("kv", 1024, None), ("mamba", 5), ("moe", 1024)]
+
+    calls.clear()  # the rollback of that request: MoE shrinks back first, then KV and mamba grow
+    Engine._resize_pools(_pool_engine(calls, moe_slots=1024, num_pages=1024, mamba_slots=5), None,
+                         moe_cache_size=512, num_pages=4096, num_mamba_slots=8, num_swa_pages=None)
+    assert calls == [("moe", 512), ("kv", 4096, None), ("mamba", 9)]
+
+
+def test_resize_pools_keeps_request_order_among_growers_and_window_only_uses_current_pages():
+    from freetoken.engine.engine import Engine
+
+    calls = []
+    Engine._resize_pools(_pool_engine(calls), None, moe_cache_size=600, num_pages=None,
+                         num_mamba_slots=None, num_swa_pages=7)
+    assert calls == [("moe", 600), ("kv", 4096, 7)]

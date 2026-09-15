@@ -1109,6 +1109,40 @@ class Engine:
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)
         self.kv_cache.attach_page_table(self.page_table)
 
+    def _resize_pools(
+        self, config, moe_cache_size: int | None, num_pages: int | None,
+        num_mamba_slots: int | None, num_swa_pages: int | None,
+    ) -> None:
+        """Resize the requested pools, shrinking ones first.
+
+        Each pool frees its own tensors before allocating, but a pool that grows ahead of one
+        that shrinks needs both geometries resident at once: on a nearly full card that OOMs
+        a resize whose final total fits (MoE 512 -> 1024 slots with KV 262K -> 64K tokens)."""
+        steps = []  # (shrinks, resize)
+        if moe_cache_size is not None:
+            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
+            steps.append((
+                moe_cache_size < self.moe_offload_cache.cache_size,
+                lambda: self.moe_offload_cache.rebuild(moe_cache_size),
+            ))
+        if num_pages is not None or num_swa_pages is not None:
+            # A window-only change (num_pages None) re-derives the window pool at the new pin
+            # against the CURRENT page count; _resize_kv_pool sets self.num_pages either way.
+            pages = num_pages if num_pages is not None else self.num_pages
+            steps.append((
+                pages < self.num_pages,
+                lambda: self._resize_kv_pool(config, pages, num_swa_pages),
+            ))
+        if num_mamba_slots is not None:
+            # Must sit between graph teardown and re-capture so the recaptured graphs bind the new
+            # state tensors. +1 for the reserved padding sink: num_mamba_slots is the usable count.
+            steps.append((
+                num_mamba_slots + 1 < self.linear_state_pool.num_slots,
+                lambda: self.linear_state_pool.rebuild(num_mamba_slots + 1),
+            ))
+        for _, resize in sorted(steps, key=lambda step: not step[0]):
+            resize()
+
     @torch.inference_mode()
     def rebuild_runtime_cache(
         self,
@@ -1218,22 +1252,7 @@ class Engine:
         # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
-        if moe_cache_size is not None:
-            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            self.moe_offload_cache.rebuild(moe_cache_size)
-        if num_pages is not None:
-            # sets self.num_pages (rebuilds KV + window)
-            self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None:
-            # Window-only change: no page-count change, but re-derive the window pool at the new
-            # pin against the CURRENT page count. This re-allocs the same-size full pool and
-            # the resized window, both inside the pool's own rebuild_from_config.
-            self._resize_kv_pool(config, self.num_pages, num_swa_pages)
-        if num_mamba_slots is not None:
-            # Reallocate the GDN state pool (frees old tensors first). Must sit between graph
-            # teardown and re-capture so the recaptured graphs bind the new state tensors.
-            # +1 for the reserved padding sink: num_mamba_slots is the usable count.
-            self.linear_state_pool.rebuild(num_mamba_slots + 1)
+        self._resize_pools(config, moe_cache_size, num_pages, num_mamba_slots, num_swa_pages)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)

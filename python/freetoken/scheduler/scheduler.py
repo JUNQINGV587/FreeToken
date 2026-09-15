@@ -405,6 +405,7 @@ class Scheduler(SchedulerIOMixin):
             mamba_used, mamba_total = mamba_slots or (0, 0)
             swa_used, swa_total = swa_tokens or (0, 0)
             moe_stats = self._moe_stats_snapshot()
+            mm_stats = self._mm_stats_snapshot()
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -415,6 +416,8 @@ class Scheduler(SchedulerIOMixin):
                 m.gpu_mem_bytes = mem
                 if moe_stats is not None:
                     m.moe_stats = moe_stats
+                if mm_stats is not None:
+                    m.mm_stats = mm_stats
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -504,6 +507,26 @@ class Scheduler(SchedulerIOMixin):
             return None
         self._moe_stats_last_at = now
         return snap
+
+    def _mm_stats_snapshot(self) -> dict | None:
+        """Throttled encoder embedding-cache snapshot for /v1/stats (live entries/bytes).
+
+        None when this process builds no encoder tower. Like the MoE snapshot it is sampled at
+        most once per second (the frontend keeps the last-known value between samples) and a
+        failing sample must never break the reply stream."""
+        cache = getattr(self.engine, "encoder_cache", None)
+        if cache is None:
+            return None
+        now = time.monotonic()
+        if now - getattr(self, "_mm_stats_last_at", 0.0) < 1.0:
+            return None
+        try:
+            entries, nbytes = cache.stats()
+        except Exception as e:  # noqa: BLE001 -- observability must not break serving
+            logger.warning(f"mm stats snapshot failed: {e!r}")
+            return None
+        self._mm_stats_last_at = now
+        return {"entries": int(entries), "bytes": int(nbytes)}
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):

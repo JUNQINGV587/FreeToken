@@ -226,6 +226,7 @@ def tokenize_worker(
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                         moe_stats=msg.moe_stats,
+                        mm_stats=msg.mm_stats,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

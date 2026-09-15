@@ -118,6 +118,10 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # Prefill chunks served since the last decode step. A long prompt's chunks would
+        # otherwise run back-to-back and starve every in-flight generation (see
+        # _schedule_next_batch); this counter makes the scheduler alternate instead.
+        self._prefill_chunks_since_decode = 0
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -903,11 +907,26 @@ class Scheduler(SchedulerIOMixin):
             batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        # Draining prefill before decode silences requests that are already generating: while
+        # another request's long prompt is chunk-prefilled, an in-flight decode emits nothing.
+        # Measured on 2xL20: a 30K prompt arriving beside an active stream cost it an 18.07 s
+        # inter-token gap (mean gap otherwise 0.02 s); at 122K that is the ~2 min p95 tail.
+        # Alternate one decode step per prefill chunk instead, so the worst-case gap is bounded
+        # by ONE chunk rather than by the whole admission. Upstream's TODO is the general
+        # policy ("DECODE first"); this is the smallest fairness fix, needing no new state
+        # beyond a counter, and it leaves the no-decode path exactly as it was.
+        if self._prefill_chunks_since_decode and self.decode_manager.runnable:
+            decode_batch = self.decode_manager.schedule_next_batch()
+            if decode_batch is not None:
+                self._prefill_chunks_since_decode = 0
+                forward_input = self._prepare_batch(decode_batch)
+                self._report_prompt_admissions(decode_batch)
+                return forward_input
+        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        if batch is not None:
+            self._prefill_chunks_since_decode += 1
+        else:
+            batch = self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)

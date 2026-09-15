@@ -486,10 +486,20 @@ class Scheduler(SchedulerIOMixin):
 
     def _gpu_mem_bytes(self) -> int:
         """Bytes this engine process holds on the GPU (torch's reserved caching-allocator
-        pool: weights + KV + MoE cache + graphs). 0 on CPU. Cheap, no device sync."""
+        pool: weights + KV + MoE cache + graphs). 0 on CPU.
+
+        memory_reserved() walks every block in the allocator, which is too expensive to run
+        once per decode step, so sample it at most once per second (same contract as the MoE
+        and multimodal snapshots: the frontend keeps the last-known value in between)."""
         if self.device.type != "cuda":
             return 0
-        return torch.cuda.memory_reserved(self.device)
+        now = time.monotonic()
+        if now - getattr(self, "_gpu_mem_last_at", 0.0) < 1.0:
+            return getattr(self, "_gpu_mem_last_value", 0)
+        value = torch.cuda.memory_reserved(self.device)
+        self._gpu_mem_last_at = now
+        self._gpu_mem_last_value = value
+        return value
 
     def _moe_stats_snapshot(self) -> dict | None:
         """Throttled MoE slot-cache snapshot for /v1/stats (miss/eviction/residency).

@@ -93,7 +93,10 @@ def test_schedule_reports_admission_only_after_prepare_succeeds():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_budget = 99
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
-    scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
+    scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None, runnable=False)
+    # _schedule_next_batch alternates one decode step per prefill chunk; a stub built with
+    # __new__ has to carry the counter the real __init__ installs.
+    scheduler._prefill_chunks_since_decode = 0
     events = []
 
     def prepare(value):
@@ -117,7 +120,10 @@ def test_prepare_failure_emits_no_prompt_admission():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_budget = 99
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
-    scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
+    scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None, runnable=False)
+    # _schedule_next_batch alternates one decode step per prefill chunk; a stub built with
+    # __new__ has to carry the counter the real __init__ installs.
+    scheduler._prefill_chunks_since_decode = 0
     sent = []
 
     def fail_prepare(_batch):
@@ -308,3 +314,51 @@ def test_listener_accounts_late_reply_after_ack_queue_was_removed():
     assert manager.stats.prompt_tokens_total == 5
     assert manager.stats.completion_tokens_total == 2
     assert manager.ack_map == {}
+
+
+def test_a_long_prefill_does_not_starve_an_active_decode():
+    """Fairness: one decode step per prefill chunk, instead of draining prefill first.
+
+    Regression for the measured tail: a 30K prompt arriving beside an active stream cost that
+    stream an 18.07 s inter-token gap because every iteration served the next prefill chunk.
+    """
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.prefill_budget = 99
+    served: list[str] = []
+    prefill_batch = SimpleNamespace(is_prefill=True, prompt_admissions=[])
+    decode_batch = SimpleNamespace(is_prefill=False, prompt_admissions=[])
+    scheduler.prefill_manager = SimpleNamespace(
+        schedule_next_batch=lambda budget: served.append("prefill") or prefill_batch, runnable=True
+    )
+    scheduler.decode_manager = SimpleNamespace(
+        schedule_next_batch=lambda: served.append("decode") or decode_batch, runnable=True
+    )
+    scheduler._prefill_chunks_since_decode = 0
+    scheduler._prepare_batch = lambda batch: batch
+    scheduler._report_prompt_admissions = lambda batch: None
+
+    Scheduler._schedule_next_batch(scheduler)  # nothing served yet -> prefill first
+    Scheduler._schedule_next_batch(scheduler)  # a chunk is pending -> give decode a turn
+    Scheduler._schedule_next_batch(scheduler)  # then back to prefill
+    assert served == ["prefill", "decode", "prefill"], served
+
+
+def test_without_a_runnable_decode_the_prefill_order_is_unchanged():
+    """The no-decode path must stay byte-for-byte the historical one (prefill drains first)."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.prefill_budget = 99
+    served: list[str] = []
+    prefill_batch = SimpleNamespace(is_prefill=True, prompt_admissions=[])
+    scheduler.prefill_manager = SimpleNamespace(
+        schedule_next_batch=lambda budget: served.append("prefill") or prefill_batch, runnable=True
+    )
+    scheduler.decode_manager = SimpleNamespace(
+        schedule_next_batch=lambda: served.append("decode") or None, runnable=False
+    )
+    scheduler._prefill_chunks_since_decode = 0
+    scheduler._prepare_batch = lambda batch: batch
+    scheduler._report_prompt_admissions = lambda batch: None
+
+    for _ in range(3):
+        Scheduler._schedule_next_batch(scheduler)
+    assert served == ["prefill", "prefill", "prefill"], served

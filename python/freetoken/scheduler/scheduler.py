@@ -31,6 +31,7 @@ from freetoken.utils import (
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .interleave import DecodeInterleavePolicy
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
@@ -91,6 +92,14 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        # Bound how long a run of prefill steps may starve in-flight decodes. A long
+        # prompt chunked at the window budget is hundreds of consecutive prefill steps;
+        # measured on an 8xRTX4090 DSV4 deployment, that left an already-decoding
+        # request unscheduled for 267-317 s. Unset reproduces the historical
+        # prefill-first order exactly.
+        self._interleave = DecodeInterleavePolicy(
+            getattr(config, "decode_interleave_every", None)
+        )
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
@@ -123,7 +132,6 @@ class Scheduler(SchedulerIOMixin):
         # Prefill chunks served since the last decode step. A long prompt's chunks would
         # otherwise run back-to-back and starve every in-flight generation (see
         # _schedule_next_batch); this counter makes the scheduler alternate instead.
-        self._prefill_chunks_since_decode = 0
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -943,26 +951,28 @@ class Scheduler(SchedulerIOMixin):
             )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # Draining prefill before decode silences requests that are already generating: while
-        # another request's long prompt is chunk-prefilled, an in-flight decode emits nothing.
-        # Measured on 2xL20: a 30K prompt arriving beside an active stream cost it an 18.07 s
-        # inter-token gap (mean gap otherwise 0.02 s); at 122K that is the ~2 min p95 tail.
-        # Alternate one decode step per prefill chunk instead, so the worst-case gap is bounded
-        # by ONE chunk rather than by the whole admission. Upstream's TODO is the general
-        # policy ("DECODE first"); this is the smallest fairness fix, needing no new state
-        # beyond a counter, and it leaves the no-decode path exactly as it was.
-        if self._prefill_chunks_since_decode and self.decode_manager.runnable:
-            decode_batch = self.decode_manager.schedule_next_batch()
-            if decode_batch is not None:
-                self._prefill_chunks_since_decode = 0
-                forward_input = self._prepare_batch(decode_batch)
-                self._report_prompt_admissions(decode_batch)
-                return forward_input
-        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
-        if batch is not None:
-            self._prefill_chunks_since_decode += 1
-        else:
+        # Prefill keeps priority -- a request that never prefills never starts -- but a
+        # long run of prefill chunks must not starve in-flight decodes. When the policy
+        # says a decode is due, take one if a decode is actually runnable; otherwise stay
+        # with prefill (never spend a slot idle just to keep a promise).
+        # getattr, not attribute access: the accounting tests drive this method on a
+        # partially built Scheduler, and interleaving must be an opt-in that a stripped
+        # object simply does not have rather than something that breaks it. A missing
+        # policy is the historical prefill-first order.
+        policy = getattr(self, "_interleave", None)
+        batch = None
+        if policy is not None and policy.wants_decode():
             batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                policy.note_decode()
+        if batch is None:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            if batch is not None and policy is not None:
+                policy.note_prefill()
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None and policy is not None:
+                policy.note_decode()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)

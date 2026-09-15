@@ -52,6 +52,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # OffloadMoeCache.stats_snapshot) for /v1/stats. None on non-offload models or
     # between sample intervals (the frontend keeps the last-known value).
     moe_stats: dict | None = None
+    # Throttled encoder embedding-cache snapshot (entries/bytes, see EncoderCache.stats)
+    # for /v1/stats. None when this process builds no encoder tower, or between samples.
+    mm_stats: dict | None = None
 
 
 @dataclass

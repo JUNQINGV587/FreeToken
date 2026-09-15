@@ -38,6 +38,9 @@ class StatsTracker:
         # Last MoE slot-cache snapshot stamped by the scheduler (miss/residency/routing
         # concentration); None until the first sample or on non-offload models.
         self.moe_stats: dict | None = None
+        # Last encoder embedding-cache snapshot (entries/bytes) stamped by the scheduler; None
+        # until the first sample or when the process builds no encoder tower.
+        self.mm_stats: dict | None = None
         self.kv_used_pages = 0
         self.kv_total_pages = 0
         self.mamba_used_slots = 0
@@ -75,6 +78,8 @@ class StatsTracker:
             self.cached_tokens_total += reply.cached_tokens
         if getattr(reply, "moe_stats", None) is not None:
             self.moe_stats = reply.moe_stats
+        if getattr(reply, "mm_stats", None) is not None:
+            self.mm_stats = reply.mm_stats
         if getattr(reply, "kv_total_pages", 0) > 0:  # ignore 0/0 (prompt reply, owned-KV)
             self.kv_used_pages = reply.kv_used_pages
             self.kv_total_pages = reply.kv_total_pages
@@ -202,6 +207,25 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     # prompts the scheduler rejects whenever the KV pool is smaller than max_position. The
     # raw ceiling stays available in ``limits.model_max_seq_len``.
     model_card["ctx"] = effective_max_seq_len
+    # Multimodal section: only for a process that actually accepts images. image_tokens.min/max
+    # are the per-image token budget; None means "whatever the checkpoint's processor defaults
+    # to" (for this checkpoint that is 64..16384 tokens), NOT zero. encoder_cache is the live
+    # encoder embedding cache sampled by the worker at ~1/s.
+    served_modalities = tuple(getattr(config, "served_modalities", None) or ())
+    mm_config = getattr(config, "mm", None)
+    mm = (
+        {
+            "served_modalities": sorted(served_modalities),
+            "image_tokens": {
+                "min": getattr(mm_config, "image_min_tokens", None),
+                "max": getattr(mm_config, "image_max_tokens", None),
+            },
+            "embed_cache_device": getattr(mm_config, "embed_cache_device", None),
+            "encoder_cache": tr.mm_stats,
+        }
+        if "image" in served_modalities
+        else None
+    )
     return {
         "instance_id": getattr(state, "instance_id", None),
         "model": model_card,
@@ -241,4 +265,5 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             ),
         },
         "moe": tr.moe_stats,
+        "mm": mm,
     }

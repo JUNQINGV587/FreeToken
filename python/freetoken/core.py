@@ -138,6 +138,8 @@ class Batch:
     # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
     mm_rows: torch.Tensor | None = field(default=None, init=False)
+    # per batch token, the end (exclusive, in its request) of the image span holding it, 0 for text: the block a bidirectional layer attends within
+    mm_block_ends: torch.Tensor | None = field(default=None, init=False)
     # this chunk's cache-miss items to encode and the gather plan [(uid, hash, row_lo, row_hi, n, pos), ...] in scatter order
     mm_encoder_jobs: list | None = field(default=None, init=False)
     mm_gather_plan: list | None = field(default=None, init=False)

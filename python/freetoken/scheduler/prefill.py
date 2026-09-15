@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -7,7 +8,7 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
-from .mm import mm_rows_after
+from .mm import mm_chunk_end, mm_rows_after
 from .utils import PendingReq
 
 if TYPE_CHECKING:
@@ -46,10 +47,18 @@ class PrefillAdder:
     cache_manager: CacheManager
     table_manager: TableManager
     encoder_cache: EncoderCache | None = None
+    # end a chunk before an image it would cut; only models whose image spans attend in both directions need it
+    keep_images_whole: bool = False
+    # the whole budget of this pass; token_budget shrinks as requests are admitted
+    pass_budget: int = 0
     # SWA-pool tokens charged to reqs admitted so far this pass. Mirrors reserved_size: swa is
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.pass_budget:
+            self.pass_budget = self.token_budget
 
     def _kv_reservation_size(self, total_len: int, cached_len: int) -> int:
         """Return the token-equivalent cost of the additional KV pages for a request."""
@@ -165,9 +174,6 @@ class PrefillAdder:
                 if aligned <= 0:
                     return None
                 chunk_size = aligned
-            self.reserved_swa += (
-                div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)
-            ) * ps
         align = self.cache_manager.prefill_chunk_align
         if align > 1 and 0 < chunk_size < remain_len:
             # An unaligned chunk end is correct, it just loses this prompt's snapshot boundaries --
@@ -175,6 +181,18 @@ class PrefillAdder:
             # the request until it gets a bigger turn.
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
+        if self.keep_images_whole and pending_req.mm_items and chunk_size < remain_len:
+            # a cut image would attend within only the part already in the cache: end the chunk before it, decided last because the caps above only move the end earlier and would undo it
+            unit = math.lcm(self.cache_manager.page_size if self.cache_manager.swa_paged else 1, align if align > 1 else 1)
+            end = mm_chunk_end(pending_req.mm_items, cached_len, cached_len + chunk_size, unit)
+            cut = next((hi for item in pending_req.mm_items for lo, hi in item.offsets if lo < end < hi), None)
+            if cut is not None and self.token_budget < self.pass_budget and cut - cached_len <= self.pass_budget:
+                # other requests took part of this pass; a pass of its own holds the image whole
+                return None
+            chunk_size = end - cached_len
+        if self.cache_manager.swa_paged:
+            ps = self.cache_manager.page_size
+            self.reserved_swa += (div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)) * ps
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
@@ -256,6 +274,7 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     encoder_cache: EncoderCache | None = None
+    keep_images_whole: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -281,6 +300,7 @@ class PrefillManager:
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
             encoder_cache=self.encoder_cache,
+            keep_images_whole=self.keep_images_whole,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

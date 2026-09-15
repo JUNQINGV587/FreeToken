@@ -6,7 +6,7 @@ import torch
 
 from freetoken.message import MMItem
 from freetoken.mm.encoder_cache import EncoderCache
-from freetoken.scheduler.mm import mm_rows_after, plan_mm_batch, plan_mm_chunk
+from freetoken.scheduler.mm import cut_image_spans, mm_chunk_end, mm_rows_after, plan_mm_batch, plan_mm_chunk
 
 CPU = torch.device("cpu")
 
@@ -86,7 +86,29 @@ def test_batch_rows_follow_the_reqs_in_batch_order():
     # req 1: 6 tokens, image on [2, 5); req 2: chunk [4, 10) of a prompt whose image spans [3, 8)
     a = SimpleNamespace(uid=1, mm_items=[_item(7, [[2, 5]])], cached_len=0, device_len=6, extend_len=6)
     b = SimpleNamespace(uid=2, mm_items=[_item(8, [[3, 8]])], cached_len=4, device_len=10, extend_len=6)
-    jobs, plan, rows = plan_mm_batch([a, b], None)
+    jobs, plan, rows, block_ends = plan_mm_batch([a, b], None)
     assert [j.hash for j in jobs] == [7, 8]
     assert plan == [(1, 7, 0, 3, 3, 2), (2, 8, 1, 5, 5, 0)]
     assert rows == [2, 3, 4, 6, 7, 8, 9]  # req 2 starts at batch row 6; its image rows 1..5 land on its first four tokens
+    assert block_ends == [0, 0, 5, 5, 5, 0, 8, 8, 8, 8, 0, 0]  # every image row carries its span's end in request positions
+
+
+def test_chunk_end_never_lands_inside_an_image_span():
+    items = [_item(1, [[10, 20]]), _item(2, [[22, 40]])]
+    assert mm_chunk_end(items, 0, 8, 1) == 8  # before the images: untouched
+    assert mm_chunk_end(items, 0, 15, 1) == 10  # inside the first image: back to its start
+    assert mm_chunk_end(items, 0, 30, 1) == 22  # inside the second
+    assert mm_chunk_end(items, 0, 30, 8) == 8  # the aligned start 16 lands in the first image, so back again
+    assert mm_chunk_end(items, 0, 20, 1) == 20 and mm_chunk_end(items, 0, 40, 1) == 40  # ends on a boundary are fine
+    assert mm_chunk_end(items, 22, 30, 1) == 30  # the image begins at the chunk start: longer than the budget, split it
+    assert mm_chunk_end(items, 12, 15, 1) == 15  # an image already split by an earlier chunk keeps going
+
+
+def test_cut_image_spans_reports_the_image_a_chunk_ends_inside():
+    from types import SimpleNamespace
+
+    image = MMItem(modality="image", hash=1, pad_value=1, offsets=[[10, 20], [22, 40]], feature=torch.zeros(1))
+    req = lambda device_len: SimpleNamespace(mm_items=[image], device_len=device_len)
+    text = SimpleNamespace(mm_items=None, device_len=5)
+    assert cut_image_spans([text, req(30)]) == [(22, 40)]
+    assert cut_image_spans([req(8)]) == cut_image_spans([req(20)]) == cut_image_spans([req(40)]) == []  # outside every span or on a boundary

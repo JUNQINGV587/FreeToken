@@ -5,7 +5,7 @@ from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 from freetoken.attention.base import AttnType
 
 # State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
 
 
 def detect_expert_quant(hf_config: Any) -> str:
@@ -172,6 +172,8 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     rotary_config: RotaryConfig
     sliding_window: int
+    # image token spans attend to each other in both directions on these layers
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass(frozen=True)

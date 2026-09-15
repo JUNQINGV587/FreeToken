@@ -101,8 +101,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 
 ### Image input
 
-Experimental. Needs a vision-capable checkpoint (Qwen3.6, Qwen3.8-Flash-Next, Qwen3-VL); a request carrying images is
-rejected otherwise. Images are accepted on all three protocols (OpenAI `image_url`,
+Experimental. Needs a checkpoint whose family registers a vision encoder ([models.md](models.md#image-input) lists them and how each one
+maps the flags below); a request carrying images is rejected otherwise. Images are accepted on all three protocols (OpenAI `image_url`,
 Anthropic `image` blocks, Responses `input_image`) as an http(s) URL or base64. Images inside a tool
 result (an Anthropic `tool_result` block from Claude Code's Read, a Responses `function_call_output`
 from Codex's view_image) are moved to the user turn that follows the tool message, as vLLM does,
@@ -114,9 +114,9 @@ so a client can gate its attachment controls without reading the checkpoint conf
 | --- | --- | --- |
 | `--text-model-only` | off | Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to the KV/expert pools) and every multimodal input is rejected. Same as `--mm-disable` with every encoder kind |
 | `--mm-disable` | none | Encoder towers to leave unbuilt (`vision`, `audio`); every input they would serve is rejected |
-| `--mm-encoder-weights` | host | Where the encoder tower's block weights live. `host` streams them from pinned host banks two blocks at a time behind the compute (about 60 MiB of VRAM instead of the whole tower; small images encode slower, about 17 ms instead of 7 ms for 448x448); `gpu` keeps them resident |
-| `--image-min-tokens`, `--image-max-tokens` | processor defaults | Per-image token budget: the image processor resizes every image to take between these many tokens, converted to the family's own units (Qwen VL: one token per 32x32 pixels of the resized image, defaults 64 to 16384). Only families with dynamic resolution honor them |
-| `--mm-processor-kwargs` | none | JSON object of extra keyword arguments for the checkpoint's image processor call, for family-specific knobs (Qwen VL: `{"size": {"longest_edge": 1048576}}`); applied after the token budget |
+| `--mm-encoder-weights` | host | Where the encoder tower's block weights live. `host` streams them from pinned host banks two blocks at a time behind the compute, so the GPU holds two blocks instead of the whole tower; small images pay the copy time, large ones hide it behind the compute. `gpu` keeps them resident. An encoder without a block stack stays resident either way |
+| `--image-min-tokens`, `--image-max-tokens` | processor defaults | Per-image token budget: the image processor resizes every image to take between these many tokens, converted to the family's own units by its processor. A family with fixed budgets honors the maximum only and refuses one below its smallest budget at start-up |
+| `--mm-processor-kwargs` | none | JSON object of extra keyword arguments for the checkpoint's image processor call, for knobs the token budget does not cover; applied after the budget, so an explicit key wins |
 | `--mm-embed-cache-device` | cpu | Where encoded image embeddings live between prefill chunks. `cpu` keeps them out of the VRAM budget; `cuda` skips the copy back |
 | `--allowed-media-domains` | any | Comma-separated hostname allowlist for image URLs; requests for other domains are rejected with a 400. Empty allows any domain |
 | `--allowed-local-media-path` | off | Directory `file://` image refs may be read from; unset rejects local files |

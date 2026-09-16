@@ -142,6 +142,8 @@ def enable_custom_all_reduce(
     """
     if tp_info.size == 1 or os.getenv("FREETOKEN_CUSTOM_ALL_REDUCE", "1") == "0":
         return False
+    global _boot_tp_cpu_group
+    _boot_tp_cpu_group = tp_cpu_group
     try:
         from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -152,8 +154,13 @@ def enable_custom_all_reduce(
             def custom_all_reduce(self, input):
                 if self.disabled or not self.should_custom_ar(input):
                     return None
-                if self._IS_CAPTURING and torch.cuda.is_current_stream_capturing():
-                    return self.all_reduce(input, registered=False)
+                if self._IS_CAPTURING:
+                    if torch.cuda.is_current_stream_capturing():
+                        return self.all_reduce(input, registered=False)
+                    # The base class would return uninitialized memory here; fail loudly.
+                    raise RuntimeError(
+                        "custom AR called inside the capture ctx but off the capturing stream"
+                    )
                 return super().custom_all_reduce(input)
 
         ca = _CopyCaptureCAR(
@@ -170,7 +177,12 @@ def enable_custom_all_reduce(
             f"custom all-reduce donor unusable ({exc!r}); staying on pynccl"
         )
         return False
-    if ca.disabled:
+    # The donor's P2P self-check is a per-rank decision: a split verdict would make one
+    # rank spin-wait for a peer that stayed on pynccl (startup hang). Take consensus.
+    verdicts = [None] * tp_info.size
+    dist.all_gather_object(verdicts, ca.disabled, group=tp_cpu_group)
+    if any(verdicts):
+        ca.close()
         return False
     DistributedCommunicator.plugins.append(
         CustomAllReduceImpl(DistributedCommunicator.plugins[-1], ca)
@@ -179,6 +191,28 @@ def enable_custom_all_reduce(
 
     init_logger(__name__).info_rank0("custom all-reduce donor active (vLLM one-stage kernel)")
     return True
+
+
+_boot_tp_cpu_group = None
+
+
+def verify_ar_sequence_boot() -> None:
+    """Boot-time guard for the donor's sequence-paired spin barriers (F1).
+
+    The 1-stage kernel pairs ARs across ranks purely by call order; a single divergent
+    call would silently misalign every later AR (no hang, no error). The sequence is
+    structural (identical on both ranks), so comparing call counts after warmup+capture
+    catches any divergence before serving. Runtime divergence remains a documented
+    latent risk (per-step checking would cost a host sync per step)."""
+    active = DistributedCommunicator.plugins[-1] if DistributedCommunicator.plugins else None
+    if not isinstance(active, CustomAllReduceImpl) or _boot_tp_cpu_group is None:
+        return
+    allc = [None] * dist.get_world_size(_boot_tp_cpu_group)
+    dist.all_gather_object(allc, (active.calls, active.calls_custom), group=_boot_tp_cpu_group)
+    if len(set(allc)) != 1:
+        raise RuntimeError(
+            f"custom AR call sequence diverged across ranks during boot: {allc}"
+        )
 
 
 def destroy_distributed() -> None:

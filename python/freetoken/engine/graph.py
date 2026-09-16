@@ -199,6 +199,11 @@ class GraphRunner:
             self.graph_map[bs] = graph
 
         self._reset_moe_offload_cache()
+        # Boot-time guard for the custom-AR donor's sequence-paired barriers (see
+        # distributed.impl.verify_ar_sequence_boot): no-op when the donor is inactive.
+        from freetoken.distributed.impl import verify_ar_sequence_boot
+
+        verify_ar_sequence_boot()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 

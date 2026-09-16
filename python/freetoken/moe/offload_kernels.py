@@ -480,6 +480,13 @@ def owner_route_map(
     slot ids); ``local_rows`` preserves the pre-rewrite rows. Replaces the ~10-op
     global_to_local/argmax/gather/where chain with a single launch; fixed shapes, no
     device->host reads, CUDA-graph capturable."""
+    if global_expert_ids.ndim != 2 or weights.ndim != 2:
+        raise ValueError(
+            f"owner route map expects 2D [tokens, top_k] inputs, got "
+            f"{tuple(global_expert_ids.shape)} / {tuple(weights.shape)}"
+        )
+    if not global_expert_ids.is_contiguous() or not weights.is_contiguous():
+        raise ValueError("owner route map requires contiguous inputs")
     B, K = global_expert_ids.shape
     device = global_expert_ids.device
     admit = torch.empty((B, K), dtype=torch.int32, device=device)

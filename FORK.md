@@ -4,7 +4,7 @@ This fork carries a production branch for **FreeToken on NVIDIA Ada Lovelace (sm
 developed and validated on 2×L20 48GB (PCIe P2P, no NVLink), TP=2 + owner-local expert
 parallelism, serving Qwen3.8-Flash-Next-NVFP4.
 
-The default branch **`sm89`** is the production mainline. Upstream is tracked as
+The default branch **`sm89-moe-offload`** is the production mainline. Upstream is tracked as
 `origin/main` and merged on every sync. Experiments live on `exp/*`.
 
 ## What this branch adds over upstream

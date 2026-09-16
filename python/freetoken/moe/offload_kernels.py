@@ -429,3 +429,76 @@ def _prefill_hit_compact_kernel(
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
+
+
+@triton.jit
+def _owner_route_map_kernel(
+    ids_ptr,  # [B, K] int: global router ids
+    w_ptr,  # [B, K] fp32: route weights
+    admit_ptr,  # [B, K] int32 out: safe local rows (the LRU kernel rewrites this in place)
+    rows_ptr,  # [B, K] int32 out: same rows, preserved past the rewrite
+    flat_ptr,  # [B, K] int32 out: layer_id * local_num + safe row
+    owned_ptr,  # [B, K] int8 out (viewed bool by the caller)
+    wmask_ptr,  # [B, K] fp32 out: weights zeroed at remote positions
+    global_start: tl.constexpr,
+    local_num: tl.constexpr,
+    layer_id: tl.constexpr,
+    K: tl.constexpr,
+    KPAD: tl.constexpr,
+):
+    b = tl.program_id(0)
+    offs = tl.arange(0, KPAD)
+    m = offs < K
+    ids = tl.load(ids_ptr + b * K + offs, mask=m, other=-1).to(tl.int32)
+    owned = (ids >= global_start) & (ids < global_start + local_num)
+    local = tl.where(owned, ids - global_start, -1)
+    # Remote entries borrow the row of the route's first owned position (their weight is
+    # zeroed, so the row choice only matters for cache behaviour -- reusing an owned row keeps
+    # the admitted row set identical to the eager compaction, avoiding sentinel churn).
+    first_idx = tl.min(tl.where(owned, offs, K), axis=0)
+    fb = tl.min(tl.where(offs == first_idx, local, local_num + 1), axis=0)
+    fallback = tl.where(first_idx < K, fb, 0)
+    safe = tl.where(owned, local, fallback)
+    tl.store(admit_ptr + b * K + offs, safe, mask=m)
+    tl.store(rows_ptr + b * K + offs, safe, mask=m)
+    tl.store(flat_ptr + b * K + offs, layer_id * local_num + safe, mask=m)
+    tl.store(owned_ptr + b * K + offs, owned.to(tl.int8), mask=m)
+    w = tl.load(w_ptr + b * K + offs, mask=m, other=0.0)
+    tl.store(wmask_ptr + b * K + offs, tl.where(owned, w, 0.0), mask=m)
+
+
+def owner_route_map(
+    layer_id: int,
+    global_start: int,
+    local_num: int,
+    weights: torch.Tensor,
+    global_expert_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One-kernel owner route map: returns (admit, local_rows, local_flat, owned, masked_w).
+
+    ``admit`` is the tensor to hand to the LRU admission kernel (rewritten in place into
+    slot ids); ``local_rows`` preserves the pre-rewrite rows. Replaces the ~10-op
+    global_to_local/argmax/gather/where chain with a single launch; fixed shapes, no
+    device->host reads, CUDA-graph capturable."""
+    B, K = global_expert_ids.shape
+    device = global_expert_ids.device
+    admit = torch.empty((B, K), dtype=torch.int32, device=device)
+    rows = torch.empty((B, K), dtype=torch.int32, device=device)
+    flat = torch.empty((B, K), dtype=torch.int32, device=device)
+    owned = torch.empty((B, K), dtype=torch.int8, device=device)
+    wmask = torch.empty((B, K), dtype=torch.float32, device=device)
+    _owner_route_map_kernel[(B,)](
+        global_expert_ids,
+        weights,
+        admit,
+        rows,
+        flat,
+        owned,
+        wmask,
+        global_start=global_start,
+        local_num=local_num,
+        layer_id=layer_id,
+        K=K,
+        KPAD=triton.next_power_of_2(K),
+    )
+    return admit, rows, flat, owned, wmask

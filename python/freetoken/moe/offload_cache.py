@@ -1500,30 +1500,37 @@ This variant never changes the shape.  Remote entries are remapped to a row that
         # Sync-free equivalents of geometry.partition_route / global_to_local_flat: those
         # helpers validate with `if torch.any(...)`, which is itself a device->host read.
         ownership = self.geometry.ownership
-        local_ids, owned = ownership.global_to_local(global_expert_ids)
-        zero_row = torch.zeros((), dtype=local_ids.dtype, device=self.device)
-        if owned.ndim == 0 or owned.shape[-1] == 0:
+        if global_expert_ids.ndim == 0 or global_expert_ids.shape[-1] == 0:
             raise ValueError("owner route needs at least one candidate position per row")
-        # Remote entries reuse an OWNED row of the SAME route (the row of its first owned
-        # position) rather than a fixed sentinel row.  Their weight is zeroed below, so which
-        # row they point at cannot affect the math -- but reusing an owned row keeps the
-        # admitted row set EXACTLY the owned rows, i.e. identical to what the eager
-        # compaction admits.  A fixed sentinel would instead add one always-touched row per
-        # layer, and that row measurably churns (missing/layer 0.72 -> 1.35 measured), which
-        # is pure extra PCIe traffic.
-        first_owned = torch.argmax(owned.to(torch.int8), dim=-1, keepdim=True)
-        fallback = local_ids.gather(-1, first_owned)
-        # All-remote row (rare): there is no owned row to borrow, so fall back to row zero.
-        fallback = torch.where(owned.any(dim=-1, keepdim=True), fallback, zero_row)
-        safe_row = torch.where(owned, local_ids, fallback)
-        # ``admit`` is rewritten IN PLACE into slot ids by the LRU kernel, and ``.to(int32)``
-        # returns the same tensor when the route is already int32 -- so every value that must
-        # survive as a bank ROW has to be materialized before the kernel runs.
-        local_rows = safe_row.clone()
-        # Computed before the rewrite as well (this allocates a fresh tensor, but keep the
-        # ordering explicit so a future in-place tweak cannot alias it).
-        local_flat = layer_id * self.geometry.local_num_experts + safe_row
-        admit = safe_row.to(dtype=torch.int32).contiguous()
+        if global_expert_ids.is_cuda:
+            # One fused kernel replaces the global_to_local -> argmax -> gather -> where ->
+            # clone/cast chain (~10 launches per layer per step). Semantics unchanged:
+            # remote entries borrow the row of the route's first owned position
+            # (zero-weighted), and all-remote rows fall back to row zero.
+            from freetoken.moe.offload_kernels import owner_route_map
+
+            admit, local_rows, local_flat, owned_i8, masked_weights = owner_route_map(
+                layer_id,
+                ownership.global_start,
+                ownership.local_num_experts,
+                weights,
+                global_expert_ids,
+            )
+            owned = owned_i8.view(torch.bool)
+        else:
+            # CPU reference path (tests / host-side tooling): the plain torch chain.
+            local_ids, owned = ownership.global_to_local(global_expert_ids)
+            zero_row = torch.zeros((), dtype=local_ids.dtype, device=self.device)
+            first_owned = torch.argmax(owned.to(torch.int8), dim=-1, keepdim=True)
+            fallback = local_ids.gather(-1, first_owned)
+            fallback = torch.where(owned.any(dim=-1, keepdim=True), fallback, zero_row)
+            safe_row = torch.where(owned, local_ids, fallback)
+            local_rows = safe_row.clone()
+            local_flat = layer_id * self.geometry.local_num_experts + safe_row
+            admit = safe_row.to(dtype=torch.int32).contiguous()
+            masked_weights = torch.where(
+                owned, weights, torch.zeros((), dtype=weights.dtype, device=weights.device)
+            ).contiguous()
 
         recorder = self._cache.route_recorder
         self._cache.route_recorder = None
@@ -1535,15 +1542,14 @@ This variant never changes the shape.  Remote entries are remapped to a row that
             self._cache.route_recorder = recorder
         self._pending_owned = True
 
-        zero_weight = torch.zeros((), dtype=weights.dtype, device=weights.device)
         empty = torch.empty((0,), dtype=torch.int32, device=self.device)
         return OwnerCacheUpdate(
             # ``admit`` was rewritten in place: owned positions carry their slot id, remote
-            # positions carry row zero's slot id (harmless: their weight is zero).
+            # positions carry the borrowed row's slot id (harmless: their weight is zero).
             slot_ids=admit.reshape(global_expert_ids.shape),
             local_ids=local_rows,
             local_flat_ids=local_flat,
-            weights=torch.where(owned, weights, zero_weight).contiguous(),
+            weights=masked_weights,
             owned_mask=owned,
             missing_local_ids=empty,
             evicted_flat_ids=empty,
@@ -1598,20 +1604,34 @@ This variant never changes the shape.  Remote entries are remapped to a row that
             )
 
         ownership = self.geometry.ownership
-        local_ids, owned = ownership.global_to_local(global_expert_ids)
-        zero_row = torch.zeros((), dtype=local_ids.dtype, device=self.device)
-        if owned.ndim == 0 or owned.shape[-1] == 0:
+        if global_expert_ids.ndim == 0 or global_expert_ids.shape[-1] == 0:
             raise ValueError("owner route needs at least one candidate position per row")
-        # Remote entries borrow the first owned row of the same route (weight is zeroed), so
-        # the admitted row set stays exactly the owned rows, matching the eager compaction.
-        first_owned = torch.argmax(owned.to(torch.int8), dim=-1, keepdim=True)
-        fallback = local_ids.gather(-1, first_owned)
-        fallback = torch.where(owned.any(dim=-1, keepdim=True), fallback, zero_row)
-        safe_row = torch.where(owned, local_ids, fallback)
-        # ``admit`` is rewritten in place; materialize the row/flat IDs before the kernel runs.
-        local_rows = safe_row.clone()
-        local_flat = layer_id * self.geometry.local_num_experts + safe_row
-        admit = safe_row.to(dtype=torch.int32).contiguous()
+        if global_expert_ids.is_cuda:
+            # Same fused one-kernel map as ensure_route_graph (semantics identical: remote
+            # entries borrow the route's first owned row, all-remote rows use row zero).
+            from freetoken.moe.offload_kernels import owner_route_map
+
+            admit, local_rows, local_flat, owned_i8, masked_weights = owner_route_map(
+                layer_id,
+                ownership.global_start,
+                ownership.local_num_experts,
+                weights,
+                global_expert_ids,
+            )
+            owned = owned_i8.view(torch.bool)
+        else:
+            local_ids, owned = ownership.global_to_local(global_expert_ids)
+            zero_row = torch.zeros((), dtype=local_ids.dtype, device=self.device)
+            first_owned = torch.argmax(owned.to(torch.int8), dim=-1, keepdim=True)
+            fallback = local_ids.gather(-1, first_owned)
+            fallback = torch.where(owned.any(dim=-1, keepdim=True), fallback, zero_row)
+            safe_row = torch.where(owned, local_ids, fallback)
+            local_rows = safe_row.clone()
+            local_flat = layer_id * self.geometry.local_num_experts + safe_row
+            admit = safe_row.to(dtype=torch.int32).contiguous()
+            masked_weights = torch.where(
+                owned, weights, torch.zeros((), dtype=weights.dtype, device=weights.device)
+            ).contiguous()
 
         recorder = self._cache.route_recorder
         self._cache.route_recorder = None
@@ -1628,7 +1648,6 @@ This variant never changes the shape.  Remote entries are remapped to a row that
         slot_ids = admit.clamp_min(0)
         neg_one = torch.full_like(local_rows, -1)
         cpu_ids = torch.where(owned & ~on_gpu, local_rows, neg_one)
-        zero_weight = torch.zeros((), dtype=weights.dtype, device=weights.device)
         empty = torch.empty((0,), dtype=torch.int32, device=self.device)
         return OwnerCacheUpdate(
             slot_ids=slot_ids.reshape(global_expert_ids.shape),
@@ -1637,7 +1656,7 @@ This variant never changes the shape.  Remote entries are remapped to a row that
             # Owner-routed weights (same convention as ensure_route_graph): remote entries are
             # zero; CPU rows keep their router weight (the GEMM masks them at the call site so
             # the CPU still gets them via cpu_ids).
-            weights=torch.where(owned, weights, zero_weight).contiguous(),
+            weights=masked_weights,
             owned_mask=owned,
             missing_local_ids=empty,
             evicted_flat_ids=empty,

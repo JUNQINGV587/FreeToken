@@ -1013,13 +1013,18 @@ class OffloadMoeCache:
             })
         return {"per_layer": per_layer}
 
-    def decode_routing_stats(self) -> dict:
+    def decode_routing_stats(self, curve_caps: list[int] | tuple[int, ...] | None = None) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
 
         Uses the histogram from ``collect_decode_freq``. The ``oracle_hit`` is the best a
         per-layer LRU holding ``cache_size/num_layers`` slots could achieve on the observed
         (stationary) routing distribution -- i.e. an upper bound on hit rate that depends
         purely on how skewed routing is, independent of any LRU/LFU dynamics.
+
+        ``oracle_hit_by_pool_size`` / ``oracle_hit_by_layer_even_split`` extend this to a
+        sizing curve: the oracle hit rate at each candidate pool size in ``curve_caps``
+        (default a ladder bracketing realistic cache sizes), so a smaller pool can be
+        evaluated without a restart. All read-only; two device syncs total.
         """
         freq = self.decode_freq.float()
         total = freq.sum(dim=1)
@@ -1043,7 +1048,7 @@ class OffloadMoeCache:
         p = freq / total.clamp(min=1).unsqueeze(1)
         ent = -(p * p.clamp(min=1e-12).log()).sum(dim=1)[valid]
         norm_ent = (ent / torch.log(torch.tensor(float(self.num_experts)))).mean().item()
-        return {
+        out = {
             "slots_per_layer": slots_per_layer,
             "working_set_mean": ws[valid].mean().item(),
             "working_set_max": int(ws[valid].max().item()),
@@ -1052,6 +1057,29 @@ class OffloadMoeCache:
             "oracle_hit_global": oracle_hit_global,
             "norm_entropy": norm_ent,
         }
+        if curve_caps is None:
+            curve_caps = (512, 1024, 2000, 4000, 6000, 8800, 12000)
+        caps = [c for c in curve_caps if 0 < c <= flat.numel()]
+        if caps:
+            # Reuse the sorted distributions; one index_select + one tolist per variant.
+            flat_sorted = torch.sort(flat, descending=True).values
+            flat_cdf = torch.cumsum(flat_sorted, 0) / flat.sum().clamp(min=1)
+            pool_idx = torch.tensor(
+                [c - 1 for c in caps], dtype=torch.long, device=freq.device
+            )
+            pool_hits = flat_cdf.index_select(0, pool_idx).tolist()
+            layer_idx = torch.tensor(
+                [max(1, c // self.num_layers) - 1 for c in caps],
+                dtype=torch.long, device=freq.device,
+            )
+            layer_hits = cdf[valid].index_select(1, layer_idx).mean(dim=0).tolist()
+            out["oracle_hit_by_pool_size"] = {
+                str(c): round(h, 6) for c, h in zip(caps, pool_hits)
+            }
+            out["oracle_hit_by_layer_even_split"] = {
+                str(c): round(h, 6) for c, h in zip(caps, layer_hits)
+            }
+        return out
 
     def stats_snapshot(self) -> dict:
         """Cross-process snapshot of the slot-cache counters for /v1/stats.
@@ -1172,6 +1200,10 @@ class OwnerOffloadMoeCache:
       (``nonzero`` + ``num_indices.item()``), so it cannot be captured.
     * :meth:`ensure_route_graph` -- fixed-shape, sync-free sentinel admission for CUDA-graph
       decode (see its docstring).  Selected by the ``graph_safe`` constructor flag.
+
+    With ``decode_target="hybrid"`` a third path, :meth:`ensure_route_hybrid`, applies the
+    capped-fetch hybrid admission in the owner-local namespace: the GPU serves hits plus at
+    most K fetched misses and the CPU computes the overflow from the owner-local banks.
     """
 
     is_owner_local = True  # MoELayer dispatches to ensure_route() on this flag
@@ -1187,14 +1219,18 @@ class OwnerOffloadMoeCache:
         graph_safe: bool = False,
         layout: dict | None = None,
         max_slots: int | None = None,
+        decode_target: str = "gpu",
+        hybrid_max_fetch: int = -1,
     ) -> None:
         if layout is None and quant_format not in _BANK_SCHEMAS:
             raise ValueError(f"unknown quant_format {quant_format!r}")
+        if decode_target not in ("gpu", "hybrid"):
+            # Per-layer CPU routing (`cpu_layer_ids`) is not wired under owner EP; hybrid is
+            # per-miss and goes through ensure_route_hybrid instead.
+            raise ValueError(
+                f"owner EP decode_target must be 'gpu' or 'hybrid', got {decode_target!r}"
+            )
         self.geometry = geometry
-        # The owner adapter is GPU-only: it wraps the GPU slot cache and `_decode_owner` is
-        # selected before the `is_cpu_layer` branch, so a CPU/hybrid target could not be
-        # honoured. `_validate_owner_ep_config` rejects `--moe-cpu-layers` under owner EP
-        # rather than accepting a configuration this class would silently ignore.
         self._cache = OffloadMoeCache(
             num_layers=geometry.num_layers,
             num_experts=geometry.local_num_experts,
@@ -1204,7 +1240,8 @@ class OwnerOffloadMoeCache:
             prefill_overlap=geometry.prefill_overlap,
             prefill_hit_d2d=prefill_hit_d2d,
             quant_format=quant_format,
-            decode_target="gpu",
+            decode_target=decode_target,
+            hybrid_max_fetch=hybrid_max_fetch,
             layout=layout,
             max_slots=max_slots,
         )
@@ -1510,6 +1547,101 @@ This variant never changes the shape.  Remote entries are remapped to a row that
             owned_mask=owned,
             missing_local_ids=empty,
             evicted_flat_ids=empty,
+        )
+
+    def ensure_route_hybrid(
+        self, layer_id: int, weights: torch.Tensor, global_expert_ids: torch.Tensor
+    ) -> OwnerCacheUpdate:
+        """Hybrid admission in the owner-local namespace.
+
+        Same global -> local-row remap as :meth:`ensure_route_graph` (remote entries borrow an
+        owned row of the same route), but the admission is the capped-fetch hybrid one: the
+        wrapped kernel rewrites the route in place to a slot id for rows the GPU serves (cache
+        hit or PCIe-fetched miss) and ``-1`` for the overflow misses the CPU must compute.
+        Fixed shape, no device->host reads, so it is CUDA-graph capturable.
+
+        ``cpu_ids`` carries the overflow rows in the owner-local namespace (-1 elsewhere; the
+        owner-local bank sources are what the CPU executor reads), and ``weights`` is masked to
+        zero at every position the GPU must not compute (remote entries and CPU rows), so the
+        two halves together compute each owned route exactly once.
+        """
+        if self.decode_target != "hybrid":
+            raise RuntimeError(
+                f"ensure_route_hybrid requires decode_target='hybrid', got {self.decode_target!r}"
+            )
+        if self._pending_owned:
+            raise RuntimeError("copy_missing must complete the previous owner route first")
+        if not same_device(weights.device, self.device) or not same_device(
+            global_expert_ids.device, self.device
+        ):
+            raise ValueError(
+                f"owner route tensors must be on {self.device}, got "
+                f"{weights.device} and {global_expert_ids.device}"
+            )
+        if not 0 <= layer_id < self.geometry.num_layers:
+            raise ValueError(
+                f"layer_id {layer_id} is outside [0, {self.geometry.num_layers})"
+            )
+        if weights.shape != global_expert_ids.shape:
+            raise ValueError(
+                f"route weights and expert IDs must have the same shape, got "
+                f"{tuple(weights.shape)} and {tuple(global_expert_ids.shape)}"
+            )
+        if global_expert_ids.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+            raise TypeError(
+                f"router expert IDs must be an integer tensor, got {global_expert_ids.dtype}"
+            )
+        if self.route_recorder is not None:
+            raise RuntimeError(
+                "--moe-trace-route records host-side and cannot run inside a CUDA graph; "
+                "disable it or serve with --cuda-graph-max-bs 0"
+            )
+
+        ownership = self.geometry.ownership
+        local_ids, owned = ownership.global_to_local(global_expert_ids)
+        zero_row = torch.zeros((), dtype=local_ids.dtype, device=self.device)
+        if owned.ndim == 0 or owned.shape[-1] == 0:
+            raise ValueError("owner route needs at least one candidate position per row")
+        # Remote entries borrow the first owned row of the same route (weight is zeroed), so
+        # the admitted row set stays exactly the owned rows, matching the eager compaction.
+        first_owned = torch.argmax(owned.to(torch.int8), dim=-1, keepdim=True)
+        fallback = local_ids.gather(-1, first_owned)
+        fallback = torch.where(owned.any(dim=-1, keepdim=True), fallback, zero_row)
+        safe_row = torch.where(owned, local_ids, fallback)
+        # ``admit`` is rewritten in place; materialize the row/flat IDs before the kernel runs.
+        local_rows = safe_row.clone()
+        local_flat = layer_id * self.geometry.local_num_experts + safe_row
+        admit = safe_row.to(dtype=torch.int32).contiguous()
+
+        recorder = self._cache.route_recorder
+        self._cache.route_recorder = None
+        try:
+            # Only owned rows carry real candidates, so the fetch cap applies to owned misses
+            # and no remote expert can ever be fetched into this rank's slots.
+            self._cache.ensure_experts_hybrid(layer_id, admit)
+        finally:
+            self._cache.route_recorder = recorder
+        self._pending_owned = True
+
+        # ``admit`` now holds: slot id >= 0 (GPU serves it) or -1 (CPU must compute it).
+        on_gpu = admit.ge(0)
+        slot_ids = admit.clamp_min(0)
+        neg_one = torch.full_like(local_rows, -1)
+        cpu_ids = torch.where(owned & ~on_gpu, local_rows, neg_one)
+        zero_weight = torch.zeros((), dtype=weights.dtype, device=weights.device)
+        empty = torch.empty((0,), dtype=torch.int32, device=self.device)
+        return OwnerCacheUpdate(
+            slot_ids=slot_ids.reshape(global_expert_ids.shape),
+            local_ids=local_rows,
+            local_flat_ids=local_flat,
+            # Owner-routed weights (same convention as ensure_route_graph): remote entries are
+            # zero; CPU rows keep their router weight (the GEMM masks them at the call site so
+            # the CPU still gets them via cpu_ids).
+            weights=torch.where(owned, weights, zero_weight).contiguous(),
+            owned_mask=owned,
+            missing_local_ids=empty,
+            evicted_flat_ids=empty,
+            cpu_ids=cpu_ids,
         )
 
     def copy_missing(self) -> None:

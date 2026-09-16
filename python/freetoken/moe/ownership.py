@@ -360,6 +360,9 @@ class OwnerCacheUpdate:
     owned_mask: torch.Tensor
     missing_local_ids: torch.Tensor
     evicted_flat_ids: torch.Tensor
+    # Hybrid admission only: owner-local bank rows the CPU executor must compute, -1 at every
+    # position the GPU serves (cache hit or PCIe-fetched miss). None for the GPU-only paths.
+    cpu_ids: torch.Tensor | None = None
 
 
 class OwnerCacheAdapter:

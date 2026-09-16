@@ -1403,7 +1403,7 @@ class _RecordingMoEMethod:
         return hidden_states
 
 
-def _make_owner_layer(quant_format="bf16", prefill_overlap=False):
+def _make_owner_layer(quant_format="bf16", prefill_overlap=False, decode_target="gpu", hybrid_max_fetch=-1):
     """OffloadMoELayer wired to an OwnerOffloadMoeCache with tiny local banks."""
     from freetoken.moe.offload_cache import OwnerOffloadMoeCache
     from freetoken.moe.ownership import OwnerCacheGeometry
@@ -1414,7 +1414,10 @@ def _make_owner_layer(quant_format="bf16", prefill_overlap=False):
         global_num_experts=8, world_size=2, rank=1, num_layers=1,
         cache_size=8, prefill_overlap=prefill_overlap,
     )
-    owner = OwnerOffloadMoeCache(geometry, torch.device("cpu"), quant_format=quant_format)
+    owner = OwnerOffloadMoeCache(
+        geometry, torch.device("cpu"), quant_format=quant_format,
+        decode_target=decode_target, hybrid_max_fetch=hybrid_max_fetch,
+    )
     if quant_format == "bf16":
         owner.set_bank_sources({
             "gate_up": [torch.randn(4, 32, 8)],
@@ -1596,3 +1599,407 @@ def test_attach_owner_moe_cache_wires_layers_and_keeps_global_banks():
     assert layers == [layer]
     assert layer.owner_cache is owner
     assert layer.offload_cache is owner
+
+
+def _make_owner_hybrid_cache(global_e=8, world=2, rank=1, cache_size=8, max_fetch=1, num_layers=1):
+    """OwnerOffloadMoeCache on CPU with decode_target='hybrid' and tiny bf16 banks."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    _init_tp()
+    local = global_e // world
+    geometry = OwnerCacheGeometry(
+        global_num_experts=global_e, world_size=world, rank=rank,
+        num_layers=num_layers, cache_size=cache_size,
+    )
+    owner = OwnerOffloadMoeCache(
+        geometry, torch.device("cpu"), quant_format="bf16",
+        decode_target="hybrid", hybrid_max_fetch=max_fetch,
+    )
+    owner.set_bank_sources({
+        "gate_up": [torch.randn(local, 32, 8) for _ in range(num_layers)],
+        "down": [torch.randn(local, 8, 16) for _ in range(num_layers)],
+    })
+    return owner
+
+
+def _sim_copy_missing(owner):
+    """Torch (CPU) stand-in for copy_missing: move the staged rows and clear the flags."""
+    inner = owner._cache
+    layer_id = inner._pending_src_layer
+    n = int(inner.num_indices.item())
+    for idx in range(n):
+        slot = int(inner.evict_slots[idx])
+        row = int(inner.src_indices[idx])
+        for role, per_layer in inner.bank_sources.items():
+            inner.bank_caches[role][slot].copy_(per_layer[layer_id][row])
+    inner._pending_src_layer = None
+    inner._pending_whole_layer = False
+    owner._pending_owned = False
+
+
+def test_owner_hybrid_route_splits_each_owned_route_exactly_once():
+    """Hybrid owner admission: each OWNED route goes to exactly one side -- a GPU slot
+    (>= 0) xor an owner-local CPU row in cpu_ids. Remote entries are inert."""
+    owner = _make_owner_hybrid_cache(max_fetch=1)
+    # rank 1 owns global [4, 8) -> local rows [0, 4); global 1 is remote.
+    topk_weights = torch.tensor([[0.5, 0.4, 0.3, 0.2]], dtype=torch.float32)
+    topk_ids = torch.tensor([[4, 5, 6, 1]], dtype=torch.int32)
+
+    update = owner.ensure_route_hybrid(0, topk_weights, topk_ids)
+
+    assert update.owned_mask.tolist() == [[True, True, True, False]]
+    on_cpu = update.cpu_ids.ge(0)
+    # slot_ids are clamped (always >= 0 by design); the true GPU set is owned & not-on-CPU
+    on_gpu = update.owned_mask & ~on_cpu
+    # exactly once: XOR on owned positions, neither on remote
+    assert torch.equal(on_gpu ^ on_cpu, update.owned_mask)
+    # cpu_ids carry owner-LOCAL rows of the owned misses that overflowed the fetch cap
+    cpu_rows = update.cpu_ids[on_cpu]
+    assert int(cpu_rows.min()) >= 0 and int(cpu_rows.max()) < owner.num_experts
+    # the remote entry: zero weight, no slot-side contribution, no cpu row
+    assert update.weights[0, 3] == 0
+    assert update.cpu_ids[0, 3] == -1
+    # cold cache: 3 owned misses, fetch cap 1 -> 1 fetched, 2 overflow to the CPU
+    assert int(owner._cache.num_missing_full.item()) == 3
+    assert int(owner._cache.num_indices.item()) == 1
+    assert int(on_cpu.sum()) == 2
+    # sync-free by design: no miss/eviction diagnostics
+    assert update.missing_local_ids.numel() == 0
+    assert update.evicted_flat_ids.numel() == 0
+    _sim_copy_missing(owner)
+    # a second route after the copy completes is accepted (staged state was consumed)
+    owner.ensure_route_hybrid(0, topk_weights, topk_ids)
+
+
+def test_owner_hybrid_two_ranks_cover_the_route_exactly_once():
+    """EP=2: across the two owner caches each route position is computed exactly once."""
+    owners = [_make_owner_hybrid_cache(rank=r, max_fetch=1) for r in range(2)]
+    topk_weights = torch.tensor([[0.5, 0.4, 0.3, 0.2, 0.1]], dtype=torch.float32)
+    topk_ids = torch.tensor([[0, 3, 4, 6, 7]], dtype=torch.int32)  # rank0: [0,4), rank1: [4,8)
+
+    cover = torch.zeros_like(topk_ids, dtype=torch.int8)
+    for owner in owners:
+        update = owner.ensure_route_hybrid(0, topk_weights, topk_ids.clone())
+        compute = update.weights.ne(0)  # remote entries are zero-weighted on both halves
+        # on this rank a position is computed iff it is owned, and exactly one side has it
+        assert torch.equal(compute, update.owned_mask)
+        on_cpu = update.cpu_ids.ge(0)
+        assert torch.equal((update.owned_mask & ~on_cpu) ^ on_cpu, update.owned_mask)
+        cover += compute.to(torch.int8)
+        _sim_copy_missing(owner)
+    assert torch.equal(cover, torch.ones_like(cover))
+
+
+def test_owner_hybrid_never_admits_remote_rows():
+    """The resident set must stay inside the owner-local namespace no matter how much of
+    the route is remote: a remote expert can never occupy one of this rank's slots."""
+    owner = _make_owner_hybrid_cache(rank=0, max_fetch=2)  # owns global [0, 4)
+    routes = [
+        torch.tensor([[0, 1, 4, 5]], dtype=torch.int32),
+        torch.tensor([[2, 3, 6, 7]], dtype=torch.int32),
+        torch.tensor([[4, 5, 6, 7]], dtype=torch.int32),  # all-remote row
+        torch.tensor([[0, 2, 4, 6]], dtype=torch.int32),
+    ]
+    for ids in routes:
+        w = torch.full(ids.shape, 0.25, dtype=torch.float32)
+        owner.ensure_route_hybrid(0, w, ids)
+        _sim_copy_missing(owner)
+    resident = owner._cache.id_of_slot[owner._cache.id_of_slot.ge(0)]
+    local = owner.num_experts
+    # id_of_slot stores layer_id * local_num_experts + local_row; layer 0 -> [0, local)
+    assert resident.numel() > 0
+    assert bool(((resident >= 0) & (resident < local)).all())
+    # every cached row is one this rank actually owns
+    assert set(resident.tolist()) <= set(range(local))
+
+
+def test_owner_layer_decode_hybrid_computes_each_owned_route_exactly_once(monkeypatch):
+    """Numerical exactly-once through ``_decode_owner_hybrid``: GPU slot partial + CPU
+    partial must equal the single-reference sum over the owned route, with bank bytes
+    flowing through the real slot cache."""
+    layer, owner = _make_owner_layer(decode_target="hybrid", hybrid_max_fetch=1)
+    inner = owner._cache
+    src = inner.bank_sources["gate_up"][0]  # [local, 2I, H]
+
+    def scale_of_src_row(row):
+        return float(src[row].sum())
+
+    def scale_of_slot(slot):
+        return float(inner.bank_caches["gate_up"][slot].sum())
+
+    def fake_gemm(cache, hidden_states, weights, slot_ids, **kw):
+        out = torch.zeros_like(hidden_states)
+        for b in range(hidden_states.shape[0]):
+            for k in range(slot_ids.shape[1]):
+                w = float(weights[b, k])
+                if w != 0.0:
+                    out[b] += w * scale_of_slot(int(slot_ids[b, k])) * hidden_states[b]
+        return out
+
+    class _FakeCpuExec:
+        def __init__(self):
+            self.seen = None
+
+        def decode_submit(self, layer_id, hidden, weights, cpu_ids):
+            self.seen = (weights.clone(), cpu_ids.clone())
+            out = torch.zeros_like(hidden)
+            for b in range(hidden.shape[0]):
+                for k in range(cpu_ids.shape[1]):
+                    row = int(cpu_ids[b, k])
+                    if row >= 0:
+                        out[b] += float(weights[b, k]) * scale_of_src_row(row) * hidden[b]
+            self._partial = out
+            return "pending"
+
+        def decode_sync(self, pending):
+            return self._partial
+
+    monkeypatch.setattr(layer, "_expert_gemm", fake_gemm)
+    monkeypatch.setattr(owner, "copy_missing", lambda: _sim_copy_missing(owner))
+    owner.set_cpu_executor(_FakeCpuExec())
+
+    # rank 1 owns global [4, 8). Cold cache, fetch cap 1: of the owned route some hits/
+    # fetches land on the GPU, the overflow lands on the CPU.
+    hidden = torch.randn(2, 8)
+    topk_weights = torch.tensor([[0.5, 0.25], [0.75, 0.125]], dtype=torch.float32)
+    topk_ids = torch.tensor([[4, 6], [5, 1]], dtype=torch.int32)  # 1 is remote
+
+    out = layer._decode_owner_hybrid(hidden, topk_weights, topk_ids)
+
+    reference = torch.zeros_like(hidden)
+    for b in range(2):
+        for k in range(2):
+            g = int(topk_ids[b, k])
+            if g >= 4:
+                reference[b] += float(topk_weights[b, k]) * scale_of_src_row(g - 4) * hidden[b]
+    assert torch.allclose(out, reference, atol=1e-5)
+
+    # the CPU saw only owned overflow rows, in the owner-local namespace
+    _, cpu_ids = owner.cpu_executor.seen
+    on_cpu = cpu_ids.ge(0)
+    assert bool((cpu_ids[on_cpu] >= 0).all()) and int(cpu_ids[on_cpu].max()) < owner.num_experts
+    # and the GPU/CPU split is complementary over the owned positions
+    owned = topk_ids.ge(4)
+    assert int(on_cpu.sum()) + int((topk_weights.ne(0) & owned & ~on_cpu).sum()) == int(owned.sum())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_owner_hybrid_cuda_route_splits_and_copies_real_rows():
+    """GPU-kernel version of the exactly-once contract: the hybrid owner admission runs the
+    real capped-fetch kernel, fetches at most K misses over the real copy path, and leaves
+    the overflow as owner-local rows in cpu_ids."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    L, E_GLOBAL, E_LOCAL, S = 2, 8, 4, 8
+    OUT, IN = 64, 512
+    dev = torch.device("cuda")
+    geometry = OwnerCacheGeometry(
+        global_num_experts=E_GLOBAL, world_size=2, rank=1, num_layers=L, cache_size=S
+    )
+    cache = OwnerOffloadMoeCache(
+        geometry, dev, quant_format="nvfp4", decode_target="hybrid", hybrid_max_fetch=1
+    )
+    cache.set_bank_sources(_owner_nvfp4_banks(L, E_LOCAL, OUT, IN, base=100))
+    cache.reset()
+
+    # rank 1 owns global [4, 8): three owned misses + one remote.
+    ids = torch.tensor([[4, 5, 6, 1]], dtype=torch.int32, device=dev)
+    weights = torch.tensor([[0.4, 0.3, 0.2, 0.1]], device=dev)
+    update = cache.ensure_route_hybrid(0, weights, ids)
+    cache.copy_missing()
+    torch.cuda.synchronize()
+
+    owned = update.owned_mask
+    on_cpu = update.cpu_ids.ge(0)
+    assert torch.equal((owned & ~on_cpu) ^ on_cpu, owned)
+    assert update.weights[0, 3].item() == 0.0  # remote is inert
+    assert update.cpu_ids[0, 3].item() == -1
+    # cold cache: 3 owned misses, fetch cap 1 -> exactly 1 fetched, 2 to the CPU
+    assert int(cache.num_missing_full.item()) == 3
+    assert int(cache.num_indices.item()) == 1
+    assert int(on_cpu.sum()) == 2
+    # the fetched expert's bytes really arrived in its slot (fingerprint = 100 + local row)
+    packed = cache.bank_caches["gate_up_packed"]
+    gpu_pos = (owned & ~on_cpu)[0]
+    for k in range(ids.shape[1]):
+        if gpu_pos[k]:
+            slot = int(update.slot_ids[0, k])
+            row = int(update.local_ids[0, k])
+            assert int(packed[slot].view(torch.uint8).flatten()[0].item()) == 100 + row
+    cache.validate_invariants()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_owner_hybrid_route_is_capturable_and_replays():
+    """The hybrid owner admission is fixed-shape and sync-free, so it must capture into a
+    CUDA graph and track new route data on replay -- same contract as ensure_route_graph."""
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    L, E_GLOBAL, E_LOCAL, S = 2, 8, 4, 8
+    OUT, IN = 64, 512
+    dev = torch.device("cuda")
+    geometry = OwnerCacheGeometry(
+        global_num_experts=E_GLOBAL, world_size=2, rank=1, num_layers=L, cache_size=S
+    )
+    cache = OwnerOffloadMoeCache(
+        geometry, dev, quant_format="nvfp4", decode_target="hybrid", hybrid_max_fetch=1
+    )
+    cache.set_bank_sources(_owner_nvfp4_banks(L, E_LOCAL, OUT, IN, base=100))
+    cache.reset()
+
+    ids = torch.tensor([[0, 4, 7, 5, 4]], dtype=torch.int32, device=dev)
+    weights = torch.tensor([[0.1, 0.2, 0.3, 0.15, 0.25]], device=dev)
+
+    def step(ids_buf, weights_buf):
+        update = cache.ensure_route_hybrid(0, weights_buf, ids_buf)
+        cache.copy_missing()
+        return update
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            step(ids.clone(), weights.clone())
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    ids_buf = ids.clone()
+    weights_buf = weights.clone()
+    with torch.cuda.graph(graph):
+        captured = step(ids_buf, weights_buf)
+
+    # Replay with a NEW route written into the captured buffers: the split must track it.
+    new_ids = torch.tensor([[6, 4, 2, 5, 1]], dtype=torch.int32, device=dev)
+    new_weights = torch.tensor([[0.5, 0.5, 0.5, 0.5, 0.5]], device=dev)
+    ids_buf.copy_(new_ids)
+    weights_buf.copy_(new_weights)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    owned = captured.owned_mask
+    on_cpu = captured.cpu_ids.ge(0)
+    # rank 1 owns [4, 8): positions 0 (g6), 1 (g4), 3 (g5) owned; 2 (g2), 4 (g1) remote.
+    assert owned[0].tolist() == [True, True, False, True, False]
+    assert torch.equal((owned & ~on_cpu) ^ on_cpu, owned)
+    assert captured.weights[0, 2].item() == 0.0
+    assert captured.weights[0, 4].item() == 0.0
+    packed = cache.bank_caches["gate_up_packed"]
+    gpu_pos = (owned & ~on_cpu)[0]
+    for k in range(new_ids.shape[1]):
+        if gpu_pos[k]:
+            slot = int(captured.slot_ids[0, k])
+            row = int(captured.local_ids[0, k])
+            assert int(packed[slot].view(torch.uint8).flatten()[0].item()) == 100 + row
+    cache.validate_invariants()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_owner_layer_decode_hybrid_end_to_end_real_executor():
+    """Full production path at toy scale: real CpuMoeExecutor (compiled ext) + real fused
+    bf16 GEMM over the real slot cache, driven through ``_decode_routed`` dispatch. The
+    two partials must sum to the single-reference decode over the owned route."""
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.fused import fused_experts_decode_impl
+    from freetoken.moe.offload_cache import OwnerOffloadMoeCache
+    from freetoken.moe.ownership import OwnerCacheGeometry
+
+    torch.manual_seed(0)
+    L, E_GLOBAL, E_LOCAL, H, I, top_k, bs = 1, 16, 8, 256, 128, 4, 4
+    dev = torch.device("cuda")
+    _init_tp()
+
+    layer = _bf16_offload_layer(0, E_GLOBAL, top_k, H, I)
+    geometry = OwnerCacheGeometry(
+        global_num_experts=E_GLOBAL, world_size=2, rank=1, num_layers=L, cache_size=16
+    )
+    owner = OwnerOffloadMoeCache(
+        geometry, dev, quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=1
+    )
+    gate_up = alloc_pinned_tensor(L * E_LOCAL, 2 * I, H, dtype=torch.bfloat16)
+    down = alloc_pinned_tensor(L * E_LOCAL, H, I, dtype=torch.bfloat16)
+    gate_up.copy_(torch.randn(L * E_LOCAL, 2 * I, H) * 0.1)
+    down.copy_(torch.randn(L * E_LOCAL, H, I) * 0.1)
+    owner.set_bank_sources(
+        {"gate_up": list(gate_up.split(E_LOCAL)), "down": list(down.split(E_LOCAL))}
+    )
+    layer.owner_cache = owner
+    layer.offload_cache = owner
+
+    executor = CpuMoeExecutor(
+        owner, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=2, max_tokens=bs, device=dev,
+    )
+    owner.set_cpu_executor(executor)
+
+    seen = {}
+    orig_submit = executor.decode_submit
+
+    def spy_submit(layer_id, hidden, weights, cpu_ids):
+        seen["cpu_ids"] = cpu_ids.clone()
+        return orig_submit(layer_id, hidden, weights, cpu_ids)
+
+    executor.decode_submit = spy_submit
+
+    # rank 1 owns global [8, 16). Cold cache + fetch cap 1 forces CPU overflow.
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.tensor(
+        [[8, 9, 10, 0], [11, 12, 13, 1], [8, 14, 15, 2], [9, 10, 12, 3]],
+        dtype=torch.int32, device=dev,
+    )
+    w = torch.rand(bs, top_k, device=dev, dtype=torch.float32) * 0.5 + 0.1
+
+    out = layer._decode_routed(hidden, w, ids).float()
+    torch.cuda.synchronize()
+
+    # reference: real fused kernel over the owner-local bank, remotes zero-weighted
+    owned = ids.ge(8)
+    local_rows = torch.where(owned, ids - 8, torch.zeros_like(ids))
+    w_ref = torch.where(owned, w, torch.zeros_like(w))
+    ref = fused_experts_decode_impl(
+        hidden,
+        owner.bank_sources["gate_up"][0].to(dev),
+        owner.bank_sources["down"][0].to(dev),
+        w_ref,
+        local_rows,
+        "silu",
+        False,
+    ).float()
+
+    rel = (out - ref).abs().max() / (ref.abs().max() + 1e-6)
+    assert rel < 2e-2, f"rel err {rel.item()}"
+    # the CPU side really carried the overflow (cap 1, up to 3 owned misses per row)
+    cpu_ids = seen["cpu_ids"]
+    assert int(cpu_ids.ge(0).sum()) > 0
+    assert int(cpu_ids[cpu_ids.ge(0)].max()) < E_LOCAL
+
+
+def test_decode_routing_stats_oracle_curve_matches_hand_computed():
+    """The sizing curve must agree with a hand-computed prefix sum of the histogram."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=4, device=torch.device("cpu"))
+    # layer 0: [8, 4, 2, 2] (total 16); layer 1: [12, 4, 0, 0] (total 16)
+    cache.decode_freq = torch.tensor([[8, 4, 2, 2], [12, 4, 0, 0]], dtype=torch.float32)
+    stats = cache.decode_routing_stats(curve_caps=(1, 2, 4, 6, 8))
+
+    # flat distribution sorted: 12, 8, 4, 4, 2, 2, 0, 0 (total 32)
+    pool = stats["oracle_hit_by_pool_size"]
+    assert pool["1"] == round(12 / 32, 6)
+    assert pool["2"] == round(20 / 32, 6)
+    assert pool["4"] == round(28 / 32, 6)
+    assert pool["6"] == 1.0
+    assert pool["8"] == 1.0
+    # even per-layer split: cap c -> C_l = max(1, c // 2) slots per layer
+    lay = stats["oracle_hit_by_layer_even_split"]
+    assert lay["1"] == round((8 / 16 + 12 / 16) / 2, 6)
+    assert lay["4"] == round((12 / 16 + 16 / 16) / 2, 6)
+    assert lay["8"] == 1.0
+    # the pre-existing single-point stats stay consistent with the curve
+    assert stats["oracle_hit_at_slots"] == round((12 / 16 + 16 / 16) / 2, 6)
+    assert stats["oracle_hit_global"] == round(28 / 32, 6)

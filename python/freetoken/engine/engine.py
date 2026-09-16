@@ -66,8 +66,11 @@ def _validate_owner_ep_config(config: EngineConfig) -> None:
             "owner EP currently requires the initial same-group TP2+EP2 topology "
             "(--tensor-parallel-size 2 --moe-ep-size 2)"
         )
-    if config.moe_strategy != "offload":
-        raise ValueError("owner EP currently requires --moe-strategy offload")
+    if config.moe_strategy not in ("offload", "hybrid"):
+        raise ValueError(
+            "owner EP currently requires --moe-strategy offload or hybrid "
+            "(hybrid decode goes through OwnerOffloadMoeCache.ensure_route_hybrid)"
+        )
     if config.moe_cache_rate is not None:
         raise ValueError(
             "owner EP sizes a LOCAL pool, so --moe-cache-rate (a fraction of the GLOBAL "
@@ -81,9 +84,10 @@ def _validate_owner_ep_config(config: EngineConfig) -> None:
         )
     if config.moe_cpu_layers:
         raise ValueError(
-            "owner EP does not implement the CPU/hybrid expert path: the owner cache wraps "
-            "the GPU slot cache and _decode_owner is selected before the is_cpu_layer "
-            "branch, so --moe-cpu-layers would be accepted and then silently ignored"
+            "owner EP does not implement per-layer CPU routing: --moe-cpu-layers is a "
+            "whole-layer CPU decode, and the owner cache wraps the GPU slot cache, so it "
+            "would be accepted and then silently ignored; use --moe-strategy hybrid for "
+            "the per-miss CPU expert path"
         )
     from freetoken.checkpoint.ftw import is_ftw_checkpoint
 
@@ -817,6 +821,8 @@ class Engine:
                 graph_safe=_owner_graph_safe(config),
                 layout=layout,
                 max_slots=max_slots,
+                decode_target=decode_target,
+                hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
         else:
             cache = OffloadMoeCache(

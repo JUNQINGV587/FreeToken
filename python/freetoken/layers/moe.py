@@ -294,6 +294,8 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         assert cache is not None
         if self.owner_cache is not None:
+            if cache.decode_target == "hybrid":
+                return self._decode_owner_hybrid(hidden_states, topk_weights, topk_ids)
             return self._decode_owner(hidden_states, topk_weights, topk_ids)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
@@ -356,6 +358,51 @@ class OffloadMoELayer(MoELayer):
                 "owner-local slot id escaped the local pool"
             )
         return out
+
+    def _decode_owner_hybrid(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Owner-local hybrid decode: ``_decode_owner`` + ``_decode_hybrid`` composed.
+
+        ``ensure_route_hybrid`` remaps the global route to the owner-local namespace and runs
+        the capped-fetch admission: GPU-served rows (hits + <=K fetched misses) become slot
+        ids, overflow misses become owner-local bank rows in ``cpu_ids``. Each owned route is
+        computed exactly once -- the GEMM masks CPU/remote rows to zero weight and the C++
+        kernel skips id<0. Remote entries are zero-weighted on both halves.
+        """
+        owner = self.owner_cache
+        executor = owner.cpu_executor
+        assert executor is not None, "CPU MoE executor was not initialized"
+        update = owner.ensure_route_hybrid(self.layer_id, topk_weights, topk_ids)
+        if owner.collect_stats:
+            owner.record_decode_stats_hybrid(self.layer_id)
+        on_cpu = update.cpu_ids.ge(0)
+        pending = executor.decode_submit(
+            self.layer_id, hidden_states, update.weights, update.cpu_ids
+        )
+
+        # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 serializes CPU/GPU for an A/B.
+        cpu_routed_early = (
+            executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
+        )
+
+        owner.copy_missing()
+        gpu_w = torch.where(on_cpu, topk_weights.new_zeros(()), update.weights).contiguous()
+        gpu_routed = self._expert_gemm(
+            owner,
+            hidden_states,
+            gpu_w,
+            update.slot_ids,
+            views=owner.bank_views(),
+            n=None,
+            alphas=owner.alphas_for_slots(self.layer_id),
+            is_prefill=False,
+        )
+        cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
+        return gpu_routed + cpu_routed
 
     def _decode_hybrid(
         self,

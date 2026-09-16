@@ -80,9 +80,14 @@ def test_moe_cache_rate_is_still_rejected():
         _validate_owner_ep_config(_config(moe_cache_rate=0.5))
 
 
-def test_a_non_offload_strategy_is_still_rejected():
-    with pytest.raises(ValueError, match="offload"):
-        _validate_owner_ep_config(_config(moe_strategy="resident"))
+def test_hybrid_strategy_is_accepted():
+    _validate_owner_ep_config(_config(moe_strategy="hybrid"))
+
+
+@pytest.mark.parametrize("strategy", ["resident", "fused", "cpu"])
+def test_other_strategies_are_still_rejected(strategy):
+    with pytest.raises(ValueError, match="offload or hybrid"):
+        _validate_owner_ep_config(_config(moe_strategy=strategy))
 
 
 def test_a_topology_other_than_tp2_ep2_is_still_rejected():

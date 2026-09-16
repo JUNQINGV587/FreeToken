@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
+from freetoken.distributed.impl import DistributedCommunicator
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -190,7 +191,7 @@ class GraphRunner:
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                with DistributedCommunicator.graph_capture_ctx(), torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
             if pool is None:

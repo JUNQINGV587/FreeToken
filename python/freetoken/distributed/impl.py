@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
 import torch.distributed as dist
@@ -60,6 +61,35 @@ class PyNCCLDistributedImpl(DistributedImpl):
         return result
 
 
+@dataclass
+class CustomAllReduceImpl(DistributedImpl):
+    """vLLM custom-allreduce donor for small decode-time tensors (2x PCIe GPUs).
+
+    Measured on 2xL20 (PCIe P2P, no NVLink): pynccl/NCCL costs 22-95 us per
+    [bs<=8, 2560] all-reduce; the donor's one-stage kernel does it in ~4-9 us with
+    fp32 accumulation in rank order -- bit-identical to NCCL's sum. Tensors the donor
+    declines (oversize / dtype / non-contiguous) fall back to the inner plugin.
+
+    expandable_segments note: the donor's zero-copy capture path registers graph-pool
+    addresses via cudaIpcGetMemHandle, which VMM (expandable segments) pointers do not
+    support. ``_CopyCaptureCAR`` therefore captures the copy-in path instead: the
+    captured kernel reads the donor's own cudaMalloc'd IPC buffer (IPC-able), at the
+    price of one ~2 us D2D copy per call -- still far cheaper than pynccl. The
+    ``capture()`` ctx is still required around graph capture so the donor exchanges
+    IPC handles for its own buffers at capture exit.
+    """
+
+    inner: DistributedImpl
+    ca: Any  # vllm CustomAllreduce
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.ca.custom_all_reduce(x) if not self.ca.disabled else None
+        return out if out is not None else self.inner.all_reduce(x)
+
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        return self.inner.all_gather(x)
+
+
 class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
@@ -68,6 +98,17 @@ class DistributedCommunicator:
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
+
+    @staticmethod
+    def graph_capture_ctx():
+        """The custom-AR donor must exchange IPC handles for captured buffers."""
+        for p in reversed(DistributedCommunicator.plugins):
+            ca = getattr(p, "ca", None)
+            if ca is not None and not ca.disabled:
+                return ca.capture()
+        import contextlib
+
+        return contextlib.nullcontext()
 
 
 def enable_pynccl_distributed(
@@ -88,6 +129,56 @@ def enable_pynccl_distributed(
     )
 
     DistributedCommunicator.plugins.append(PyNCCLDistributedImpl(comm))
+    enable_custom_all_reduce(tp_info, tp_cpu_group, max_bytes)
+
+
+def enable_custom_all_reduce(
+    tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
+) -> bool:
+    """Attach the vLLM custom-allreduce donor ahead of the current plugin, if usable.
+
+    The donor self-disables when P2P is unavailable; any failure leaves the pynccl
+    plugin as the active one. FREETOKEN_CUSTOM_ALL_REDUCE=0 opts out.
+    """
+    if tp_info.size == 1 or os.getenv("FREETOKEN_CUSTOM_ALL_REDUCE", "1") == "0":
+        return False
+    try:
+        from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+
+        class _CopyCaptureCAR(CustomAllreduce):
+            """Under capture, use the copy-in path: VMM (expandable_segments) input
+            pointers cannot be IPC-registered, but the donor's own buffer can."""
+
+            def custom_all_reduce(self, input):
+                if self.disabled or not self.should_custom_ar(input):
+                    return None
+                if self._IS_CAPTURING and torch.cuda.is_current_stream_capturing():
+                    return self.all_reduce(input, registered=False)
+                return super().custom_all_reduce(input)
+
+        ca = _CopyCaptureCAR(
+            group=tp_cpu_group,
+            device=tp_info.rank,
+            # decode ARs are [bs, hidden] (a few KB); 2 MiB leaves headroom without
+            # growing the registered IPC pool pointlessly.
+            max_size=max(2 * max_bytes, 2 << 20),
+        )
+    except Exception as exc:
+        from freetoken.utils import init_logger
+
+        init_logger(__name__).warning(
+            f"custom all-reduce donor unusable ({exc!r}); staying on pynccl"
+        )
+        return False
+    if ca.disabled:
+        return False
+    DistributedCommunicator.plugins.append(
+        CustomAllReduceImpl(DistributedCommunicator.plugins[-1], ca)
+    )
+    from freetoken.utils import init_logger
+
+    init_logger(__name__).info_rank0("custom all-reduce donor active (vLLM one-stage kernel)")
+    return True
 
 
 def destroy_distributed() -> None:

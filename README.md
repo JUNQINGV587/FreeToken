@@ -14,11 +14,11 @@
 >
 > This branch tracks upstream main plus production customizations for **2x NVIDIA L20 (sm_89, PCIe P2P)**: TP2 + expert offload, serving Qwen3.8-Flash-Next-NVFP4 (qwen4_exp, NVFP4 + PLE disk backend). See git history for the full change list (cherry-picked upstream PRs keep their original authors).
 >
-> Measured performance (2026-09-17, server-side gen throughput):
+> Measured performance (server-side gen throughput):
 >
 > | Scenario | Value | Notes |
 > |---|---|---|
-> | Single-stream decode | **81 t/s** | +19% vs first deployment (68.07 t/s, 2026-09-13) |
+> | Single-stream decode | **81 t/s** | +19% vs first deployment (68.07 t/s) |
 > | 8-way concurrent aggregate | **278-282 t/s** | steady state, all slots busy |
 > | Cold prefill | **3641 tok/s** (70K tokens, TTFT 19.1s) | 3.6x the ~1025 tok/s first-deployment baseline (1025 -> 2132 -> 3641) |
 > | Prefix-cache-hit TTFT | 1.26s (17K tokens) | hybrid radix reuse |
@@ -45,7 +45,7 @@
 >
 > Notes: `--moe-cache-size 8800` holds the top ~8800 of 48x512 experts per GPU in VRAM (measured miss cost ~4 rows/step, so a bigger cache buys nothing); `--num-tokens 786432` sizes the KV pool to ~768K tokens; `--expert-load serial` trades load time for lower peak host RAM; `--image-max-tokens 4096` caps per-image vision tokens.
 
-> Decode progression on this box (same model, same hardware): 68.07 t/s at first deployment (2026-09-13) -> 69.7 after merging upstream main (09-15) -> 72.5-74.2 with custom all-reduce (09-16) -> 78.6-79.9 with admission fusion (09-16) -> **81 t/s** now (09-17, PLE hash fusion + D2H-stall-free GDN conv + prefill warmup batch).
+> Decode progression on this box (same model, same hardware): 68.07 t/s at first deployment -> 69.7 after merging upstream main -> 72.5-74.2 with custom all-reduce -> 78.6-79.9 with admission fusion -> **81 t/s** now (PLE hash fusion + D2H-stall-free GDN conv + prefill warmup batch).
 >
 > Key customizations: all-backend prefill JIT warmup (#169), wide-load NVFP4 prefill MoE kernel for M>=2048 (int32 wide loads + register unpacking, 3.4-3.6x per layer, bit-identical, env-gated), lm_head projecting only the rows the sampler reads (last-token gather), D2H-stall-free varlen GDN conv (#339), single-kernel PLE n-gram hash (#338), disconnect abort delivery (#222), and more.
 

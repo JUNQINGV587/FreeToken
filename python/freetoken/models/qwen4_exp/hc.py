@@ -10,6 +10,7 @@ back at the store, so they agree to fp32 rounding.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -20,10 +21,30 @@ from freetoken.kernel.triton.hc import (
     hc_gate_mix,
     hc_silu,
 )
+from freetoken.kernel.triton.hc_prefill_fused import (
+    HC_PREFILL_FUSED_MIN_M,
+    hc_prefill_combine_norm,
+    hc_prefill_up_mix,
+)
 from freetoken.layers import BaseOP, LinearReplicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+HC_PREFILL_FUSED_ENV = "FREETOKEN_HC_PREFILL_FUSED"
+
+
+def prefill_fused_active(R: torch.Tensor) -> bool:
+    """Dispatch gate: env on, CUDA 2D, prefill-regime M. Below the M gate the caller
+    keeps the production kernels (the fused up-GEMM's cuBLAS bit contract is only
+    established for M >= HC_PREFILL_FUSED_MIN_M)."""
+    return (
+        os.environ.get(HC_PREFILL_FUSED_ENV, "0") == "1"
+        and R.is_cuda
+        and R.dim() == 2
+        and R.shape[0] >= HC_PREFILL_FUSED_MIN_M
+        and R.dtype == torch.bfloat16
+    )
 
 
 def grouped_plus_one_rms_norm(
@@ -150,5 +171,47 @@ class GatedResidual(BaseOP):
             return hc_combine(R, y, s, self.hc_count)
         return self._combine_torch(R, y, s)
 
+    # ---------------------------------------------------------------- fused prefill
 
-__all__ = ["GatedResidual", "GroupedPlusOneRMSNorm", "grouped_plus_one_rms_norm"]
+    def fused_weights_bf16(self) -> bool:
+        """The fused kernels reproduce the bf16 (UnquantizedLinearMethod) GEMM chain only."""
+        down_w = (
+            self.input_mix_weight_down_block_inject.weight
+            if self.use_combine
+            else self.input_mix_weight_down.weight
+        )
+        return (
+            down_w.dtype == torch.bfloat16
+            and self.input_mix_weight_up.weight.dtype == torch.bfloat16
+        )
+
+    def mix_fused(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """``mix`` given pre-normed streams ``rn`` (bf16, from combine_fused or a
+        standalone grouped_gemma_rmsnorm). The kernel sequence after the norm is the
+        production one (down GEMM -> hc_silu -> up GEMM -> hc_gate_mix): on sm_89 the
+        fused silu+up+mix kernel (hc_prefill_up_mix, bit-exact, kept in
+        kernel/triton/hc_prefill_fused.py) is perf-neutral, so only the norm is
+        absorbed into the previous block's combine."""
+        lora, s = self._down(rn)
+        gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
+        return hc_gate_mix(rn, gate, self.hc_count), s
+
+    def combine_fused(
+        self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor, next_norm: "GroupedPlusOneRMSNorm | None"
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Combine, and when ``next_norm`` is given fuse the next block's RMSNorm into the
+        same launch. Returns (R', rn) where rn is None exactly when next_norm is None."""
+        if next_norm is None:
+            return hc_combine(R, y, s, self.hc_count), None
+        return hc_prefill_combine_norm(
+            R, y, s, next_norm.weight, next_norm.eps, self.hc_count
+        )
+
+
+__all__ = [
+    "GatedResidual",
+    "GroupedPlusOneRMSNorm",
+    "grouped_plus_one_rms_norm",
+    "HC_PREFILL_FUSED_ENV",
+    "prefill_fused_active",
+]

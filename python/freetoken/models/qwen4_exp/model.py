@@ -85,6 +85,35 @@ class Qwen4ExpDecoderLayer(BaseOP):
         block_input, inject = self.mlp_hyper_connection.mix(hidden)
         return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
+    def forward_fused(
+        self,
+        hidden: torch.Tensor,
+        rn: torch.Tensor | None,
+        batch: Batch,
+        next_norm,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """FREETOKEN_HC_PREFILL_FUSED path: mix consumes pre-normed streams, combine
+        returns the next block's normed streams fused into the same launch. Bit-identical
+        to forward (spec in kernel/triton/hc_prefill_fused.py). ``rn`` is None at model
+        entry and after a PLE add; ``next_norm`` is the norm that consumes this layer's
+        mlp combine output (None when a PLE add or nothing follows)."""
+        from freetoken.kernel.triton.hc import grouped_gemma_rmsnorm
+
+        if self.ple is not None:
+            hidden = hidden + self.ple.forward(hidden, batch)
+            rn = None
+        attn_hc, mlp_hc = self.attn_hyper_connection, self.mlp_hyper_connection
+        if rn is None:
+            rn = grouped_gemma_rmsnorm(hidden, attn_hc.hc_norm.weight, attn_hc.hc_norm.eps, attn_hc.hc_count)
+        block_input, inject = attn_hc.mix_fused(rn)
+        if self._is_linear:
+            block_output = self.linear_attn.forward(block_input)
+        else:
+            block_output = self.self_attn.forward(block_input, batch)
+        hidden, rn = attn_hc.combine_fused(hidden, block_output, inject, mlp_hc.hc_norm)
+        block_input, inject = mlp_hc.mix_fused(rn)
+        return mlp_hc.combine_fused(hidden, self.mlp.forward(block_input), inject, next_norm)
+
 
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
@@ -109,8 +138,16 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        from .hc import prefill_fused_active
+
         hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
         hidden = hidden.repeat(1, self.hc_count)
+        if prefill_fused_active(hidden) and all(
+            layer.attn_hyper_connection.fused_weights_bf16()
+            and layer.mlp_hyper_connection.fused_weights_bf16()
+            for layer in self.layers.op_list
+        ):
+            return self._forward_hc_fused(hidden, batch)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -125,6 +162,32 @@ class Qwen4ExpModel(BaseOP):
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
         return self.hyper_connection_mixer.mix(hidden)[0]
+
+    def _forward_hc_fused(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+        """FREETOKEN_HC_PREFILL_FUSED prefill path (gate checked by forward):
+        identical math, fused HC kernels (spec in kernel/triton/hc_prefill_fused.py)."""
+        meta = None
+        if self._ple:
+            from .ple import build_ple_metadata, commit_ngram_context
+
+            meta = build_ple_metadata(batch, self._ple[0].args, batch.input_ids.device)
+            for ple in self._ple:
+                ple.start_prefetch(batch, meta)
+        layers = self.layers.op_list
+        rn = None
+        for i, layer in enumerate(layers):
+            if i + 1 < len(layers):
+                nxt = layers[i + 1]
+                # a PLE add between this combine and the next norm breaks the fusion
+                next_norm = None if nxt.ple is not None else nxt.attn_hyper_connection.hc_norm
+            else:
+                next_norm = self.hyper_connection_mixer.hc_norm
+            hidden, rn = layer.forward_fused(hidden, rn, batch, next_norm)
+        if meta is not None:
+            # single writer: the layers only read the context, so a second PLE layer's
+            # prefetch sees the un-rolled window
+            commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        return self.hyper_connection_mixer.mix_fused(rn)[0]
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):

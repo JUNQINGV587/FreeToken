@@ -982,6 +982,14 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if batch.is_decode:
+            # freq_pin repin hook: called between decode batches on the engine stream
+            # (both loops run _forward inside engine_stream_ctx), the fence point that
+            # stream-orders the pin-bitmap swap and force-placement copies after the
+            # previous batch. A no-op for other policies and between repin epochs.
+            cache = getattr(self.engine, "moe_offload_cache", None)
+            if cache is not None and getattr(cache, "cache_policy", "lru") == "freq_pin":
+                cache.maybe_repin()
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)

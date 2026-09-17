@@ -138,6 +138,12 @@ class OffloadMoeCache:
     # CPU absorbs the overflow misses, then the partials merge. The CPU executor is
     # attached (set_cpu_executor) for cpu/hybrid, set whenever >=1 layer decodes on the CPU.
     decode_target: str = "gpu"
+    # freq_pin policy (--moe-cache-policy freq_pin): pin-slot quota K. The slots
+    # [2*num_experts, 2*num_experts + K) are reserved for the per-layer decode-hot pin
+    # set (quota K // num_layers per layer) and leave the LRU victim pool; the prefill
+    # borrow region [0, 2*num_experts) is never pinned. None -> FREETOKEN_PIN_SLOTS,
+    # default 7168 (6144 is the safer fallback); K=0 degrades the policy to pure LRU.
+    pin_slots: int | None = None
     # hybrid only: max experts fetched over PCIe per (layer, decode step); the rest
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.
@@ -169,7 +175,7 @@ class OffloadMoeCache:
                 "global/local/slot IDs are wired through every cache kernel"
             )
 
-        policy_ids = {"lru": 0}
+        policy_ids = {"lru": 0, "freq_pin": 1}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         if self.layout is None:
@@ -277,6 +283,63 @@ class OffloadMoeCache:
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # ---- freq_pin policy state (all None / inert for lru) -----------------------
+        # pin_freq: the policy's own [L, E] decode-activation histogram, collected at
+        #   the same raw-ids point as decode_freq but with the owner-graph remote-borrow
+        #   inflation excluded (the wrapper counts with the owned mask). decode_freq
+        #   itself is untouched so the lru diagnostics stay bit-identical.
+        # pin_id_mask: [L*E] int8 pin bitmap; pin_cfg: [pin_base, active_pin_slots],
+        #   read by the admission kernel per call so a captured decode graph observes
+        #   repins without recapture. active == 0 -> pure LRU (cold start).
+        if self.cache_policy == "freq_pin":
+            if self.decode_target != "gpu":
+                raise ValueError(
+                    "freq_pin admission is implemented for decode_target='gpu' only; "
+                    "the hybrid capped-fetch and cpu decode paths stay on plain LRU"
+                )
+            k = self.pin_slots
+            if k is None:
+                k = int(os.getenv("FREETOKEN_PIN_SLOTS", "7168"))
+            self.pin_slots_target = max(0, int(k))
+            self.pin_freq = torch.zeros(
+                (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+            )
+            self.pin_id_mask = torch.zeros(
+                (self.num_layers * self.num_experts,), dtype=torch.int8, device=self.device
+            )
+            self.pin_cfg = torch.tensor(
+                [2 * self.num_experts, 0], dtype=torch.int64, device=self.device
+            )
+            # Periodic repin cadence (decode steps), hysteresis margin (a challenger
+            # must beat an incumbent by this factor to displace it), warmup gate
+            # (total routing counts before the first pin) and the per-repin EMA
+            # halving of the histogram (half-life = one repin period).
+            self.pin_repin_interval = int(os.getenv("FREETOKEN_PIN_REPIN_INTERVAL", "1000"))
+            self.pin_hysteresis = float(os.getenv("FREETOKEN_PIN_HYSTERESIS", "0.5"))
+            self.pin_warmup_count = int(os.getenv("FREETOKEN_PIN_WARMUP_COUNT", "500000"))
+            # Per-epoch cap on force-placed rows (first-pin pulse mitigation): 0 =
+            # unlimited (default, current behaviour); >0 spreads a big placement wave
+            # over consecutive epochs.
+            self.pin_place_max_rows = max(
+                0, int(os.getenv("FREETOKEN_PIN_PLACE_MAX_ROWS", "0"))
+            )
+            self._pin_decay = os.getenv("FREETOKEN_PIN_DECAY", "1").strip().lower() not in {
+                "0", "false", "no", "off",
+            }
+            self._decode_steps_seen = 0
+            self._last_warmup_check = 0
+            self._last_repin_step = 0
+            self._pinned_once = False
+            self._repin_count = 0
+            self._last_repin_report: dict | None = None
+        else:
+            self.pin_slots_target = 0
+            self.pin_freq = None
+            self.pin_id_mask = None
+            self.pin_cfg = None
+        # Owner-graph boundary sets this around the inner ensure call so the borrowed
+        # remote rows are not counted (see OwnerOffloadMoeCache.ensure_route_graph).
+        self.pin_freq_suppress = False
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -552,6 +615,18 @@ class OffloadMoeCache:
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
         self.decode_freq.zero_()
+        if self.pin_freq is not None:
+            # A rebuild cold-starts both the cache and the histogram, so the pin state
+            # returns to the un-pinned (pure LRU) warmup phase.
+            self.pin_freq.zero_()
+            self.pin_id_mask.zero_()
+            self.pin_cfg[0] = 2 * self.num_experts
+            self.pin_cfg[1] = 0
+            self._decode_steps_seen = 0
+            self._last_warmup_check = 0
+            self._last_repin_step = 0
+            self._pinned_once = False
+            self._last_repin_report = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
@@ -880,6 +955,13 @@ class OffloadMoeCache:
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        if self.pin_freq is not None and not self.pin_freq_suppress:
+            # Same raw-ids point, device-side (CUDA-graph safe), unconditional for the
+            # freq_pin policy: the histogram drives the pin set, it is not diagnostics.
+            # The .to() is a no-op on the production path (ids already on device); it
+            # only bites when the CPU reference mirror runs against a CUDA cache.
+            ids = expert_ids.reshape(-1).to(device=self.device, dtype=torch.int64)
+            self.pin_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         if self.route_recorder is not None:
             # same raw-ids point: append the ordered trace BEFORE the in-place rewrite.
             self.route_recorder.record(layer_id, expert_ids, phase=0)
@@ -944,6 +1026,201 @@ class OffloadMoeCache:
         Kept so the hybrid and non-hybrid call sites stay symmetric. The previous version
         was eight torch ops per layer per step, all captured into the decode graph.
         """
+
+    # --------------------------------------------------------------- freq_pin
+    def maybe_repin(self) -> dict | None:
+        """freq_pin decode-step hook: warmup-gated first pin + periodic repin.
+
+        The scheduler calls this once per decode forward, between batches on the
+        engine stream -- the fence point that makes the pin-bitmap swap and the
+        force-placement copies safe under the no-refcount model: they are
+        stream-ordered after the previous batch, and the host-side map snapshots in
+        ``_apply_pin_plan`` sync that stream, so they observe its final state. All
+        gates are host-side and cheap; the only device syncs happen on the rare due
+        checks. Returns a report dict when a repin happened, else None.
+        """
+        if self.pin_freq is None:
+            return None
+        self._decode_steps_seen += 1
+        if not self._pinned_once:
+            if self._decode_steps_seen - self._last_warmup_check < 64:
+                return None
+            self._last_warmup_check = self._decode_steps_seen
+            if int(self.pin_freq.sum().item()) < self.pin_warmup_count:
+                return None
+            return self._repin()
+        if self._decode_steps_seen - self._last_repin_step < self.pin_repin_interval:
+            return None
+        return self._repin()
+
+    def _pin_geometry(self) -> tuple[int, int, int]:
+        """(pin_base, pin slots K, per-layer quota) against the CURRENT cache size."""
+        pin_base = 2 * self.num_experts
+        k = max(0, min(self.pin_slots_target, self.cache_size - pin_base))
+        return pin_base, k, k // self.num_layers
+
+    def _compute_pin_plan(self) -> dict:
+        """Pin-set selection with hysteresis; pure host math (no device writes).
+
+        First pin: straight per-layer top-quota. Later repins rank by an
+        hysteresis-adjusted count -- incumbents score ``count * (1 + margin)``,
+        challengers score ``count`` -- and take the top quota of that ranking: a
+        challenger displaces an incumbent only by beating it by the margin. Under
+        histogram-tail rank noise the counts are near-tied, so the set freezes
+        (bounding the per-repin load delta); a genuine distribution shift still
+        rotates it.
+        """
+        _, k, quota = self._pin_geometry()
+        freq = self.pin_freq.cpu()
+        old_mask = self.pin_id_mask.cpu().view(self.num_layers, self.num_experts)
+        new_mask = torch.zeros_like(old_mask)
+        changed_rows = 0
+        for layer in range(self.num_layers):
+            if quota == 0:
+                break
+            counts = freq[layer]
+            old_set = set(old_mask[layer].nonzero(as_tuple=False).flatten().tolist())
+            scores = counts
+            if self._pinned_once and old_set:
+                idx = torch.tensor(sorted(old_set), dtype=torch.long)
+                scores = counts.float().clone()
+                scores[idx] *= 1.0 + self.pin_hysteresis
+            order = torch.argsort(scores, descending=True, stable=True).tolist()
+            selected = order[:quota]
+            new_mask[layer, torch.tensor(selected, dtype=torch.long)] = 1
+            changed_rows += len(set(selected) - old_set)
+        bytes_per_expert = sum(self._copy_feat_bytes_host) if self._copy_feat_bytes_host else 0
+        return {
+            "new_mask": new_mask,
+            "k": k,
+            "quota": quota,
+            "changed_rows": changed_rows,
+            "delta_bytes": changed_rows * bytes_per_expert,
+            "bytes_per_expert": bytes_per_expert,
+        }
+
+    def _apply_pin_plan(self, plan: dict) -> dict:
+        """Swap the pin bitmap, then force-place newly pinned ids into the pin region.
+
+        The swap activates the region LAST, so an admission kernel reading the state
+        mid-repin sees either the old pair or (new mask, old region) -- both legal.
+        Force placement evicts the pin region's non-pinned and departing occupants
+        (coldest first) and loads the rows through the normal staged-copy path. Slots
+        touched by the very latest ensure call are treated as in-flight and skipped:
+        their placements defer to the next epoch (fence-point contract; see
+        ``maybe_repin``).
+        """
+        pin_base, k, _ = self._pin_geometry()
+        self.pin_id_mask.copy_(plan["new_mask"].reshape(-1).to(self.device))
+        self.pin_cfg[0] = pin_base
+        self.pin_cfg[1] = k
+        report = {
+            "k": k,
+            "quota": plan["quota"],
+            "changed_rows": plan["changed_rows"],
+            "delta_bytes": plan["delta_bytes"],
+            "loaded_rows": 0,
+            "deferred_rows": 0,
+        }
+        if k == 0 or not self.bank_sources:
+            return report
+
+        step_now = int(self.step.item())
+        slot_map = self.slot_for_id.cpu()
+        id_of_slot = self.id_of_slot.cpu().tolist()
+        usage = self.usage.cpu().tolist()
+        L, E = self.num_layers, self.num_experts
+        new_flat = plan["new_mask"].reshape(-1).tolist()
+        victims = sorted(
+            (
+                s
+                for s in range(pin_base, pin_base + k)
+                if not (0 <= id_of_slot[s] and new_flat[id_of_slot[s]])
+                and not (step_now > 0 and usage[s] == step_now)
+            ),
+            key=lambda s: (usage[s], s),
+        )
+        placements: dict[int, list[tuple[int, int]]] = {}
+        deferred = 0
+        vi = 0
+        loaded = 0
+        max_rows = self.pin_place_max_rows
+        for layer in range(L):
+            for e in plan["new_mask"][layer].nonzero(as_tuple=False).flatten().tolist():
+                s = int(slot_map[layer, e].item())
+                if pin_base <= s < pin_base + k:
+                    continue  # already resident in the pin region
+                if vi >= len(victims) or (max_rows > 0 and loaded >= max_rows):
+                    # No eligible slot this epoch (in-flight deferral), or the
+                    # per-epoch placement cap (first-pin pulse throttle) is hit:
+                    # the row lands at the next epoch instead.
+                    deferred += 1
+                    continue
+                v = victims[vi]
+                vi += 1
+                if s != -1:
+                    # Free the old residence (borrow region / LRU remainder): usage=0
+                    # makes it the coldest, same as the borrow invalidation.
+                    id_of_slot[s] = -1
+                    usage[s] = 0
+                old = id_of_slot[v]
+                if old >= 0:
+                    slot_map[old // E, old % E] = -1
+                id_of_slot[v] = layer * E + e
+                slot_map[layer, e] = v
+                usage[v] = max(step_now, 1)
+                placements.setdefault(layer, []).append((e, v))
+                loaded += 1
+        if placements:
+            self.slot_for_id.copy_(slot_map.to(self.device))
+            self.id_of_slot.copy_(torch.tensor(id_of_slot, dtype=torch.int32).to(self.device))
+            self.usage.copy_(torch.tensor(usage, dtype=torch.int64).to(self.device))
+            if self.device.type == "cuda":
+                for layer, pairs in placements.items():
+                    n = len(pairs)
+                    self.evict_slots[:n] = torch.tensor(
+                        [v for _, v in pairs], dtype=torch.int32, device=self.device
+                    )
+                    self.src_indices[:n] = torch.tensor(
+                        [e for e, _ in pairs], dtype=torch.int32, device=self.device
+                    )
+                    self.num_indices.fill_(n)
+                    self._pending_src_layer = layer
+                    self._pending_whole_layer = False
+                    self.copy_missing()
+            else:
+                # Host-side test caches: plain per-row copies (no fast_index_copy).
+                for layer, pairs in placements.items():
+                    for name in self.bank_schema:
+                        src = self.bank_sources[name][layer]
+                        dst = self.bank_caches[name]
+                        for e, v in pairs:
+                            dst[v].copy_(src[e])
+        report["loaded_rows"] = loaded
+        report["deferred_rows"] = deferred
+        return report
+
+    def _repin(self) -> dict:
+        first = not self._pinned_once
+        plan = self._compute_pin_plan()
+        report = self._apply_pin_plan(plan)
+        # EMA half-life = one repin period: halve the accumulated histogram so the next
+        # repin ranks mostly on the fresh window (a longer memory pins the union of past
+        # domains and increases the churn; simulation report section 8).
+        if self._pin_decay:
+            self.pin_freq.bitwise_right_shift_(1)
+        self._pinned_once = True
+        self._last_repin_step = self._decode_steps_seen
+        self._repin_count += 1
+        report["first"] = first
+        report["repin"] = self._repin_count
+        self._last_repin_report = report
+        logger.info(
+            f"freq_pin repin #{self._repin_count}: K={report['k']} quota={report['quota']} "
+            f"changed={report['changed_rows']} rows ({report['delta_bytes'] / 2**30:.2f} GiB), "
+            f"loaded={report['loaded_rows']} deferred={report['deferred_rows']}"
+        )
+        return report
 
     def record_decode_stats_hybrid(self, layer_id: int) -> None:
         """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
@@ -1126,6 +1403,26 @@ class OffloadMoeCache:
                 out["routing"] = self.decode_routing_stats()
             except Exception:  # noqa: BLE001 -- stats must never break the reply path
                 pass
+        if self.collect_decode_freq:
+            # Raw [L, E] decode-activation histogram (spec 202609-cache-freqpin section 6
+            # anchor; ~98KB at production geometry) for offline pin-set / hit-curve
+            # observability. One bulk D2H, same throttle as the rest of the snapshot.
+            try:
+                out["raw"] = {"decode_freq": self.decode_freq.cpu().tolist()}
+            except Exception:  # noqa: BLE001 -- stats must never break the reply path
+                pass
+        if self.pin_freq is not None:
+            try:
+                out["pin"] = {
+                    "pin_slots": int(self.pin_cfg[1].item()),
+                    "pin_quota_per_layer": self._pin_geometry()[2],
+                    "pinned_ids": int(self.pin_id_mask.sum().item()),
+                    "warmed": self._pinned_once,
+                    "repins": self._repin_count,
+                    "last_repin": self._last_repin_report,
+                }
+            except Exception:  # noqa: BLE001 -- stats must never break the reply path
+                pass
         return out
 
     def copy_missing(self) -> None:
@@ -1214,6 +1511,7 @@ class OwnerOffloadMoeCache:
         device: torch.device,
         *,
         cache_policy: str = "lru",
+        pin_slots: int | None = None,
         quant_format: str = "bf16",
         prefill_hit_d2d: bool = False,
         graph_safe: bool = False,
@@ -1237,6 +1535,7 @@ class OwnerOffloadMoeCache:
             cache_size=geometry.cache_size,
             device=device,
             cache_policy=cache_policy,
+            pin_slots=pin_slots,
             prefill_overlap=geometry.prefill_overlap,
             prefill_hit_d2d=prefill_hit_d2d,
             quant_format=quant_format,
@@ -1534,12 +1833,26 @@ This variant never changes the shape.  Remote entries are remapped to a row that
 
         recorder = self._cache.route_recorder
         self._cache.route_recorder = None
+        # freq_pin: remote entries admit the route's first OWNED row (zero weight), and
+        # counting those borrows would systematically inflate that expert's frequency
+        # (~half of a top-k route is remote under EP2). Suppress the inner histogram
+        # update and count owned positions at this boundary instead -- fixed-shape
+        # (a zero-weighted scatter_add), so the decode graph stays capturable.
+        count_pin = self._cache.pin_freq is not None
+        if count_pin:
+            self._cache.pin_freq_suppress = True
         try:
             # Admits row zero for remote-only routes too, so the copy plan is never empty and
             # the captured kernel sequence is identical on every replay.
             self._cache.ensure_experts(layer_id, admit)
         finally:
             self._cache.route_recorder = recorder
+            if count_pin:
+                self._cache.pin_freq_suppress = False
+        if count_pin:
+            rows = local_rows.reshape(-1).long()
+            owned_w = owned.reshape(-1).to(torch.int64)
+            self._cache.pin_freq[layer_id].scatter_add_(0, rows, owned_w)
         self._pending_owned = True
 
         empty = torch.empty((0,), dtype=torch.int32, device=self.device)

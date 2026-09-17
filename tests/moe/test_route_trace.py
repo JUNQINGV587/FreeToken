@@ -20,6 +20,7 @@ _rt = importlib.util.module_from_spec(_spec)
 sys.modules["route_trace"] = _rt  # @dataclass resolves cls.__module__ via sys.modules
 _spec.loader.exec_module(_rt)
 LRU = _rt.LRU
+FreqPinLRU = _rt.FreqPinLRU
 RouteTraceRecorder = _rt.RouteTraceRecorder
 read_trace = _rt.read_trace
 replay = _rt.replay
@@ -212,3 +213,72 @@ def test_two_rank_recorders_do_not_truncate_each_other(tmp_path):
     _meta1, records1 = read_trace(rec1.path)
     assert len(records0) == 1
     assert records1 == []
+
+
+# ------------------------------------------------------- freq_pin mirror branch
+# The LRU class above is the semantic lock for policy=lru and is untouched; the
+# FreqPinLRU mirror (same file, admission semantics of _ensure_experts_freq_pin_kernel)
+# is locked here instead. See tests/moe/test_freq_pin.py for the torch-level lock
+# (mirror == CPU reference == GPU kernel).
+
+
+def test_freqpin_degrades_to_lru_bit_exact():
+    """pin_slots=0 (cold start / empty histogram): identical admission decisions."""
+    import random
+
+    rng = random.Random(0)
+    C, E, L = 64, 32, 2
+    lru = LRU(C, E)
+    pin = FreqPinLRU(C, E)  # no pin region
+    for _ in range(2000):
+        layer = rng.randrange(L)
+        ids = [rng.randrange(E) for _ in range(10)]
+        lru.ensure(layer, ids)
+        pin.ensure(layer, ids)
+    assert (pin.miss, pin.active) == (lru.miss, lru.active)
+    # LRU cache contents are determined by the reference string alone (stack
+    # property), so the resident sets match even though the free-slot fill order
+    # differs (the heap mirror pops the free list from the tail).
+    assert set(pin.slot_of) == set(lru.slot_of)
+
+
+def test_freqpin_pinned_ids_never_evicted_under_pressure():
+    import random
+
+    rng = random.Random(1)
+    C, E, L = 32, 8, 4  # pin region [16, 24)
+    pin = FreqPinLRU(C, E, pin_base=16, pin_slots=8, pinned_ids={0, 1})
+    pin.ensure(0, [0, 1])
+    slots = {pin.slot_of[0], pin.slot_of[1]}
+    assert all(16 <= s < 24 for s in slots)
+    for _ in range(500):
+        layer = rng.randrange(1, L)
+        pin.ensure(layer, rng.sample(range(E), 6))
+        assert pin.slot_of[0] in slots and pin.slot_of[1] in slots
+        # non-pinned ids are never admitted into the pin region
+        for fid, s in pin.slot_of.items():
+            if fid not in (0, 1):
+                assert not (16 <= s < 24), (fid, s)
+
+
+def test_freqpin_pinned_miss_enters_pin_region():
+    C, E = 24, 8  # pin region [16, 20)
+    pin = FreqPinLRU(C, E, pin_base=16, pin_slots=4, pinned_ids={0, 1, 2, 3})
+    pin.ensure(0, [0, 1, 2, 3])
+    assert all(16 <= pin.slot_of[e] < 20 for e in range(4))
+    pin.ensure(0, [4, 5, 6, 7])
+    assert all(not (16 <= pin.slot_of[e] < 20) for e in range(4, 8))
+
+
+def test_freqpin_pinned_occupant_evicted_last_and_batch_protected():
+    C, E = 24, 8  # pin region [16, 20)
+    pin = FreqPinLRU(C, E, pin_base=16, pin_slots=4, pinned_ids={0, 1, 2, 3})
+    pin.ensure(0, [0, 1, 2, 3])
+    slots = {e: pin.slot_of[e] for e in range(4)}
+    pin.ensure(0, [3])  # freshen 3
+    # pin set swap: 0 departs, 4 joins; 3 is hit in the same call as the miss
+    pin.set_pins({1, 2, 3, 4})
+    pin.ensure(0, [3, 4])
+    assert pin.slot_of[4] == slots[0]  # the departed non-pinned occupant goes first
+    assert pin.slot_of[3] == slots[3]  # batch protection: hit this call
+    assert 0 not in pin.slot_of

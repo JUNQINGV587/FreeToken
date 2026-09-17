@@ -220,6 +220,93 @@ class LRU:
             self._h.heappush(self.heap, (self.step, s))
 
 
+class FreqPinLRU:
+    """Unified-pool mirror of ``_ensure_experts_freq_pin_kernel`` (freq_pin policy).
+
+    Same admission contract as :class:`LRU` (dedup, hit-bump batch protection,
+    ``(usage, slot)`` victim order, i-th ascending miss takes the i-th coldest
+    victim), plus a pin region ``[pin_base, pin_base + pin_slots)`` reserved for
+    ``pinned_ids`` (flat ``layer * E + expert``):
+
+      * a miss on a pinned id installs into the pin region; a slot whose occupant
+        is itself pinned is evicted only when the region offers nothing else;
+      * any other miss never touches the pin region;
+      * ``pin_slots == 0`` degenerates to plain LRU over the whole pool,
+        bit-identical to :class:`LRU` (locked by test_route_trace.py).
+
+    Pin-set maintenance (hysteresis, force placement) is host cache logic, not
+    admission semantics, so this mirror only swaps the set via :meth:`set_pins`.
+    Linear victim scan: a semantics mirror for tests, not a bulk replay engine.
+    """
+
+    def __init__(self, cache_size: int, num_experts: int, pin_base: int = 0,
+                 pin_slots: int = 0, pinned_ids=()):
+        self.C = cache_size
+        self.E = num_experts
+        self.pin_base = pin_base
+        self.pin_slots = pin_slots
+        self.pinned = set(pinned_ids)
+        self.slot_of: dict[int, int] = {}
+        self.owner: list[int | None] = [None] * cache_size
+        self.usage: list[int] = [0] * cache_size
+        self.step = 0
+        self.miss = 0
+        self.active = 0
+
+    def set_pins(self, pinned_ids, pin_base: int | None = None,
+                 pin_slots: int | None = None) -> None:
+        """Atomic pin-bitmap swap (admission side; placement is host cache logic)."""
+        self.pinned = set(pinned_ids)
+        if pin_base is not None:
+            self.pin_base = pin_base
+        if pin_slots is not None:
+            self.pin_slots = pin_slots
+
+    def _victim(self, pinned: bool) -> int:
+        best, best_key = -1, None
+        lo = self.pin_base
+        hi = self.pin_base + self.pin_slots
+        for s in range(self.C):
+            if pinned != (lo <= s < hi):
+                continue
+            if self.usage[s] == self.step:
+                continue  # batch protection: touched by this call
+            o = self.owner[s]
+            # A pinned occupant of the pin region sorts behind every other candidate.
+            pen = 1 if (pinned and o is not None and o in self.pinned) else 0
+            key = (pen, self.usage[s], s)
+            if best_key is None or key < best_key:
+                best, best_key = s, key
+        if best == -1:
+            # Degenerate (every candidate batch-protected): the kernel's all-MAX
+            # argmin tie resolves to slot 0, mirror it.
+            best = 0
+        return best
+
+    def ensure(self, layer: int, ids) -> None:
+        self.step += 1
+        base = layer * self.E
+        uniq = sorted(set(ids))
+        self.active += len(uniq)
+        misses = []
+        for e in uniq:
+            s = self.slot_of.get(base + e)
+            if s is None:
+                misses.append(e)
+            else:
+                self.usage[s] = self.step
+        self.miss += len(misses)
+        for e in misses:
+            fid = base + e
+            s = self._victim(self.pin_slots > 0 and fid in self.pinned)
+            old = self.owner[s]
+            if old is not None:
+                del self.slot_of[old]
+            self.owner[s] = fid
+            self.slot_of[fid] = s
+            self.usage[s] = self.step
+
+
 def replay(records, cache_size: int, num_experts: int, *, phase: int = 0,
            ep_owner: tuple[int, int] | None = None):
     """Replay ``records`` through one LRU pool.

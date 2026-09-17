@@ -5,7 +5,7 @@ import os
 import torch
 import triton
 import triton.language as tl
-from flashlib.kernels.slot_cache import lru_ensure
+from flashlib.kernels.slot_cache import Stat, lru_ensure
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
@@ -24,7 +24,15 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     ``src_indices`` back, so ``copy_missing`` still resolves against this layer's own host
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
+
+    ``freq_pin`` dispatches to the repo's own kernel instead (flashlib's ``lru_ensure``
+    has no pin-mask parameter); with an empty pin region it is bit-identical to
+    ``lru_ensure``.
     """
+    if cache.cache_policy == "freq_pin":
+        if not expert_ids.is_cuda:
+            return _ensure_experts_freq_pin_cpu(cache, layer_id, expert_ids)
+        return _ensure_experts_freq_pin_gpu(cache, layer_id, expert_ids)
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
@@ -183,6 +191,99 @@ def _ensure_experts_hybrid_cpu(
             cache.expert_recency[layer_id, expert] = step
 
     # Overflow misses keep slot_for_id == -1, so the rewrite below yields -1 for them.
+    flat = expert_ids.view(-1)
+    for i in range(flat.numel()):
+        flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
+
+
+def _ensure_experts_freq_pin_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    block_e = triton.next_power_of_2(cache.num_experts)
+    block_c = triton.next_power_of_2(cache.cache_size)
+    num_warps = 8 if block_c >= 2048 else 4
+    _ensure_experts_freq_pin_kernel[(1,)](
+        expert_ids,
+        cache.slot_for_id,
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        cache.pin_id_mask,
+        cache.pin_cfg,
+        cache.evict_slots,
+        cache.src_indices,
+        cache.num_indices,
+        cache.lru_stats[layer_id],
+        layer_id,
+        expert_ids.numel(),
+        cache.num_experts,
+        cache.cache_size,
+        BLOCK_E=block_e,
+        BLOCK_C=block_c,
+        COLLECT_STATS=cache.collect_stats,
+        num_warps=num_warps,
+    )
+
+
+def _ensure_experts_freq_pin_cpu(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """CPU reference mirror of the freq_pin kernel (eviction decisions bit-identical to
+    the GPU path; see tests/moe/test_freq_pin.py). With an empty pin region
+    (``pin_cfg[1] == 0``) the decisions are plain LRU over the whole pool."""
+    MAX = 9223372036854775807
+    PIN_PENALTY = 1 << 62
+    seen = []
+    for expert in expert_ids.view(-1).tolist():
+        if expert not in seen:
+            seen.append(expert)
+
+    step = int(cache.step.item()) + 1
+    cache.step.fill_(step)
+    base = layer_id * cache.num_experts
+    pin_base = int(cache.pin_cfg[0].item())
+    pin_num = int(cache.pin_cfg[1].item())
+    pin_mask = cache.pin_id_mask.tolist()
+
+    for expert in seen:
+        slot = int(cache.slot_for_id[layer_id, expert].item())
+        if slot != -1:
+            cache.usage[slot] = step
+
+    missing = sorted(e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1)
+    cache.num_indices.fill_(len(missing))
+    if cache.collect_stats:
+        cache.lru_stats[layer_id, Stat.ACTIVE] += len(seen)
+        cache.lru_stats[layer_id, Stat.MISS] += len(missing)
+        cache.lru_stats[layer_id, Stat.CALLS] += 1
+
+    active_flat = {base + e for e in seen}
+    usage = cache.usage.tolist()
+    owner = cache.id_of_slot.tolist()
+    for i, expert in enumerate(missing):
+        pinned = pin_num > 0 and pin_mask[base + expert] != 0
+        victim, best = -1, MAX
+        for s in range(cache.cache_size):
+            if owner[s] in active_flat:
+                continue  # batch protection: touched by this call
+            if pinned != (pin_base <= s < pin_base + pin_num):
+                continue  # pinned misses install into the pin region; others stay out
+            key = usage[s]
+            if pinned and owner[s] >= 0 and pin_mask[owner[s]]:
+                key += PIN_PENALTY  # a pinned occupant is evicted only as a last resort
+            if key < best:
+                victim, best = s, key
+        if victim == -1:
+            # Degenerate (every candidate batch-protected): the kernel's all-MAX argmin
+            # tie resolves to slot 0, mirror it.
+            victim = 0
+        old_id = owner[victim]
+        if old_id >= 0:
+            cache.slot_for_id.view(-1)[old_id] = -1
+        cache.id_of_slot[victim] = base + expert
+        cache.slot_for_id[layer_id, expert] = victim
+        cache.usage[victim] = step
+        owner[victim] = base + expert
+        usage[victim] = step
+        cache.evict_slots[i] = victim
+        cache.src_indices[i] = expert  # layer-local row
+
     flat = expert_ids.view(-1)
     for i in range(flat.numel()):
         flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
@@ -408,6 +509,112 @@ def _ensure_experts_hybrid_kernel(
     if BY_RECENCY:
         step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
+
+
+@triton.jit(do_not_specialize=["layer_id", "num_active"])
+def _ensure_experts_freq_pin_kernel(
+    expert_ids_ptr,
+    slot_for_id_ptr,
+    id_of_slot_ptr,
+    usage_ptr,
+    step_ptr,
+    pin_id_mask_ptr,
+    pin_cfg_ptr,
+    evict_slots_ptr,
+    src_indices_ptr,
+    num_indices_ptr,
+    stats_ptr,
+    layer_id,
+    num_active,
+    num_experts: tl.constexpr,
+    cache_size: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    COLLECT_STATS: tl.constexpr,
+):
+    """Timestamp-LRU with a pinned hot set (freq_pin policy).
+
+    Same admission contract as flashlib's ``lru_ensure`` -- dedup, hit-bump batch
+    protection, ``(usage, slot)`` victim order, the i-th ascending miss id takes the
+    i-th coldest victim -- plus a pin region ``[pin_base, pin_base + pin_num)`` whose
+    bounds are read from ``pin_cfg`` ON DEVICE, so a captured decode graph observes a
+    repin on replay without recapture:
+
+    * a miss on a pinned id (``pin_id_mask``) installs into the pin region, preferring
+      slots whose occupant is not pinned (a pinned occupant costs +PIN_PENALTY, so it
+      is evicted only when the region offers nothing else);
+    * any other miss never touches the pin region: pin slots leave the LRU victim pool;
+    * ``pin_num == 0`` (cold start / frequency table below the warmup threshold)
+      degenerates to plain LRU over the whole pool, bit-identical to ``lru_ensure``.
+
+    The pin region always starts at ``2 * num_experts``: the prefill double buffer owns
+    the slots below and invalidates them per chunk, so pinning there would be void.
+    """
+    step = tl.load(step_ptr) + 1
+    tl.store(step_ptr, step)
+    base = layer_id * num_experts
+    pin_base = tl.load(pin_cfg_ptr).to(tl.int32)
+    pin_num = tl.load(pin_cfg_ptr + 1).to(tl.int32)
+    MAX: tl.constexpr = 9223372036854775807
+    PIN_PENALTY: tl.constexpr = 4611686018427387904  # 1 << 62
+
+    # ---- Phase 1: dedup + hit bump (batch protection) ----
+    off_e = tl.arange(0, BLOCK_E)
+    e_mask = off_e < num_experts
+    is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+    for i in tl.range(num_active):
+        e = tl.load(expert_ids_ptr + i)
+        is_active = is_active | (off_e == e)
+    slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
+    is_missing = is_active & (slot == -1) & e_mask
+    num_missing = tl.sum(is_missing.to(tl.int32))
+    tl.store(num_indices_ptr, num_missing.to(tl.int64))
+    is_hit = is_active & (slot >= 0)
+    tl.store(usage_ptr + slot, step, mask=is_hit)
+    if COLLECT_STATS:
+        si = tl.arange(0, 4)
+        v = tl.where(si == 0, tl.sum(is_active.to(tl.int32)), tl.where(si == 1, num_missing, 1))
+        tl.atomic_add(stats_ptr + si, v.to(tl.int64), mask=si < 3)
+    missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
+
+    # ---- Phase 2: victims; pinned misses into the pin region, others outside it ----
+    if num_missing > 0:
+        tl.debug_barrier()  # the hit-bump scatter must be visible to the bulk reload below
+        off_c = tl.arange(0, BLOCK_C)
+        c_mask = off_c < cache_size
+        oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
+        u = tl.load(usage_ptr + off_c, mask=c_mask, other=0).to(tl.int64)
+        owner_active = c_mask & False
+        for i in tl.range(num_active):
+            ei = tl.load(expert_ids_ptr + i)
+            owner_active = owner_active | (oid == base + ei)
+        resident_pin = tl.load(
+            pin_id_mask_ptr + oid, mask=(oid >= 0) & c_mask, other=0
+        ).to(tl.int64)
+        in_pin = (off_c >= pin_base) & (off_c < pin_base + pin_num)
+        score = tl.where(c_mask, u + resident_pin * in_pin.to(tl.int64) * PIN_PENALTY, MAX)
+        score = tl.where(owner_active, MAX, score)
+        for i in tl.range(num_missing):
+            e = tl.sum(tl.where((missing_rank == i) & is_missing, off_e, 0))
+            pinned = (tl.load(pin_id_mask_ptr + base + e) != 0) & (pin_num > 0)
+            cand = tl.where(in_pin == pinned, score, MAX)
+            victim = tl.argmin(cand, axis=0).to(tl.int32)
+            old_id = tl.sum(tl.where(off_c == victim, oid, 0))
+            if old_id >= 0:
+                tl.store(slot_for_id_ptr + old_id, -1)
+            tl.store(id_of_slot_ptr + victim, base + e)
+            tl.store(slot_for_id_ptr + base + e, victim)
+            tl.store(usage_ptr + victim, step)
+            tl.store(evict_slots_ptr + i, victim)
+            tl.store(src_indices_ptr + i, e)  # layer-local row
+            score = tl.where(off_c == victim, MAX, score)
+
+    # ---- Phase 3: rewrite expert_ids -> slot ids in place ----
+    for i in tl.range(num_active):
+        e = tl.load(expert_ids_ptr + i)
+        s = tl.load(slot_for_id_ptr + base + e)
+        tl.store(expert_ids_ptr + i, s)
+
 
 
 @triton.jit(do_not_specialize=["buffer_base"])

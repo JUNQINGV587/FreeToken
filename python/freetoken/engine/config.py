@@ -46,6 +46,9 @@ class EngineConfig:
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
+    # freq_pin policy (--moe-cache-policy freq_pin): pin-slot quota K out of the
+    # persistent region [2*num_experts, cache_size). 7168 default, 6144 fallback.
+    moe_pin_slots: int = 7168
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8

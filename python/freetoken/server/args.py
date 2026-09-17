@@ -691,8 +691,19 @@ def parse_args(
     parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
-        choices=["lru"],
-        help="The unified MoE cache eviction policy.",
+        choices=["lru", "freq_pin"],
+        help="The unified MoE cache eviction policy. freq_pin reserves --moe-pin-slots "
+        "persistent slots for the decode-hot pin set (per-layer quota, hysteresis "
+        "repin every 1000 decode steps, pure-LRU cold start); lru is the default.",
+    )
+
+    parser.add_argument(
+        "--moe-pin-slots",
+        type=int,
+        default=ServerArgs.moe_pin_slots,
+        help="freq_pin policy: pin-slot quota K, carved out of the persistent region "
+        "[2*num_experts, moe_cache_size); the prefill borrow region is never pinned. "
+        "Default 7168; 6144 is the safer fallback.",
     )
 
     parser.add_argument(

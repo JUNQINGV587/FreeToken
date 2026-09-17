@@ -20,14 +20,14 @@
 > |---|---|---|
 > | Single-stream decode | **81 t/s** | +19% vs first deployment (68.07 t/s, 2026-09-13) |
 > | 8-way concurrent aggregate | **278-282 t/s** | steady state, all slots busy |
-> | Cold prefill | **2132 tok/s** (96K tokens, TTFT 45s) | 2.1x the ~1025 tok/s historical baseline |
+> | Cold prefill | **3641 tok/s** (70K tokens, TTFT 19.1s) | 3.6x the ~1025 tok/s first-deployment baseline (1025 -> 2132 -> 3641) |
 > | Prefix-cache-hit TTFT | 1.26s (17K tokens) | hybrid radix reuse |
 > | Short-interaction TTFT | 1.35s | prefill JIT already paid at boot warmup |
 > | Expert-cache reload under domain churn | **no measurable cost** | 6-domain rotation x2 rounds; revisit round identical to first (72.2 vs 72.2 t/s median) |
 >
 > Decode progression on this box (same model, same hardware): 68.07 t/s at first deployment (2026-09-13) -> 69.7 after merging upstream main (09-15) -> 72.5-74.2 with custom all-reduce (09-16) -> 78.6-79.9 with admission fusion (09-16) -> **81 t/s** now (09-17, PLE hash fusion + D2H-stall-free GDN conv + prefill warmup batch).
 >
-> Key customizations: all-backend prefill JIT warmup (#169), route-density-tiered NVFP4 prefill MoE tiles (BM=128 for M>=2048, +21-32%, bit-identical), lm_head projecting only the rows the sampler reads (last-token gather), D2H-stall-free varlen GDN conv (#339), single-kernel PLE n-gram hash (#338), disconnect abort delivery (#222), and more.
+> Key customizations: all-backend prefill JIT warmup (#169), wide-load NVFP4 prefill MoE kernel for M>=2048 (int32 wide loads + register unpacking, 3.4-3.6x per layer, bit-identical, env-gated), lm_head projecting only the rows the sampler reads (last-token gather), D2H-stall-free varlen GDN conv (#339), single-kernel PLE n-gram hash (#338), disconnect abort delivery (#222), and more.
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 

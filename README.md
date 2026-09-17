@@ -12,20 +12,20 @@
 
 > **Fork operations branch (`sm89-moe-offload`) — not upstream content**
 >
-> This branch tracks upstream main plus production customizations for **2x NVIDIA L20 (sm_89, PCIe P2P)**: TP2 + owner-EP (`--moe-strategy offload`), serving Qwen3.8-Flash-Next-NVFP4 (qwen4_exp, NVFP4 + PLE disk backend). See git history for the full change list (cherry-picked upstream PRs keep their original authors).
+> This branch tracks upstream main plus production customizations for **2x NVIDIA L20 (sm_89, PCIe P2P)**: TP2 + expert offload, serving Qwen3.8-Flash-Next-NVFP4 (qwen4_exp, NVFP4 + PLE disk backend). See git history for the full change list (cherry-picked upstream PRs keep their original authors).
 >
-> Measured performance (2026-09-17, image `freetoken:sm89-e55fe3e`, server-side gen throughput):
+> Measured performance (2026-09-17, server-side gen throughput):
 >
 > | Scenario | Value | Notes |
 > |---|---|---|
-> | Single-stream decode | **81 t/s** | up from 78.6-79.9 before this round |
-> | 8-way concurrent aggregate | **278-282 t/s** | at max-running-requests 8 |
+> | Single-stream decode | **81 t/s** | +19% vs first deployment (68.07 t/s, 2026-09-13) |
+> | 8-way concurrent aggregate | **278-282 t/s** | steady state, all slots busy |
 > | Cold prefill | **2132 tok/s** (96K tokens, TTFT 45s) | 2.1x the ~1025 tok/s historical baseline |
 > | Prefix-cache-hit TTFT | 1.26s (17K tokens) | hybrid radix reuse |
 > | Short-interaction TTFT | 1.35s | prefill JIT already paid at boot warmup |
-> | Expert-cache reload under domain churn | **no measurable cost** | 6-domain rotation x2 rounds, revisit round identical to first (72.2 vs 72.2 t/s median); ~3.8 missed rows/step ~= 10 MB over PCIe |
+> | Expert-cache reload under domain churn | **no measurable cost** | 6-domain rotation x2 rounds; revisit round identical to first (72.2 vs 72.2 t/s median) |
 >
-> Decode progression on this box: 44.9 t/s with a cold expert cache (2026-09-15) -> 69-70 warm best before custom all-reduce -> 78.6-79.9 with custom AR + admission fusion (2026-09-16) -> **81 t/s** now.
+> Decode progression on this box (same model, same hardware): 68.07 t/s at first deployment (2026-09-13) -> 69.7 after merging upstream main (09-15) -> 72.5-74.2 with custom all-reduce (09-16) -> 78.6-79.9 with admission fusion (09-16) -> **81 t/s** now (09-17, PLE hash fusion + D2H-stall-free GDN conv + prefill warmup batch).
 >
 > Key customizations: all-backend prefill JIT warmup (#169), route-density-tiered NVFP4 prefill MoE tiles (BM=128 for M>=2048, +21-32%, bit-identical), lm_head projecting only the rows the sampler reads (last-token gather), D2H-stall-free varlen GDN conv (#339), single-kernel PLE n-gram hash (#338), disconnect abort delivery (#222), and more.
 

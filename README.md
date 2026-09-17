@@ -25,6 +25,26 @@
 > | Short-interaction TTFT | 1.35s | prefill JIT already paid at boot warmup |
 > | Expert-cache reload under domain churn | **no measurable cost** | 6-domain rotation x2 rounds; revisit round identical to first (72.2 vs 72.2 t/s median) |
 >
+> Production configuration on this box (2x L20 48GiB, PCIe P2P):
+>
+> ```bash
+> ft serve \
+>   --model Qwen3.8-Flash-Next-NVFP4 \
+>   --tensor-parallel-size 2 --moe-ep-size 2 --gpu 0,1 \
+>   --moe-strategy offload \
+>   --ple-backend disk --quant-backend moe.nvfp4=triton \
+>   --expert-load serial --memory-ratio 0.90 \
+>   --moe-cache-size 8800 \
+>   --num-tokens 786432 \
+>   --max-running-requests 8 \
+>   --cuda-graph-max-bs 8 \
+>   --image-max-tokens 4096 \
+>   --moe-prefill-hit-d2d
+> # env: FREETOKEN_NVFP4_PREFILL_WIDE=1  (wide-load prefill kernel)
+> ```
+>
+> Notes: `--moe-cache-size 8800` holds the top ~8800 of 48x512 experts per GPU in VRAM (measured miss cost ~4 rows/step, so a bigger cache buys nothing); `--num-tokens 786432` sizes the KV pool to ~768K tokens; `--expert-load serial` trades load time for lower peak host RAM; `--image-max-tokens 4096` caps per-image vision tokens.
+
 > Decode progression on this box (same model, same hardware): 68.07 t/s at first deployment (2026-09-13) -> 69.7 after merging upstream main (09-15) -> 72.5-74.2 with custom all-reduce (09-16) -> 78.6-79.9 with admission fusion (09-16) -> **81 t/s** now (09-17, PLE hash fusion + D2H-stall-free GDN conv + prefill warmup batch).
 >
 > Key customizations: all-backend prefill JIT warmup (#169), wide-load NVFP4 prefill MoE kernel for M>=2048 (int32 wide loads + register unpacking, 3.4-3.6x per layer, bit-identical, env-gated), lm_head projecting only the rows the sampler reads (last-token gather), D2H-stall-free varlen GDN conv (#339), single-kernel PLE n-gram hash (#338), disconnect abort delivery (#222), and more.

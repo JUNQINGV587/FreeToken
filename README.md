@@ -10,6 +10,21 @@
 | <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/MsA277cJzZ"><b>Community Discord</b></a> | <a href="https://github.com/FlashML-org/FreeToken/issues/482"><b>Community WeChat</b></a> |
 </p>
 
+> **Fork 运维分支说明（`sm89-moe-offload`，非上游内容）**
+>
+> 本分支 = 上游 main 同步 + 面向 **2× NVIDIA L20（sm_89, PCIe P2P）** 的生产定制：TP2 + owner-EP（`--moe-strategy offload`），服务 Qwen3.8-Flash-Next-NVFP4（qwen4_exp，NVFP4 + PLE disk）。改动清单见 git 历史（上游 PR cherry-pick 均保留原作者署名）。
+>
+> 实测性能（2026-09-17，镜像 `freetoken:sm89-e55fe3e`，服务端口径）：
+>
+> | 场景 | 数值 | 备注 |
+> |---|---|---|
+> | 单流 decode | **81 t/s** | 基线 78.6–79.9 |
+> | 8 路并发聚合 | **278–282 t/s** | = max-running-requests 8 |
+> | 冷 prefill | **2132 tok/s**（96K tok，TTFT 45s） | 同硬件历史基线 ~1025 tok/s，**2.1×** |
+> | 前缀命中 TTFT | 1.26s（17K tok） | hybrid radix 复用 |
+> | 高频短交互 TTFT | 1.35s | prefill JIT 已在启动预热中付清 |
+>
+> 关键定制：prefill 全后端 JIT 预热（#169）、NVFP4 prefill MoE tile 按 sm_89 路由密度分档（M≥2048 用 BM=128，+21~32%，位级一致）、lm_head 只投影采样行（末 token 行采集）、GDN varlen conv 去 D2H 停等（#339）、PLE n-gram hash 单内核融合（#338）、断连 Abort 送达（#222）等。
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 

@@ -7,6 +7,7 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -231,13 +232,25 @@ def fused_experts_decode_nvfp4_serial(
 
 def _prefill_config(M: int) -> Dict[str, int]:
     # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
-    # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
-    # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
+    # so it cannot be picked by triton.autotune. Table from an L20 (sm_89) sweep on the
+    # qwen4_exp geometry (research/bench/probe_nvfp4_prefill_tiles.py): at high route
+    # density the kernel is bound by expert-weight re-reads (sum_e ceil(routes_e/BM)),
+    # so BM=128 wins (+21-32% at M>=4096); near M=1024 padding compute dominates and
+    # BM=32 stays. BLOCK_SIZE_KB is 32 in every row, so the per-route fp32 reduction
+    # order -- and therefore the outputs -- is identical across the table.
     if M <= 64:
-        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                    GROUP_SIZE_M=1, num_warps=8, num_stages=4)
-    return dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                GROUP_SIZE_M=8, num_warps=8, num_stages=4)
+        cfg = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
+                   GROUP_SIZE_M=1, num_warps=8, num_stages=4)
+    elif M < 2048:
+        cfg = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
+                   GROUP_SIZE_M=8, num_warps=8, num_stages=2)
+    else:
+        cfg = dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
+                   GROUP_SIZE_M=8, num_warps=8, num_stages=2)
+    bm_override = int(os.environ.get("FREETOKEN_NVFP4_PREFILL_BM", "0"))
+    if bm_override > 0 and M > 64:
+        cfg["BLOCK_SIZE_M"] = bm_override
+    return cfg
 
 
 def _prefill_gemm(

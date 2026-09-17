@@ -81,10 +81,18 @@ class CustomAllReduceImpl(DistributedImpl):
 
     inner: DistributedImpl
     ca: Any  # vllm CustomAllreduce
+    calls: int = 0
+    calls_custom: int = 0
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        # The counters feed verify_ar_sequence_boot: the donor pairs spin barriers by
+        # call order, so per-rank (total, custom-served) counts must match after boot.
+        self.calls += 1
         out = self.ca.custom_all_reduce(x) if not self.ca.disabled else None
-        return out if out is not None else self.inner.all_reduce(x)
+        if out is not None:
+            self.calls_custom += 1
+            return out
+        return self.inner.all_reduce(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.inner.all_gather(x)

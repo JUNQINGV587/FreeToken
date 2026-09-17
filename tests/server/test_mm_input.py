@@ -155,6 +155,20 @@ def test_render_messages_hoists_system_to_front():
     assert msgs[2]["role"] == "user"
 
 
+def test_render_messages_maps_developer_to_system_before_hoisting():
+    """OpenAI's developer role == system. Templates that know the role may still
+    treat it as position-locked system ('must be at the beginning'), so the
+    mapping must happen in render_messages, ahead of the hoist -- otherwise
+    [user, developer, user] reaches the template unhoisted and 400s (#391 gap)."""
+    msgs = render_messages([
+        {"role": "user", "content": "hi"},
+        {"role": "developer", "content": "be brief"},
+        {"role": "user", "content": "go"},
+    ])
+    assert [m["role"] for m in msgs] == ["system", "user", "user"]
+    assert msgs[0]["content"] == "be brief"
+
+
 def test_render_messages_preserves_system_first():
     """When system is already first, no reordering happens."""
     msgs = render_messages([

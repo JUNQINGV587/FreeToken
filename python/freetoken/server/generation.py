@@ -454,6 +454,11 @@ def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     hoist system messages to the front and merge multiples into one to satisfy
     that constraint."""
     rendered = [_render_message(m) for m in messages]
+    # OpenAI's developer role is the current spelling of system. Map it here --
+    # before the hoist -- because templates that "know" developer still treat it
+    # as position-locked system (raise unless index 0), so tokenize.py's
+    # template-mention guard would leave mid-list developer messages to 400.
+    rendered = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in rendered]
     system_msgs = [m for m in rendered if m.get("role") == "system"]
     if system_msgs and rendered[0].get("role") != "system":
         non_system = [m for m in rendered if m.get("role") != "system"]

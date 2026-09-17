@@ -8,6 +8,7 @@ so no BF16 copy of the experts is ever materialized.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any, Dict
 
 import torch
@@ -250,6 +251,18 @@ def _prefill_config(M: int) -> Dict[str, int]:
     bm_override = int(os.environ.get("FREETOKEN_NVFP4_PREFILL_BM", "0"))
     if bm_override > 0 and M > 64:
         cfg["BLOCK_SIZE_M"] = bm_override
+    # Wide-load prototype dispatch (moe/fused_nvfp4_wide.py): env-gated
+    # (FREETOKEN_NVFP4_PREFILL_WIDE=1), M >= 2048 only. With the env off the
+    # wide module is never imported, so a broken/moved wide module cannot
+    # affect production; if it is already loaded and its binding is installed
+    # (runtime flip 1 -> 0), restore the pinned production binding.
+    if os.environ.get("FREETOKEN_NVFP4_PREFILL_WIDE", "0") == "1":
+        from freetoken.moe.fused_nvfp4_wide import dispatch_prefill
+
+        return dispatch_prefill(M, cfg, globals())
+    wmod = sys.modules.get("freetoken.moe.fused_nvfp4_wide")
+    if wmod is not None:
+        wmod.restore_prefill(globals())
     return cfg
 
 

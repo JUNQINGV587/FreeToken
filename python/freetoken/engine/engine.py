@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import gc
 import math
 import os
@@ -348,14 +349,24 @@ class WeightLoadError(RuntimeError):
     """The checkpoint itself could not be read. Resource and config failures keep their own type."""
 
 
+def _is_resource_failure(exc: Exception) -> bool:
+    if isinstance(exc, (torch.OutOfMemoryError, MemoryError, PinFailed)):
+        return True
+    # an anonymous mmap that does not fit raises ENOMEM, not MemoryError
+    if isinstance(exc, OSError) and exc.errno == errno.ENOMEM:
+        return True
+    # torch has no type for a failed CPU allocation
+    return isinstance(exc, RuntimeError) and "DefaultCPUAllocator" in str(exc)
+
+
 @contextlib.contextmanager
 def _weight_load_context():
-    """Wrap a checkpoint read so the failure reason starts with WeightLoadError, which /health and the desktop key on."""
+    """Wrap a checkpoint read so the startup failure reason (log and /health) starts with WeightLoadError."""
     try:
         yield
-    except (torch.OutOfMemoryError, MemoryError, PinFailed):
-        raise
     except Exception as exc:
+        if _is_resource_failure(exc):
+            raise
         raise WeightLoadError(f"{type(exc).__name__}: {exc}") from exc
 
 
@@ -598,7 +609,7 @@ class Engine:
             )
         with _weight_load_context():
             self.model.load_state_dict(self._load_weight_state_dict(config))
-            finalize_quant(self.model)
+        finalize_quant(self.model)
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
@@ -1633,7 +1644,8 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     from freetoken.checkpoint.ftw import ftw_quant_format
     from freetoken.moe.legacy_format import kind_kernel_for
 
-    fmt = ftw_quant_format(model_path) if model_path else None
+    with _weight_load_context():
+        fmt = ftw_quant_format(model_path) if model_path else None
     if fmt is None:
         return quant_backend
     try:

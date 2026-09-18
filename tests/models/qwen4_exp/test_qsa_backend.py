@@ -133,7 +133,16 @@ def test_flashinfer_dense_matches_the_sparse_path():
 @requires_cuda
 @pytest.mark.parametrize("cut", [1001, 4096, 4097], ids=["unaligned", "page-boundary", "boundary+1"])
 def test_chunked_prefill_matches_one_shot(cut: int):
-    """Cut points that are not multiples of index_ratio exercise the dual-source compress."""
+    """Cut points that are not multiples of index_ratio exercise the dual-source compress.
+
+    Compared within the file's tolerance, not bit-exactly: the bf16 projections behind this
+    layer are not batch-shape invariant. cuBLAS accumulates a 5000-row GEMM differently from a
+    1001- or 4096-row one, which moves a few hundred of the ~3M projection elements by 1-2 bf16
+    ulps; those ulps reach the compressed keys and can flip a near-tie top-k block, so a chunked
+    prefill cannot match a one-shot prefill bit-for-bit. When both chunk projections do come out
+    identical the chunked output is byte-identical, and
+    test_chunked_prefill_is_deterministic pins the bit-level property that is achievable.
+    """
     config = parsed_config()
     fixture = Fixture(config, num_pages=512)
     attn = fixture.layer(QSA_LAYER)
@@ -145,7 +154,28 @@ def test_chunked_prefill_matches_one_shot(cut: int):
     attn.forward(x[:cut], fixture.batch([head], "prefill"))
     tail = fixture.req(1, cut, length)
     got = attn.forward(x[cut:], fixture.batch([tail], "prefill"))
-    assert torch.equal(got, one_shot[cut:])
+    torch.testing.assert_close(got.float(), one_shot[cut:].float(), rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda
+def test_chunked_prefill_is_deterministic():
+    """Replaying the same chunking in a fresh fixture is bit-identical.
+
+    Run-to-run determinism is the one bit-level claim this path supports. The tolerance
+    comparison above cannot check it, and an exact comparison against the one-shot prefill is
+    unreachable for the reason given there.
+    """
+    length, cut = 5000, 1001
+    outs = []
+    for _ in range(2):
+        fixture = Fixture(parsed_config(), num_pages=512)
+        attn = fixture.layer(QSA_LAYER)
+        x = _inputs(fixture, [length])[0]
+        attn.forward(x[:cut], fixture.batch([fixture.req(0, 0, cut)], "prefill"))
+        outs.append(
+            attn.forward(x[cut:], fixture.batch([fixture.req(0, cut, length)], "prefill"))
+        )
+    assert torch.equal(outs[0], outs[1])
 
 
 @requires_cuda

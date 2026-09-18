@@ -701,6 +701,15 @@ class OffloadMoeCache:
         # call hid a device-to-host sync -- and with two buffer reuses per chunk x 48
         # layers the host waited, per layer, for ALL enqueued GPU work (the cached-context
         # attention included), serializing the prefill-overlap pipeline.
+        if not self.id_of_slot.is_cuda:
+            # A CPU cache (CPU-only MoE, unit tests) has no Triton backend: same bookkeeping,
+            # eagerly.
+            ids = self.id_of_slot[slot_start : slot_start + self.num_experts]
+            self.slot_for_id.view(-1)[ids[ids >= 0]] = -1
+            ids.fill_(-1)
+            self.usage[slot_start : slot_start + self.num_experts] = 0
+            return
+
         from freetoken.kernel.triton.moe import invalidate_prefill_slots
 
         invalidate_prefill_slots(

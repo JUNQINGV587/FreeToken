@@ -187,11 +187,25 @@ def enable_custom_all_reduce(
         return False
     # The donor's P2P self-check is a per-rank decision: a split verdict would make one
     # rank spin-wait for a peer that stayed on pynccl (startup hang). Take consensus.
+    # The prefetch env gates ride the same gather: they are pure scheduling knobs (no AR
+    # call-order or numerics effect), but a drifted pair would silently desync the two
+    # ranks' prefill timing, so refuse the boot instead of serving a skewed TP pair.
+    from freetoken.moe.offload_cache import PREFILL_PREFETCH_EARLY
+    from freetoken.moe.ownership import PREFILL_PREFETCH_DEPTH
+
     verdicts = [None] * tp_info.size
-    dist.all_gather_object(verdicts, ca.disabled, group=tp_cpu_group)
-    if any(verdicts):
+    dist.all_gather_object(
+        verdicts, (ca.disabled, PREFILL_PREFETCH_DEPTH, PREFILL_PREFETCH_EARLY), group=tp_cpu_group
+    )
+    if any(disabled for disabled, _, _ in verdicts):
         ca.close()
         return False
+    if len({(depth, early) for _, depth, early in verdicts}) != 1:
+        ca.close()
+        raise RuntimeError(
+            "FREETOKEN_PREFILL_PREFETCH_DEPTH/EARLY diverged across TP ranks: "
+            f"{verdicts} (set them identically on every rank)"
+        )
     DistributedCommunicator.plugins.append(
         CustomAllReduceImpl(DistributedCommunicator.plugins[-1], ca)
     )

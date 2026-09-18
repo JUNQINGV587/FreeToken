@@ -331,6 +331,274 @@ def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypa
     assert copy_stream.waited == ["begin", "release0"]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_prefill_overlap_depth_three_rotates_three_buffers(monkeypatch):
+    """FREETOKEN_PREFILL_PREFETCH_DEPTH=3 (AR-stagger candidate 3A): the buffer ring
+    holds three full layers, the lookahead covers L..L+2, and layer data still lands
+    byte-identical in the ring position layer_id % 3."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    num_layers = 6
+    num_experts = 4
+    dev = torch.device("cuda")
+    monkeypatch.setattr("freetoken.moe.ownership.PREFILL_PREFETCH_DEPTH", 3)
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=3 * num_experts,
+        device=dev,
+        prefill_overlap=True,
+    )
+    gate_up_source = list(torch.arange(num_layers * num_experts * 32 * 8, dtype=torch.float32).reshape(
+        num_layers * num_experts, 32, 8
+    ).split(num_experts))
+    down_source = list(torch.arange(num_layers * num_experts * 8 * 16, dtype=torch.float32).reshape(
+        num_layers * num_experts, 8, 16
+    ).split(num_experts))
+    cache.set_bank_sources({"gate_up": gate_up_source, "down": down_source})
+
+    assert cache.prefill_depth == 3
+    assert cache.prefill_bank_buffers[0].shape[0] == 3
+    # the ring still borrows the slot cache's head, now three layers wide
+    assert cache.prefill_bank_buffers[0].data_ptr() == cache.bank_caches["gate_up"].data_ptr()
+    assert cache.prefill_bank_buffers[0][2].data_ptr() - cache.prefill_bank_buffers[0][0].data_ptr() == 2 * gate_up_source[0].nbytes
+
+    ptrs = []
+    cache.begin_prefill()
+    for layer_id in range(num_layers):
+        # MoE-entry lookahead with depth 3: prefetch L, L+1, L+2 (dedup no-ops on repeats)
+        for i in range(cache.prefill_depth):
+            cache.prefetch_prefill_layer(layer_id + i)
+        views = cache.wait_prefill_layer(layer_id)
+        assert torch.equal(views[0], gate_up_source[layer_id].to(dev))
+        assert torch.equal(views[1], down_source[layer_id].to(dev))
+        ptrs.append(views[0].data_ptr())
+        cache.release_prefill_layer(layer_id)
+
+    assert len({ptrs[0], ptrs[1], ptrs[2]}) == 3  # three distinct buffers in rotation
+    assert ptrs[0] == ptrs[3] and ptrs[1] == ptrs[4] and ptrs[2] == ptrs[5]
+    assert cache._prefill_chunk_open is False  # last layer's release closed the chunk
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_prefill_overlap_depth_three_buffer_reuse_requires_release(monkeypatch):
+    """The depth-3 ring keeps the existing reuse guard: prefetching into a buffer whose
+    layer was never released must assert, and must pass after release."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    num_layers = 6
+    num_experts = 4
+    monkeypatch.setattr("freetoken.moe.ownership.PREFILL_PREFETCH_DEPTH", 3)
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=3 * num_experts,
+        device=torch.device("cuda"),
+        prefill_overlap=True,
+    )
+    cache.set_bank_sources({
+        "gate_up": list(torch.zeros(num_layers * num_experts, 32, 8).split(num_experts)),
+        "down": list(torch.zeros(num_layers * num_experts, 8, 16).split(num_experts)),
+    })
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(1)
+    cache.prefetch_prefill_layer(2)
+    with pytest.raises(AssertionError, match="reused before release"):
+        cache.prefetch_prefill_layer(3)  # buffer 0 still held by layer 0
+    cache.release_prefill_layer(0)
+    cache.prefetch_prefill_layer(3)
+    assert cache._prefill_buffer_layer[0] == 3
+
+
+def test_prefill_overlap_depth_three_requires_three_layer_slots(monkeypatch):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr("freetoken.moe.ownership.PREFILL_PREFETCH_DEPTH", 3)
+    with pytest.raises(AssertionError, match="3 \\* num_experts"):
+        OffloadMoeCache(
+            num_layers=3,
+            num_experts=4,
+            cache_size=11,
+            device=torch.device("cpu"),
+            prefill_overlap=True,
+        )
+    # exact floor is accepted
+    OffloadMoeCache(
+        num_layers=3,
+        num_experts=4,
+        cache_size=12,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_begin_prefill_is_idempotent_within_a_chunk(monkeypatch):
+    """With FREETOKEN_PREFILL_PREFETCH_EARLY=1 the decoder-layer-entry hook AND the
+    MoE entry both call begin_prefill at layer 0. The second call must not re-fence
+    the copy stream or reset the buffer map behind the hook's prefetches."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    num_layers = 2
+    num_experts = 4
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=8,
+        device=torch.device("cuda"),
+        prefill_overlap=True,
+    )
+    cache.set_bank_sources({
+        "gate_up": list(torch.zeros(num_layers * num_experts, 32, 8).split(num_experts)),
+        "down": list(torch.zeros(num_layers * num_experts, 8, 16).split(num_experts)),
+    })
+
+    class FakeStream:
+        def __init__(self):
+            self.waited = []
+
+        def wait_event(self, event):
+            self.waited.append(event.name)
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream=None):
+            pass
+
+    @contextmanager
+    def fake_cuda_stream(stream):
+        yield
+
+    copy_stream = FakeStream()
+    cache.prefill_copy_stream = copy_stream
+    cache.prefill_begin_event = FakeEvent("begin")
+    cache.prefill_ready_events = [FakeEvent("ready0"), FakeEvent("ready1")]
+    cache.prefill_release_events = [FakeEvent("release0"), FakeEvent("release1")]
+    monkeypatch.setattr("torch.cuda.stream", fake_cuda_stream)
+    monkeypatch.setattr("torch.cuda.current_stream", lambda device=None: object())
+
+    # Chunk 1: hook begins at the layer-0 entry, MoE entry begins again -- one fence only.
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(1)
+    cache.begin_prefill()  # duplicate: must not reset the map or re-fence
+    cache.prefetch_prefill_layer(0)  # dedup no-op
+    assert copy_stream.waited == ["begin"]
+    assert cache._prefill_buffer_layer == [0, 1]
+    assert cache._prefill_chunk_open is True
+
+    cache.release_prefill_layer(0)
+    cache.release_prefill_layer(1)  # last layer closes the chunk
+    assert cache._prefill_chunk_open is False
+
+    # Chunk 2: begin re-fences; buffer 0 reuse waits on chunk 1's release event.
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    assert copy_stream.waited == ["begin", "begin", "release0"]
+    assert cache._prefill_buffer_layer == [0, None]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_early_prefetch_prefill_hook_enqueues_at_layer_entry(monkeypatch):
+    """FREETOKEN_PREFILL_PREFETCH_EARLY=1 (candidate 3B): the hook begins the chunk at
+    layer 0, enqueues the lookahead layers, is idempotent on repeat, and stays out of
+    decode batches entirely."""
+    from freetoken.layers import moe as moe_mod
+    from freetoken.moe import offload_cache as offload_cache_mod
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(offload_cache_mod, "PREFILL_PREFETCH_EARLY", True)
+    num_layers = 4
+    num_experts = 4
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=8,
+        device=torch.device("cuda"),
+        prefill_overlap=True,
+    )
+    cache.set_bank_sources({
+        "gate_up": list(torch.zeros(num_layers * num_experts, 32, 8).split(num_experts)),
+        "down": list(torch.zeros(num_layers * num_experts, 8, 16).split(num_experts)),
+    })
+    mlp = SimpleNamespace(experts=SimpleNamespace(owner_cache=None, offload_cache=cache))
+    monkeypatch.setattr(
+        moe_mod, "get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=True)),
+    )
+
+    moe_mod.early_prefetch_prefill(mlp, 0)  # begin + prefetch(0) + prefetch(1)
+    assert cache._prefill_chunk_open is True
+    assert cache._prefill_buffer_layer == [0, 1]
+    moe_mod.early_prefetch_prefill(mlp, 0)  # repeat: fully deduped
+    assert cache._prefill_buffer_layer == [0, 1]
+
+    cache.wait_prefill_layer(0)
+    cache.release_prefill_layer(0)
+    moe_mod.early_prefetch_prefill(mlp, 1)  # prefetch(2) reuses the released buffer 0
+    assert cache._prefill_buffer_layer == [2, 1]
+
+    # decode batches: the hook is a strict no-op
+    monkeypatch.setattr(
+        moe_mod, "get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=False)),
+    )
+    moe_mod.early_prefetch_prefill(mlp, 2)
+    assert cache._prefill_buffer_layer == [2, 1]
+
+
+def test_early_prefetch_prefill_hook_prefers_owner_cache(monkeypatch):
+    from freetoken.layers import moe as moe_mod
+    from freetoken.moe import offload_cache as offload_cache_mod
+
+    monkeypatch.setattr(offload_cache_mod, "PREFILL_PREFETCH_EARLY", True)
+
+    class FakeCache:
+        prefill_overlap = True
+        prefill_depth = 2
+
+        def __init__(self):
+            self.calls = []
+
+        def begin_prefill(self):
+            self.calls.append("begin")
+
+        def prefetch_prefill_layer(self, layer_id):
+            self.calls.append(("prefetch", layer_id))
+
+    owner, global_cache = FakeCache(), FakeCache()
+    mlp = SimpleNamespace(
+        experts=SimpleNamespace(owner_cache=owner, offload_cache=global_cache)
+    )
+    monkeypatch.setattr(
+        moe_mod, "get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=True)),
+    )
+
+    moe_mod.early_prefetch_prefill(mlp, 0)
+    assert owner.calls == ["begin", ("prefetch", 0), ("prefetch", 1)]
+    assert global_cache.calls == []
+    owner.calls.clear()
+    moe_mod.early_prefetch_prefill(mlp, 3)  # layer > 0: no begin, lookahead only
+    assert owner.calls == [("prefetch", 3), ("prefetch", 4)]
+
+
+def test_early_prefetch_prefill_hook_default_off():
+    """Default (env unset): the hook must not touch the model at all -- bit-identical
+    legacy behaviour is the whole point of the gate."""
+    from freetoken.layers import moe as moe_mod
+
+    class Exploding:
+        def __getattr__(self, name):
+            raise AssertionError("hook touched the mlp block while gated off")
+
+    moe_mod.early_prefetch_prefill(Exploding(), 0)
+
+
 def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
     layer, cache = _make_layer_and_cache()
     topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)

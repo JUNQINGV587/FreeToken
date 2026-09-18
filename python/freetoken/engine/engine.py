@@ -27,7 +27,7 @@ from freetoken.moe.offload_cache import (
     attach_offload_moe_cache,
     attach_owner_moe_cache,
 )
-from freetoken.moe.ownership import ExpertOwnership, OwnerCacheGeometry
+from freetoken.moe.ownership import PREFILL_PREFETCH_DEPTH, ExpertOwnership, OwnerCacheGeometry
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -802,8 +802,9 @@ class Engine:
             if config.moe_prefill_overlap:
                 logger.info_rank0(
                     f"owner EP prefill overlap enabled: slots "
-                    f"[0, {2 * ownership.local_num_experts}) of {config.moe_cache_size} "
-                    f"are borrowed as the two-layer prefill buffer"
+                    f"[0, {PREFILL_PREFETCH_DEPTH * ownership.local_num_experts}) of "
+                    f"{config.moe_cache_size} are borrowed as the "
+                    f"{PREFILL_PREFETCH_DEPTH}-layer prefill buffer ring"
                 )
         _require_offload_cache_size(
             config.moe_cache_size,
@@ -1926,17 +1927,19 @@ def _adjust_config(config: EngineConfig):
 
     if is_moe and config.moe_strategy == "cpu":
         # CPU-compute decode keeps experts in host RAM and computes them on the CPU;
-        # the GPU only holds the two-layer prefill double buffer. So the slot cache is
-        # fixed at exactly two expert layers (prefill overlap requires >= 2*num_experts)
-        # and --moe-cache-size / --moe-cache-auto / --moe-cache-rate do not apply.
+        # the GPU only holds the prefill buffer ring. So the slot cache is fixed at
+        # exactly PREFILL_PREFETCH_DEPTH expert layers (prefill overlap requires
+        # >= depth*num_experts) and --moe-cache-size / --moe-cache-auto /
+        # --moe-cache-rate do not apply.
         num_experts = config.model_config.num_experts
         if getattr(config, "moe_cache_auto", False):
             override("moe_cache_auto", False)
-        override("moe_cache_size", 2 * num_experts)
+        override("moe_cache_size", PREFILL_PREFETCH_DEPTH * num_experts)
         override("moe_prefill_overlap", True)
         logger.info_rank0(
             f"MoE backend 'cpu': decode computes experts on CPU; GPU keeps a "
-            f"two-layer prefill buffer (moe_cache_size={2 * num_experts})"
+            f"{PREFILL_PREFETCH_DEPTH}-layer prefill buffer ring "
+            f"(moe_cache_size={PREFILL_PREFETCH_DEPTH * num_experts})"
         )
 
     if (

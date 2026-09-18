@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
+from freetoken.layers.moe import early_prefetch_prefill
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
@@ -74,6 +75,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+        # Expert-prefetch enqueue point (env-gated; no-op by default). Runs before
+        # attention so the next layer's H2D window covers the whole layer.
+        early_prefetch_prefill(self.mlp, self._layer_id)
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden, batch)
         block_input, inject = self.attn_hyper_connection.mix(hidden)

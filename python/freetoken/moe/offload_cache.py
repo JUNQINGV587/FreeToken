@@ -25,8 +25,18 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# AR-stagger spec candidate 3B: enqueue the upcoming layers' expert prefetch at the
+# DECODER-LAYER entry (before attention) instead of at the MoE entry, widening each copy's
+# window by the attention block. Opt-in via FREETOKEN_PREFILL_PREFETCH_EARLY=1; default off
+# keeps the MoE-entry enqueue point bit-identical. Host-side enqueue timing only -- no new
+# stream, event direction, or device->host sync (the #500 single-launch discipline holds).
+PREFILL_PREFETCH_EARLY = os.getenv("FREETOKEN_PREFILL_PREFETCH_EARLY", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 from freetoken.utils import init_logger
 
+from . import ownership as _ownership
 from .ownership import OwnerCacheGeometry, OwnerCacheUpdate, same_device
 
 logger = init_logger(__name__)
@@ -181,11 +191,19 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # Overlap-prefill buffer-ring depth (borrowed full layers), env-gated; see ownership.
+        self._prefill_depth = _ownership.PREFILL_PREFETCH_DEPTH
+        # Set by begin_prefill, cleared by the last layer's release: makes the layer-0
+        # begin idempotent within one chunk, so the decoder-layer-entry prefetch hook
+        # (PREFILL_PREFETCH_EARLY) and the MoE-entry begin can both fire without a double
+        # fence/reset. Not a new sync edge -- host-side bookkeeping only.
+        self._prefill_chunk_open = False
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
-        assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
-            "Prefill overlap borrows two full expert-layer buffers from the unified MoE "
-            "cache, so cache_size must be at least 2 * num_experts "
+        assert not self.prefill_overlap or self.cache_size >= self._prefill_depth * self.num_experts, (
+            f"Prefill overlap borrows {self._prefill_depth} full expert-layer buffers from "
+            "the unified MoE cache, so cache_size must be at least "
+            f"{self._prefill_depth} * num_experts "
             "(raise moe_cache_size or disable moe_prefill_overlap)"
         )
         self.cache_policy_id = policy_ids[self.cache_policy]
@@ -294,21 +312,21 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
-        # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
-        # first 2 * num_experts slots (set up when prefill_overlap is enabled).
+        # Per-bank [depth, num_experts, ...] buffer-ring views over the slot cache's
+        # first depth * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
         self.prefill_copy_stream: torch.cuda.Stream | None = None
         self.prefill_begin_event: torch.cuda.Event | None = None
         self.prefill_ready_events: list[torch.cuda.Event] = []
         self.prefill_release_events: list[torch.cuda.Event] = []
-        self._prefill_buffer_layer: list[int | None] = [None, None]
-        self._prefill_buffer_released: list[bool] = [True, True]
-        self._prefill_buffer_has_release_event: list[bool] = [False, False]
+        self._prefill_buffer_layer: list[int | None] = [None] * self._prefill_depth
+        self._prefill_buffer_released: list[bool] = [True] * self._prefill_depth
+        self._prefill_buffer_has_release_event: list[bool] = [False] * self._prefill_depth
         # hit-D2D split state: pinned begin-of-chunk snapshot of slot_for_id (the
         # classification input; frozen for the chunk -- no decode runs inside one,
-        # and buffer invalidation only clears slot < 2E entries, which classify as
-        # miss regardless), the lazily resolved batch-memcpy entry point (False =
-        # unavailable), and row counters for cache reports.
+        # and buffer invalidation only clears entries in the buffer-owned slot region
+        # (< depth*num_experts), which classify as miss regardless), the lazily resolved
+        # batch-memcpy entry point (False = unavailable), and row counters for cache reports.
         self._prefill_slot_snapshot: torch.Tensor | None = None
         self._prefill_snapshot_np = None
         self._prefill_hit_d2d_active = False
@@ -316,6 +334,11 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+
+    @property
+    def prefill_depth(self) -> int:
+        """Number of borrowed full-layer buffers in the overlap prefill ring (>= 2)."""
+        return self._prefill_depth
 
     def set_bank_sources(
         self,
@@ -511,9 +534,10 @@ class OffloadMoeCache:
         self.prefill_begin_event = None
         self.prefill_ready_events = []
         self.prefill_release_events = []
-        self._prefill_buffer_layer = [None, None]
-        self._prefill_buffer_released = [True, True]
-        self._prefill_buffer_has_release_event = [False, False]
+        self._prefill_buffer_layer = [None] * self._prefill_depth
+        self._prefill_buffer_released = [True] * self._prefill_depth
+        self._prefill_buffer_has_release_event = [False] * self._prefill_depth
+        self._prefill_chunk_open = False
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
         self.bank_caches = {}
@@ -556,10 +580,10 @@ class OffloadMoeCache:
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         # 5. Re-evaluate prefill overlap against the new size.
-        if self.prefill_overlap and cache_size < 2 * self.num_experts:
+        if self.prefill_overlap and cache_size < self._prefill_depth * self.num_experts:
             logger.warning(
                 f"Disabling MoE prefill overlap on rebuild: cache_size {cache_size} "
-                f"< 2*num_experts {2 * self.num_experts}."
+                f"< {self._prefill_depth}*num_experts {self._prefill_depth * self.num_experts}."
             )
             self.prefill_overlap = False
         if self.prefill_overlap:
@@ -637,19 +661,25 @@ class OffloadMoeCache:
 
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
-        self._prefill_buffer_layer = [None, None]
-        self._prefill_buffer_released = [True, True]
-        self._prefill_buffer_has_release_event = [False, False]
-        # The double buffers borrow the slot cache's first 2 * num_experts slots
+        depth = self._prefill_depth
+        logger.info(
+            f"MoE prefill overlap: buffer ring depth={depth} "
+            f"({depth * self.num_experts} borrowed slots), "
+            f"early_prefetch={PREFILL_PREFETCH_EARLY}"
+        )
+        self._prefill_buffer_layer = [None] * depth
+        self._prefill_buffer_released = [True] * depth
+        self._prefill_buffer_has_release_event = [False] * depth
+        # The buffer ring borrows the slot cache's first depth * num_experts slots
         # (one full expert layer per buffer), one view per registered bank.
         self.prefill_bank_buffers = [
-            cache[: 2 * self.num_experts].view(2, self.num_experts, *cache.shape[1:])
+            cache[: depth * self.num_experts].view(depth, self.num_experts, *cache.shape[1:])
             for _, cache in self.banks
         ]
         if self.device.type == "cuda":
             self.prefill_copy_stream = torch.cuda.Stream(device=self.device)
-            self.prefill_ready_events = [torch.cuda.Event() for _ in range(2)]
-            self.prefill_release_events = [torch.cuda.Event() for _ in range(2)]
+            self.prefill_ready_events = [torch.cuda.Event() for _ in range(depth)]
+            self.prefill_release_events = [torch.cuda.Event() for _ in range(depth)]
             self.prefill_begin_event = torch.cuda.Event()
         if self.prefill_hit_d2d and self.device.type == "cuda":
             self._prefill_slot_snapshot = torch.empty(
@@ -678,10 +708,14 @@ class OffloadMoeCache:
         )
 
     def begin_prefill(self) -> None:
-        if not self.prefill_overlap:
+        if not self.prefill_overlap or self._prefill_chunk_open:
+            # chunk_open: the decoder-layer-entry prefetch hook (PREFILL_PREFETCH_EARLY)
+            # already began this chunk; the MoE-entry begin that follows must not
+            # re-fence the copy stream or reset the buffer map behind its prefetches.
             return
-        self._prefill_buffer_layer = [None, None]
-        self._prefill_buffer_released = [True, True]
+        self._prefill_chunk_open = True
+        self._prefill_buffer_layer = [None] * self._prefill_depth
+        self._prefill_buffer_released = [True] * self._prefill_depth
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
@@ -708,7 +742,7 @@ class OffloadMoeCache:
 
         assert self.banks and self.prefill_bank_buffers
 
-        buffer_id = layer_id % 2
+        buffer_id = layer_id % self._prefill_depth
         if self._prefill_buffer_layer[buffer_id] == layer_id:
             return
         if self._prefill_buffer_layer[buffer_id] is not None:
@@ -750,10 +784,10 @@ class OffloadMoeCache:
             reason = "FREETOKEN_SKIP_FAST_INDEX_COPY is set (the hit gather would be a no-op)"
         elif not self._copy_fused_ok:
             reason = "the fused copy plan is unavailable (bank alignment or FREETOKEN_FUSED_COPY=0)"
-        elif self.cache_size <= 2 * self.num_experts:
+        elif self.cache_size <= self._prefill_depth * self.num_experts:
             reason = (
                 f"cache_size {self.cache_size} leaves no hit region "
-                f"(needs > {2 * self.num_experts} slots)"
+                f"(needs > {self._prefill_depth * self.num_experts} slots)"
             )
         elif not self._resolve_batch_memcpy():
             reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
@@ -790,10 +824,10 @@ class OffloadMoeCache:
         stream, under the existing release/ready event discipline; its host-built
         run list comes from the begin-of-chunk snapshot because the batch API
         takes HOST pointer arrays. Live-vs-snapshot cannot disagree: the only
-        chunk-internal writer (buffer invalidation) rewrites slots already below
-        the 2E threshold, and slots < 2E (including -1) are misses on both sides
-        -- the buffers own those slots, so their bytes are volatile within the
-        chunk. Hit and miss row sets are disjoint, so the streams need no
+        chunk-internal writer (buffer invalidation) rewrites slots already below the
+        buffer-region threshold (depth*E), and slots < depth*E (including -1) are misses
+        on both sides -- the buffers own those slots, so their bytes are volatile within
+        the chunk. Hit and miss row sets are disjoint, so the streams need no
         ordering against each other.
         """
         import numpy as np
@@ -803,7 +837,7 @@ class OffloadMoeCache:
 
         E = self.num_experts
         snap = self._prefill_snapshot_np[layer_id]
-        hit_mask = snap >= 2 * E
+        hit_mask = snap >= self._prefill_depth * E
         self.prefill_hit_rows += int(hit_mask.sum())
         self.prefill_total_rows += E
         if self._gather_dst_ptrs is not None:
@@ -858,7 +892,7 @@ class OffloadMoeCache:
         assert self.prefill_overlap
         assert self.prefill_bank_buffers
         self.prefetch_prefill_layer(layer_id)
-        buffer_id = layer_id % 2
+        buffer_id = layer_id % self._prefill_depth
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
@@ -867,13 +901,17 @@ class OffloadMoeCache:
     def release_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap:
             return
-        buffer_id = layer_id % 2
+        buffer_id = layer_id % self._prefill_depth
         if self._prefill_buffer_layer[buffer_id] != layer_id:
             return
         if self.prefill_release_events:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
+        if layer_id == self.num_layers - 1:
+            # Chunk closed: the next chunk's begin_prefill (from the layer-entry hook or
+            # the MoE entry) must re-fence the copy stream and re-snapshot the slot map.
+            self._prefill_chunk_open = False
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
@@ -1709,9 +1747,10 @@ This variant never changes the shape.  Remote entries are remapped to a row that
     def materialize_layer(self, layer_id: int, buffer_id: int = 0) -> torch.Tensor:
         """Materialize all local rows using the legacy prefill choreography."""
         if self.geometry.prefill_overlap:
-            if buffer_id != layer_id % 2:
+            if buffer_id != layer_id % self._cache._prefill_depth:
                 raise ValueError(
-                    "owner prefill buffer_id must match layer_id % 2 for the legacy buffers"
+                    "owner prefill buffer_id must match layer_id % prefill_depth "
+                    "for the legacy buffers"
                 )
             self._cache.prefetch_prefill_layer(layer_id)
         else:

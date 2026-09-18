@@ -8,10 +8,21 @@ feeding a remote global ID or a slot ID into a bank/GEMM kernel.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
+
+# Overlap-prefill buffer-ring depth (AR-stagger spec candidate 3A). Default 2 keeps the
+# legacy double buffer; FREETOKEN_PREFILL_PREFETCH_DEPTH=3 borrows a third full layer from
+# the slot cache so one layer's H2D window spans two whole layers. Pure scheduling
+# geometry -- no kernel, numerics, or AR call-order change. Both TP ranks inherit the same
+# launcher env; the donor boot consensus refuses a drifted pair.
+_raw_depth = os.getenv("FREETOKEN_PREFILL_PREFETCH_DEPTH", "2")
+PREFILL_PREFETCH_DEPTH = int(_raw_depth)
+if PREFILL_PREFETCH_DEPTH < 2:
+    raise ValueError(f"FREETOKEN_PREFILL_PREFETCH_DEPTH must be >= 2, got {_raw_depth!r}")
 
 
 def same_device(left: torch.device, right: torch.device) -> bool:
@@ -166,8 +177,9 @@ class OwnerCacheGeometry:
     runtime path prematurely.
 
     ``cache_size`` is the number of local expert slots on this rank.  It is deliberately checked
-    against the local expert count, not the global count.  Prefill overlap borrows two complete
-    local layers from the unified pool, hence its separate ``2 * local_num_experts`` minimum.
+    against the local expert count, not the global count.  Prefill overlap borrows
+    ``PREFILL_PREFETCH_DEPTH`` complete local layers from the unified pool, hence its separate
+    ``PREFILL_PREFETCH_DEPTH * local_num_experts`` minimum.
     """
 
     global_num_experts: int
@@ -186,10 +198,11 @@ class OwnerCacheGeometry:
                 f"cache_size={self.cache_size} is smaller than local_num_experts="
                 f"{owner.local_num_experts}"
             )
-        if self.prefill_overlap and self.cache_size < 2 * owner.local_num_experts:
+        if self.prefill_overlap and self.cache_size < PREFILL_PREFETCH_DEPTH * owner.local_num_experts:
             raise ValueError(
-                "prefill_overlap requires cache_size >= 2 * local_num_experts "
-                f"({2 * owner.local_num_experts}), got {self.cache_size}"
+                f"prefill_overlap requires cache_size >= {PREFILL_PREFETCH_DEPTH} * "
+                f"local_num_experts ({PREFILL_PREFETCH_DEPTH * owner.local_num_experts}), "
+                f"got {self.cache_size}"
             )
 
     @property

@@ -5,6 +5,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
+from freetoken.moe import offload_cache as _offload_cache
 from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -24,6 +25,33 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+
+
+def early_prefetch_prefill(mlp: "BaseOP", layer_id: int) -> None:
+    """Decoder-layer-entry prefetch hook (AR-stagger candidate 3B).
+
+    Called at the top of a decoder layer's forward (before attention) so the upcoming
+    layers' expert H2D is enqueued one attention block earlier than the legacy MoE-entry
+    point, widening the copy window. No-op unless FREETOKEN_PREFILL_PREFETCH_EARLY=1, an
+    offload prefill with overlap is in flight, and the model carries routed experts.
+
+    Scheduling only: host-side enqueue calls, no new stream/event direction and no
+    device->host sync. The buffer map dedupes the later MoE-entry prefetch of the same
+    layer into a no-op, and ``begin_prefill`` is idempotent per chunk, so a model without
+    this hook keeps the legacy choreography bit-identical even with the env set.
+    """
+    if not _offload_cache.PREFILL_PREFETCH_EARLY:
+        return
+    experts = getattr(mlp, "experts", None)
+    cache = getattr(experts, "owner_cache", None) or getattr(experts, "offload_cache", None)
+    if cache is None or not cache.prefill_overlap:
+        return
+    if not get_global_ctx().batch.is_prefill:
+        return
+    if layer_id == 0:
+        cache.begin_prefill()
+    for i in range(cache.prefill_depth):
+        cache.prefetch_prefill_layer(layer_id + i)
 
 
 class MoELayer(BaseOP):
@@ -509,16 +537,18 @@ class OffloadMoELayer(MoELayer):
         """
         owner = self.owner_cache
         if owner.geometry.prefill_overlap:
-            # Same begin -> prefetch(current) -> prefetch(next) -> wait -> release
-            # choreography as the global-ID path (_wait_prefill_overlap): the NEXT layer's
-            # H2D runs on the copy stream while THIS layer's GEMMs run on the compute
-            # stream.  Prefetching only the current layer would serialize copy and compute
-            # and lose the whole point of overlap.  prefetch_prefill_layer is a no-op past
-            # the last layer, so the lookahead needs no bounds check here.
+            # Same begin -> prefetch ring -> wait -> release choreography as the global-ID
+            # path (_wait_prefill_overlap): the NEXT layers' H2D runs on the copy stream
+            # while THIS layer's GEMMs run on the compute stream.  Prefetching only the
+            # current layer would serialize copy and compute and lose the whole point of
+            # overlap.  prefetch_prefill_layer is a no-op past the last layer and when the
+            # decoder-layer-entry hook (early_prefetch_prefill) already enqueued the layer,
+            # and begin_prefill is idempotent per chunk, so the lookahead needs no bounds
+            # check or early-mode branch here.
             if self.layer_id == 0:
                 owner.begin_prefill()
-            owner.prefetch_prefill_layer(self.layer_id)
-            owner.prefetch_prefill_layer(self.layer_id + 1)
+            for i in range(owner.prefill_depth):
+                owner.prefetch_prefill_layer(self.layer_id + i)
             views = owner.wait_prefill_layer(self.layer_id)
         else:
             owner.materialize_layer(self.layer_id, buffer_id=0)
@@ -543,15 +573,17 @@ class OffloadMoELayer(MoELayer):
         return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
-        """Double-buffer choreography for this layer's overlap prefill: kick off the
-        next layer's full-layer H2D copy, then return this layer's bank views (in
-        bank registration order; buffer position == expert id, so routing ids pass
-        through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
+        """Buffer-ring choreography for this layer's overlap prefill: kick off the
+        next layers' full-layer H2D copies (``prefill_depth - 1`` layers of lookahead),
+        then return this layer's bank views (in bank registration order; buffer
+        position == expert id, so routing ids pass through unmapped). The caller runs
+        ``release_prefill_layer`` after its GEMMs. Enqueues issued earlier by the
+        decoder-layer-entry hook dedupe to no-ops via the buffer map.
         """
         if self.layer_id == 0:
             cache.begin_prefill()
-        cache.prefetch_prefill_layer(self.layer_id)
-        cache.prefetch_prefill_layer(self.layer_id + 1)
+        for i in range(cache.prefill_depth):
+            cache.prefetch_prefill_layer(self.layer_id + i)
         return cache.wait_prefill_layer(self.layer_id)
 
     # ------------------------------------------------------------------

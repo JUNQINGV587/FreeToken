@@ -1,7 +1,7 @@
 """Single-launch invalidation of the MoE prefill overlap buffers.
 
-``OffloadMoeCache._invalidate_prefill_buffer`` runs twice per prefill chunk (once per
-double-buffer slot) and used to clear the buffer's slot map with a boolean-mask index:
+``OffloadMoeCache._invalidate_prefill_buffer`` runs once per buffer-ring slot per
+prefill chunk and used to clear the buffer's slot map with a boolean-mask index:
 
     slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
 

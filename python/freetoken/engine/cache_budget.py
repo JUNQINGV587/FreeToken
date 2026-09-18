@@ -60,25 +60,30 @@ def plan_cache_budget(
     ``budget_bytes`` is the net pool for MoE cache + KV cache (caller already subtracted
     weights + fixed_cache_size; the (1-memory_ratio) remainder is the graph headroom).
     Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV, clamped
-    to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
-    overlap is feasible else ``num_experts``); KV pages take whatever remains.
+    to ``[floor, min(total_experts, max_slots)]`` (floor is ``depth*num_experts`` when
+    prefill overlap is feasible else ``num_experts``, depth = ownership's env-gated
+    PREFILL_PREFETCH_DEPTH); KV pages take whatever remains.
     """
     assert per_expert_bytes > 0, "per_expert_bytes must be positive"
     assert cache_per_page > 0, "cache_per_page must be positive (owned-KV models unsupported here)"
 
+    # Local import: keeps this module torch-free for budget-only unit tests.
+    from freetoken.moe import ownership as _ownership
+
+    depth = _ownership.PREFILL_PREFETCH_DEPTH
     hi = min(total_experts, max_slots)
-    # Prefill overlap borrows two full expert-layer buffers, so it needs >= 2*num_experts
-    # slots; disable it (and lower the floor) if the cap cannot fit that.
-    overlap = prefill_overlap and hi >= 2 * num_experts
-    lo = 2 * num_experts if overlap else num_experts
+    # Prefill overlap borrows depth full expert-layer buffers, so it needs >=
+    # depth*num_experts slots; disable it (and lower the floor) if the cap cannot fit that.
+    overlap = prefill_overlap and hi >= depth * num_experts
+    lo = depth * num_experts if overlap else num_experts
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
     kv_reserve_bytes = kv_reserve_pages * cache_per_page
     # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
     raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))
-    # A tiny budget may have forced moe_cache_size below 2*num_experts even with overlap on.
-    overlap = overlap and moe_cache_size >= 2 * num_experts
+    # A tiny budget may have forced moe_cache_size below depth*num_experts even with overlap on.
+    overlap = overlap and moe_cache_size >= depth * num_experts
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
     num_pages = max(remaining // cache_per_page, kv_reserve_pages)

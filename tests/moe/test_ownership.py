@@ -177,6 +177,21 @@ def test_owner_cache_geometry_rejects_invalid_capacity_or_owner(kwargs, message)
         OwnerCacheGeometry(**params)
 
 
+def test_owner_cache_geometry_overlap_floor_follows_prefetch_depth(monkeypatch):
+    """FREETOKEN_PREFILL_PREFETCH_DEPTH=3 (AR-stagger candidate 3A) borrows three local
+    layers, so the geometry floor becomes 3 * local_num_experts."""
+    monkeypatch.setattr("freetoken.moe.ownership.PREFILL_PREFETCH_DEPTH", 3)
+    with pytest.raises(ValueError, match="3 \\* local_num_experts"):
+        OwnerCacheGeometry(
+            global_num_experts=8, world_size=2, rank=0, num_layers=2,
+            cache_size=11, prefill_overlap=True,
+        )
+    OwnerCacheGeometry(
+        global_num_experts=8, world_size=2, rank=0, num_layers=2,
+        cache_size=12, prefill_overlap=True,
+    )
+
+
 def test_owner_cache_geometry_validates_legacy_binding_and_local_bank_shapes():
     geometry = OwnerCacheGeometry(8, 2, 0, num_layers=2, cache_size=6)
     geometry.validate_cache_binding(

@@ -11,6 +11,7 @@ from freetoken.layers import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from freetoken.layers.moe import early_prefetch_prefill
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
@@ -61,6 +62,9 @@ class Qwen3_5DecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
+        # Expert-prefetch enqueue point (env-gated; no-op by default). Runs before
+        # attention so the next layer's H2D window covers the whole layer.
+        early_prefetch_prefill(self.mlp, self._layer_id)
         # Residual-stream form: fuse each residual-add into the next RMSNorm
         # (GemmaRMSNorm.forward_add_residual) so add + norm are one kernel per sublayer.
         if residual is None:

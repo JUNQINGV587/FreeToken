@@ -25,6 +25,18 @@
 > | Short-interaction TTFT | 1.35s | prefill JIT already paid at boot warmup |
 > | Expert-cache reload under domain churn | **no measurable cost** | 6-domain rotation x2 rounds; revisit round identical to first (72.2 vs 72.2 t/s median) |
 >
+> Server hardware this deployment runs on:
+>
+> | Component | Spec |
+> |---|---|
+> | GPU | 2x NVIDIA L20 48GB (sm_89, PCIe P2P, no NVLink) |
+> | CPU | Intel Core i9-7980XE (18C/36T; PCIe Gen3 root complex - device links run at 8.0 GT/s) |
+> | RAM | 128 GB (hosts the offloaded MoE expert bank) |
+> | Storage | 2 TB NVMe (PLE disk backend) |
+> | OS | Unraid 7 (Docker) |
+>
+> Note the platform constraint: the L20 is Gen4-capable, but the i9-7980XE root complex caps links at PCIe Gen3 - measured 12.3 GB/s pinned H2D per GPU, 24 GB/s aggregate across both. All numbers above were measured under this constraint.
+>
 > Production configuration on this box (2x L20 48GiB, PCIe P2P):
 >
 > ```bash

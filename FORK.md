@@ -22,6 +22,32 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   prerequisite, not yet wired).
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
+## Measurement protocol
+
+A number from this branch is only comparable inside the same boundary and the same
+output window; each rule below was learned by getting a wrong number first.
+
+- **Decode needs an output window of >= 512 tokens, 1024+ preferred.** Client-side SSE
+  under-reads by 11% at a 128-token window and 22% at 64 (sampling ramp plus the first
+  graph steps after prefill). The `gen throughput` field in the engine log is a
+  per-step instantaneous value - do not average it.
+- **`reasoning_content` counts as output.** Counting only `content` reports the first
+  token at end-of-reasoning instead of first token, and shortens `ct`.
+- **Prefer prompts that cannot stop early.** A summarize instruction returns ~110 tokens
+  whatever the budget (EOS), so every depth carries the same ramp penalty and the depth
+  curve looks flat; an enumerate instruction runs to the budget and exposes the real slope.
+- **Discard the first request after a long-context one.** Releasing a 255K sequence costs
+  the next request a one-off slowdown, observed anywhere from 0 to -25% over three samples.
+- **Warm the engine with short-request and decode traffic before measuring long prefill.**
+  On a freshly booted engine long prefill reads ~28% low (2690 vs 3641 tok/s), and repeated
+  long prefills do not clear it - a batch of short requests does.
+- **Read concurrent decode in the saturated phase**, when all streams are decoding. An
+  end-to-end average over a concurrent run mixes in queue starvation (0.7-1.4 t/s while a
+  later prefill holds the GPU) and reads far too low.
+- **Take KV occupancy from the engine log `token usage`**, not from polling `/v1/stats`:
+  under saturation the stats request itself queues and the sampler under-reads (47.9%
+  sampled against the 97% the engine reported for the same run).
+
 ## Precision contract
 
 Zero precision degradation vs upstream: kernel swaps are verified bit-identical or within

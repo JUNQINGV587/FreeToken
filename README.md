@@ -14,16 +14,22 @@
 >
 > This branch tracks upstream main plus production customizations for **2x NVIDIA L20 (sm_89, PCIe P2P)**: TP2 + expert offload, serving Qwen3.8-Flash-Next-NVFP4 (qwen4_exp, NVFP4 + PLE disk backend). See git history for the full change list (cherry-picked upstream PRs keep their original authors).
 >
-> Measured performance (server-side gen throughput):
+> Measured performance. Every row states **where** it was measured: the same engine
+> reads 81 or 68 t/s on the same workload depending on the measurement boundary and the
+> output window, so a boundary-less number is not reproducible. Protocol in [FORK.md](FORK.md).
 >
-> | Scenario | Value | Notes |
-> |---|---|---|
-> | Single-stream decode | **81 t/s** | +19% vs first deployment (68.07 t/s) |
-> | 8-way concurrent aggregate | **278-282 t/s** | steady state, all slots busy |
-> | Cold prefill | **3641 tok/s** (70K tokens, TTFT 19.1s) | 3.6x the ~1025 tok/s first-deployment baseline (1025 -> 2132 -> 3641) |
-> | Prefix-cache-hit TTFT | 1.26s (17K tokens) | hybrid radix reuse |
-> | Short-interaction TTFT | 1.35s | prefill JIT already paid at boot warmup |
-> | Expert-cache reload under domain churn | **no measurable cost** | 6-domain rotation x2 rounds; revisit round identical to first (72.2 vs 72.2 t/s median) |
+> | Scenario | Value | Measured at | Notes |
+> |---|---|---|---|
+> | Single-stream decode, short context | **81 t/s** | server-side gen throughput | +19% vs first deployment (68.07 t/s); client-side SSE on the same condition reads 77-80 |
+> | Single-stream decode, 255K context | **71.7 t/s** | client-side SSE, 2047-token window | step time 12.74 -> 13.57 ms, i.e. -6.7% vs short context |
+> | 8-way concurrent aggregate | **278-282 t/s** | server-side steady state | client-side end-to-end window reads 198-207 (includes queue ramp + drain, not comparable) |
+> | 3-way concurrent aggregate, KV pool at 97% | **113-117 t/s** | client-side SSE, saturated phase | 38-39 t/s per stream; 1.7x single-stream |
+> | Cold prefill, 70K tokens | **3641 tok/s** (TTFT 19.1s) | client-side TTFT | 3.6x the ~1025 tok/s first-deployment baseline (1025 -> 2132 -> 3641) |
+> | Cold prefill, 255K tokens | **3180-3380 tok/s** (TTFT 75.5-80.3s) | client-side TTFT | prefill peaks near 70K tokens, then declines ~15% by 255K |
+> | Prefix-cache-hit TTFT | 1.26s (17K tokens) | client-side | hybrid radix reuse |
+> | Short-interaction TTFT | 1.27-1.35s | client-side | prefill JIT already paid at boot warmup |
+> | Long-context KV ceiling | 3 x 262144 tokens | engine log `token usage` | a 4th full-context request queues for a free slot; no error, no dropped request |
+> | Expert-cache reload under domain churn | **no measurable cost** | - | 6-domain rotation x2 rounds; revisit round identical to first (72.2 vs 72.2 t/s median) |
 >
 > Server hardware this deployment runs on:
 >

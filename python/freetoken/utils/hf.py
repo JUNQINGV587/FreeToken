@@ -29,6 +29,60 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def config_vocab_size(config: Any) -> int | None:
+    """Embedding rows the checkpoint declares, or None when it does not say.
+
+    Text configs nest it (``config.text_config.vocab_size``); older ones keep it top level.
+    """
+    for holder in (config, getattr(config, "text_config", None)):
+        value = getattr(holder, "vocab_size", None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def tokenizer_token_ids(tokenizer: PreTrainedTokenizerBase) -> list[int]:
+    """Every id the tokenizer can emit, sorted: base vocab plus added/special tokens.
+
+    ``get_vocab()`` covers the added tokens on some tokenizers and not others, so union
+    both sources rather than trusting either alone.
+    """
+    ids = set(tokenizer.get_vocab().values())
+    added = getattr(tokenizer, "added_tokens_encoder", None) or {}
+    ids.update(added.values())
+    return sorted(ids)
+
+
+def tokenizer_max_token_id(tokenizer: PreTrainedTokenizerBase) -> int:
+    """Largest id the tokenizer can emit: base vocab plus added/special tokens."""
+    return max(tokenizer_token_ids(tokenizer), default=-1)
+
+
+def warn_on_tokenizer_vocab_overflow(
+    tokenizer: PreTrainedTokenizerBase, config: Any, model_path: str = ""
+) -> int:
+    """Error out loudly when the tokenizer can emit ids the embedding table cannot hold.
+
+    ``embed_input_ids`` gathers rows with no bounds mask on the text path, so an id past
+    the table reads whatever memory follows it. That is silent corruption rather than a
+    crash: the same prompt can decode as gibberish or NaNs on one request and be fine on
+    another, depending on what the allocator put behind the table. Returns the largest id.
+    """
+    all_ids = tokenizer_token_ids(tokenizer)
+    largest = max(all_ids, default=-1)
+    vocab_size = config_vocab_size(config)
+    if vocab_size is None or largest < vocab_size:
+        return largest
+    over = [i for i in all_ids if i >= vocab_size]
+    logger.error(
+        f"tokenizer can emit ids up to {largest} but {model_path or 'the checkpoint'} embeds "
+        f"only {vocab_size} rows; {len(over)} ids ({over[0]}-{over[-1]}) are read out of "
+        f"bounds by the embedding gather -> silent corruption. Fix the checkpoint's "
+        f"vocab_size or its tokenizer."
+    )
+    return largest
+
+
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     from freetoken.models.gguf.reader import gguf_config_source
 
@@ -45,6 +99,12 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
                 tokenizer.chat_template = json.load(f)["chat_template"]
         except Exception:
             pass
+    # A checkpoint whose embedding is smaller than its tokenizer silently reads out of
+    # bounds on every prompt; say so at load time (never fatal: the config may be exotic).
+    try:
+        warn_on_tokenizer_vocab_overflow(tokenizer, cached_load_hf_config(model_path), model_path)
+    except Exception:
+        pass
     return tokenizer
 
 

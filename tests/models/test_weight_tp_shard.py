@@ -92,7 +92,7 @@ def test_ftw_checkpoints_accept_tp_shard(monkeypatch):
     monkeypatch.setattr("freetoken.checkpoint.ftw.is_ftw_checkpoint", lambda path: True)
     monkeypatch.setattr(
         "freetoken.checkpoint.ftw.iter_ftw_weights",
-        lambda path: iter([("w", torch.zeros(2, 2))]),
+        lambda path, keep=None: iter([("w", torch.zeros(2, 2))]),
     )
     out = list(
         weight_mod.load_weight("/m", torch.device("cpu"), tp_shard=True, include_vision=False)

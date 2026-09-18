@@ -1,5 +1,5 @@
 """Read-only control-plane endpoints consumed by the desktop app: /health (lifecycle),
-/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5).
+/ready (readiness), /v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5).
 
 All handlers read a shared FrontendManager snapshot via ``get_state``; nothing here touches
 the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Responses routes.
@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -49,6 +49,16 @@ def build_health(state: Any, version: str) -> dict:
     }
 
 
+def is_ready(doc: dict) -> bool:
+    """Whether a ``build_health`` document describes an engine that can take work.
+
+    Readiness is not liveness: ``/health`` answers 200 for the whole lifecycle so the client can
+    render load progress, while ``/ready`` must fail closed -- ``loading``, ``failed`` and
+    ``stopping`` all mean a caller has to keep waiting (or give up), and only ``serving`` counts.
+    """
+    return doc.get("status") == "ok" and doc.get("maintenance", "serving") == "serving"
+
+
 def register_control_routes(
     app: FastAPI,
     get_state: Callable[[], Any],
@@ -57,6 +67,13 @@ def register_control_routes(
     @app.get("/health")
     async def health():
         return build_health(get_state(), app.version)
+
+    @app.get("/ready")
+    async def ready(response: Response):
+        doc = build_health(get_state(), app.version)
+        if not is_ready(doc):
+            response.status_code = 503
+        return doc
 
     from . import request_ring
 

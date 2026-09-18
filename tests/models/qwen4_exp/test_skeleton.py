@@ -365,7 +365,11 @@ def _hf_attention(x, attn, config, positions):
 def test_qsa_layer_matches_hf_dense():
     """The QSA layer under the dense oracle backend equals HF attention, and freezes what the indexer hands the backend."""
     from freetoken.models.qwen4_exp.attention import Qwen4ExpAttention, TorchDenseQSAReference
+    from freetoken.models.qwen4_exp.gemv_concat import gemv_concat_env
     from freetoken.utils.torch_utils import torch_dtype
+
+    if gemv_concat_env():
+        pytest.skip("asserts the unfused qkv_proj/index_qk_proj module layout")
 
     torch.manual_seed(6)
     config = _config()
@@ -412,8 +416,12 @@ class _StubLinearMixer(BaseOP):
 def test_shared_expert_gate_fusion_matches_eager():
     """Qwen4ExpMoE only swaps qwen3_5's gemv+sigmoid+mul+add gate chain for two triton kernels."""
     from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
+    from freetoken.models.qwen4_exp.gemv_concat import gemv_concat_env
     from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE
     from freetoken.utils.torch_utils import torch_dtype
+
+    if gemv_concat_env():
+        pytest.skip("asserts the unfused gate/gate_up_proj module layout")
 
     config = _config()
     device, dtype = torch.device("cuda"), torch.bfloat16
@@ -534,3 +542,86 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         decode_logits = model.forward()
     assert decode_logits.shape == (len(prompts), config.vocab_size)
     assert torch.isfinite(decode_logits.float()).all()
+
+
+@requires_cuda
+def test_gemv_concat_moe_forward_bitwise_vs_unfused(monkeypatch):
+    """FREETOKEN_GEMV_CONCAT=1: the fused router_gate_up MoE is torch.equal to the
+    unfused build at every M (fused GEMV at M==1, baseline pair at M>1)."""
+    from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE
+    from freetoken.utils.torch_utils import torch_dtype
+
+    config = _config()
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    monkeypatch.delenv("FREETOKEN_GEMV_CONCAT", raising=False)
+    with torch.device(device), torch_dtype(dtype):
+        base = Qwen4ExpMoE(config, 0)
+    _fill(base, torch.Generator(device=device).manual_seed(33), scale=0.2)
+    monkeypatch.setenv("FREETOKEN_GEMV_CONCAT", "1")
+    with torch.device(device), torch_dtype(dtype):
+        fused = Qwen4ExpMoE(config, 0)
+
+    base_sd, fused_sd = base.state_dict(), fused.state_dict()
+    assert "router_gate_up.weight" in fused_sd
+    assert "gate.weight" not in fused_sd
+    assert "shared_expert.gate_up_proj.weight" not in fused_sd
+    for key, tensor in fused_sd.items():
+        if key == "router_gate_up.weight":
+            tensor.copy_(torch.cat(
+                [base_sd["gate.weight"], base_sd["shared_expert.gate_up_proj.weight"]], dim=0
+            ))
+        else:
+            tensor.copy_(base_sd[key])
+
+    _fresh_ctx(_batch=SimpleNamespace(is_prefill=True))
+    for m in (1, 2, 4, 8):
+        x = torch.randn(m, config.hidden_size, device=device, dtype=dtype) * 0.5
+        got = fused.forward(x.clone())
+        want = base.forward(x.clone())
+        assert torch.equal(got, want), f"M={m}"
+
+
+@requires_cuda
+def test_gemv_concat_qsa_forward_bitwise_vs_unfused(monkeypatch):
+    """FREETOKEN_GEMV_CONCAT=1: the fused qkv_index_proj attention layer is torch.equal
+    to the unfused build at every M, including the indexer inputs handed to the backend."""
+    from freetoken.models.qwen4_exp.attention import Qwen4ExpAttention, TorchDenseQSAReference
+    from freetoken.utils.torch_utils import torch_dtype
+
+    config = _config()
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    monkeypatch.delenv("FREETOKEN_GEMV_CONCAT", raising=False)
+    with torch.device(device), torch_dtype(dtype):
+        base = Qwen4ExpAttention(config, layer_id=3)
+    _fill(base, torch.Generator(device=device).manual_seed(41))
+    monkeypatch.setenv("FREETOKEN_GEMV_CONCAT", "1")
+    with torch.device(device), torch_dtype(dtype):
+        fused = Qwen4ExpAttention(config, layer_id=3)
+
+    base_sd, fused_sd = base.state_dict(), fused.state_dict()
+    assert "qkv_index_proj.weight" in fused_sd
+    assert "qkv_proj.weight" not in fused_sd
+    assert "indexer.index_qk_proj.weight" not in fused_sd
+    for key, tensor in fused_sd.items():
+        if key == "qkv_index_proj.weight":
+            tensor.copy_(torch.cat(
+                [base_sd["qkv_proj.weight"], base_sd["indexer.index_qk_proj.weight"]], dim=0
+            ))
+        else:
+            tensor.copy_(base_sd[key])
+
+    for m in (1, 2, 4, 8):
+        x = torch.randn(m, config.hidden_size, device=device, dtype=dtype) * 0.5
+        positions = torch.arange(m, device=device, dtype=torch.int64)
+        req = SimpleNamespace(extend_len=m, cached_len=0, table_idx=1)
+        batch = SimpleNamespace(
+            padded_reqs=[req], reqs=[req], positions=positions,
+            get_attn_positions=lambda: positions,
+        )
+        backend = TorchDenseQSAReference(config, num_slots=4, max_len=64, device=device, dtype=dtype)
+        _fresh_ctx(attn_backend=backend)
+        got = fused.forward(x.clone(), batch)
+        backend2 = TorchDenseQSAReference(config, num_slots=4, max_len=64, device=device, dtype=dtype)
+        _fresh_ctx(attn_backend=backend2)
+        want = base.forward(x.clone(), batch)
+        assert torch.equal(got, want), f"M={m}"

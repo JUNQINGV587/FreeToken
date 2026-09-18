@@ -266,6 +266,9 @@ def test_top_level_mixer_keeps_the_unmerged_down(loaded, checkpoint):
 
 
 def test_qkv_fusion_slices_back_to_q_k_v(loaded, checkpoint):
+    from freetoken.models.qwen4_exp.gemv_concat import gemv_concat_env
+    if gemv_concat_env():
+        pytest.skip("asserts the unfused projection layout (FREETOKEN_GEMV_CONCAT=1)")
     _folder, raw = checkpoint
     attn = "model.language_model.layers.1.self_attn"
     parts = [raw[f"{attn}.{p}_proj.weight"] for p in ("q", "k", "v")]
@@ -452,6 +455,9 @@ def test_tp2_lm_head_short_final_shard_is_zero_padded_too():
 
 
 def test_shared_expert_gate_up_merge(loaded, checkpoint):
+    from freetoken.models.qwen4_exp.gemv_concat import gemv_concat_env
+    if gemv_concat_env():
+        pytest.skip("asserts the unfused projection layout (FREETOKEN_GEMV_CONCAT=1)")
     _folder, raw = checkpoint
     base = "model.language_model.layers.1.mlp.shared_expert"
     merged = loaded["model.layers.1.mlp.shared_expert.gate_up_proj.weight"]
@@ -574,6 +580,9 @@ def test_iter_weights_tp_shard_reassembles_every_dense_buffer(checkpoint, monkey
     Text-only (`include_vision=False`), the configuration this loader serves at TP>1: the
     vision tower is neither sharded nor replicated here (its own loader refuses TP>1), and
     the engine builds it only inside `--text-model-only`'s absence at TP1."""
+    from freetoken.models.qwen4_exp.gemv_concat import gemv_concat_env
+    if gemv_concat_env():
+        pytest.skip("asserts the unfused projection layout (FREETOKEN_GEMV_CONCAT=1)")
     import freetoken.distributed.info as info
 
     folder, _raw = checkpoint
@@ -766,6 +775,9 @@ def _assert_fused_per_kind(loaded, raw, fused: str, parts: list[str]) -> None:
 
 
 def test_fp8_projections_fuse_per_kind(loaded_fp8, checkpoint_fp8):
+    from freetoken.models.qwen4_exp.gemv_concat import gemv_concat_env
+    if gemv_concat_env():
+        pytest.skip("asserts the unfused projection layout (FREETOKEN_GEMV_CONCAT=1)")
     _folder, raw = checkpoint_fp8
     attn, gdn = f"{LM}.layers.1.self_attn", f"{LM}.layers.0.linear_attn"
     _assert_fused_per_kind(loaded_fp8, raw, "model.layers.1.self_attn.qkv_proj", [f"{attn}.{p}_proj" for p in "qkv"])
@@ -858,3 +870,64 @@ def test_vision_tower_sharding_matches_the_tp2_model(monkeypatch):
         "visual.blocks.0.attn.qkv.weight", torch.zeros(full_shapes["visual.blocks.0.attn.qkv.weight"]),
         config=config, rank=0, world_size=1,
     ).shape == full_shapes["visual.blocks.0.attn.qkv.weight"]
+
+
+def test_gemv_concat_fusion_round_trip(checkpoint, monkeypatch):
+    """FREETOKEN_GEMV_CONCAT: router|gate|up and qkv|index_qk load as one buffer each."""
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_GEMV_CONCAT", "1")
+    got = _load(folder)
+    lm = "model.language_model"
+    for layer in (0, 1):
+        fused = got[f"model.layers.{layer}.mlp.router_gate_up.weight"]
+        expected = torch.cat(
+            [
+                raw[f"{lm}.layers.{layer}.mlp.gate.weight"],
+                raw[f"{lm}.layers.{layer}.mlp.shared_expert.gate_proj.weight"],
+                raw[f"{lm}.layers.{layer}.mlp.shared_expert.up_proj.weight"],
+            ],
+            dim=0,
+        )
+        assert fused.shape == (E + 2 * I, H)
+        assert torch.equal(fused, expected)
+        assert f"model.layers.{layer}.mlp.gate.weight" not in got
+        assert f"model.layers.{layer}.mlp.shared_expert.gate_up_proj.weight" not in got
+    attn = f"{lm}.layers.1.self_attn"
+    fused = got["model.layers.1.self_attn.qkv_index_proj.weight"]
+    expected = torch.cat(
+        [raw[f"{attn}.{p}_proj.weight"] for p in ("q", "k", "v")]
+        + [raw[f"{attn}.indexer.index_qk_proj.weight"]],
+        dim=0,
+    )
+    assert fused.shape == (2 * QH * AHD + 2 * KVH * AHD + 5 * IHD, H)
+    assert torch.equal(fused, expected)
+    assert "model.layers.1.self_attn.qkv_proj.weight" not in got
+    assert "model.layers.1.self_attn.indexer.index_qk_proj.weight" not in got
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+def test_gemv_concat_modules_m_dispatch_bitwise():
+    """The fused projections are torch.equal to the baseline GEMV pair at every M:
+    the single fused GEMV at M==1, the two row-slice GEMVs (baseline-identical) at M>1."""
+    import torch.nn.functional as F
+
+    from freetoken.models.qwen4_exp.attention import _QKVIndexProj
+    from freetoken.models.qwen4_exp.moe import _RouterGateUpProj
+
+    torch.manual_seed(0)
+    hidden, experts, inter = 256, 8, 12
+    qkv_rows, index_rows = 96, 20
+
+    moe = _RouterGateUpProj(hidden, experts, inter)
+    moe.weight = torch.randn(experts + 2 * inter, hidden, device="cuda", dtype=torch.bfloat16)
+    qsa = _QKVIndexProj(hidden, qkv_rows, index_rows)
+    qsa.weight = torch.randn(qkv_rows + index_rows, hidden, device="cuda", dtype=torch.bfloat16)
+
+    for m in (1, 2, 4, 8):
+        x = torch.randn(m, hidden, device="cuda", dtype=torch.bfloat16)
+        router, gate_up = moe.forward(x)
+        assert torch.equal(router, F.linear(x, moe.weight[:experts]))
+        assert torch.equal(gate_up, F.linear(x, moe.weight[experts:]))
+        qkv, index = qsa.forward(x)
+        assert torch.equal(qkv, F.linear(x, qsa.weight[:qkv_rows]))
+        assert torch.equal(index, F.linear(x, qsa.weight[qkv_rows:]))

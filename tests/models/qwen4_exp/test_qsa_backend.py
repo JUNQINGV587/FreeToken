@@ -277,6 +277,9 @@ def test_tp2_rank_partials_sum_to_the_tp1_output(monkeypatch):
     ``o_proj`` all-reduce is replaced by an identity so the unreduced partials can be summed
     here, which is exactly the TP contract.
     """
+    from freetoken.models.qwen4_exp.gemv_concat import gemv_concat_env
+    if gemv_concat_env():
+        pytest.skip("asserts the unfused projection layout (FREETOKEN_GEMV_CONCAT=1)")
     import freetoken.distributed.info as info
     from freetoken.distributed import DistributedCommunicator
     from freetoken.models.qwen4_exp.weight import shard_qwen4_exp_dense_tensor

@@ -117,6 +117,9 @@ def _jaccard(indices, selection):
 
 @requires_cuda
 def test_single_layer_matches_hf_reference(monkeypatch):
+    from freetoken.models.qwen4_exp.gemv_concat import gemv_concat_env
+    if gemv_concat_env():
+        pytest.skip("asserts the unfused projection layout (FREETOKEN_GEMV_CONCAT=1)")
     config = parsed_config()
     fixture = Fixture(config, num_pages=128, max_running_req=4)
     attn = fixture.layer(QSA_LAYER)

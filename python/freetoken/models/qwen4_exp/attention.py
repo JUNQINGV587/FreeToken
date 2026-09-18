@@ -18,10 +18,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import torch
+import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
 from freetoken.models.qwen4_exp.config import qwen4_exp_tp_geometry
+from freetoken.models.qwen4_exp.gemv_concat import f2_enabled
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
@@ -76,9 +78,14 @@ class QSAAttentionBackend(Protocol):
 
 
 class Qwen4ExpIndexer(BaseOP):
-    """QSA indexer weights (checkpoint prefix ``self_attn.indexer``); the scoring lives in the backend."""
+    """QSA indexer weights (checkpoint prefix ``self_attn.indexer``); the scoring lives in the backend.
 
-    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
+    With FREETOKEN_GEMV_CONCAT (``fused=True``) the index projection is a row segment of
+    the attention layer's ``qkv_index_proj`` buffer and is not built here; the layer then
+    hands the precomputed projection to :meth:`forward_qk`.
+    """
+
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "", fused: bool = False) -> None:
         args = config.qwen4_args
         self.layer_id = layer_id
         self.num_heads = args.index_n_heads
@@ -86,15 +93,15 @@ class Qwen4ExpIndexer(BaseOP):
         self.head_dim = args.index_head_dim
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
-        self.index_qk_proj = LinearReplicated(
-            args.hidden_size, sum(self._split), has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
-        )
+        if not fused:
+            self.index_qk_proj = LinearReplicated(
+                args.hidden_size, sum(self._split), has_bias=False,
+                quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
+            )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
 
-    def forward(self, x: torch.Tensor) -> QSAIndexerInputs:
-        q, k = self.index_qk_proj.forward(x).split(self._split, dim=-1)
+    def _inputs(self, q: torch.Tensor, k: torch.Tensor) -> QSAIndexerInputs:
         return QSAIndexerInputs(
             q=q.reshape(-1, self.num_heads, self.head_dim).contiguous(),
             k=k.reshape(-1, self.head_dim).contiguous(),
@@ -102,6 +109,35 @@ class Qwen4ExpIndexer(BaseOP):
             k_norm_weight=self.k_layernorm.weight,
             eps=self.eps,
         )
+
+    def forward(self, x: torch.Tensor) -> QSAIndexerInputs:
+        q, k = self.index_qk_proj.forward(x).split(self._split, dim=-1)
+        return self._inputs(q, k)
+
+    def forward_qk(self, qk: torch.Tensor) -> QSAIndexerInputs:
+        q, k = qk.split(self._split, dim=-1)
+        return self._inputs(q, k)
+
+
+class _QKVIndexProj(BaseOP):
+    """Load-time concat of the QSA qkv projection and the indexer's index_qk projection.
+
+    Row layout: ``[q | k | v (rank-local head shards) | index_qk (TP-replicated)]``. Same
+    M-dispatch as the MoE router_gate_up fusion: the single fused GEMV is bitwise
+    identical to the pair only at M==1, so M>1 runs the original two GEMVs on contiguous
+    row slices of the fused buffer.
+    """
+
+    def __init__(self, hidden_size: int, qkv_rows: int, index_rows: int) -> None:
+        self.qkv_rows = qkv_rows
+        self.weight = torch.empty(qkv_rows + index_rows, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        n = self.qkv_rows
+        if x.shape[0] == 1:
+            y = F.linear(x, self.weight)
+            return y[:, :n], y[:, n:]
+        return F.linear(x, self.weight[:n]), F.linear(x, self.weight[n:])
 
 
 class Qwen4ExpAttention(BaseOP):
@@ -147,10 +183,18 @@ class Qwen4ExpAttention(BaseOP):
             raise NotImplementedError(
                 "qwen4_exp dense TP currently supports the BF16 attention path only"
             )
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_global_split, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
-        )
+        self.qkv_index_proj = None
+        if f2_enabled(config):
+            args = config.qwen4_args
+            index_rows = (args.index_n_heads + args.index_kv_heads) * args.index_head_dim
+            self.qkv_index_proj = _QKVIndexProj(
+                config.hidden_size, sum(self._qkv_split), index_rows
+            )
+        else:
+            self.qkv_proj = LinearColParallelMerged(
+                config.hidden_size, self._qkv_global_split, has_bias=False,
+                quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+            )
         self.o_proj = LinearOProj(
             config.num_qo_heads * self.head_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
@@ -167,11 +211,17 @@ class Qwen4ExpAttention(BaseOP):
             mrope_section=tuple(rotary.mrope_section) if rotary.mrope_section is not None else None,
             mrope_layout=rotary.mrope_layout,
         )
-        self.indexer = Qwen4ExpIndexer(config, layer_id, prefix=f"{prefix}.indexer")
+        self.indexer = Qwen4ExpIndexer(
+            config, layer_id, prefix=f"{prefix}.indexer", fused=self.qkv_index_proj is not None
+        )
 
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
-        qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
+        if self.qkv_index_proj is not None:
+            qkv, index_qk = self.qkv_index_proj.forward(x)
+        else:
+            qkv = self.qkv_proj.forward(x)
+        qg, k, v = qkv.split(self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
         q = qg[..., : self.head_dim].contiguous()
         gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
@@ -182,7 +232,11 @@ class Qwen4ExpAttention(BaseOP):
         q, k = self.rotary.forward(
             batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
         )
-        index = self.indexer.forward(x)
+        index = (
+            self.indexer.forward_qk(index_qk)
+            if self.qkv_index_proj is not None
+            else self.indexer.forward(x)
+        )
         o = get_global_ctx().attn_backend.qsa_forward(
             q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
         )

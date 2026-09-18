@@ -447,6 +447,10 @@ def iter_weights(
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the model's state dict minus the routed experts.
     A dense projection is bf16 or 128x128 block-fp8 (``.weight`` e4m3 + ``.weight_scale_inv``) as the checkpoint's QuantConfig says: the official releases skip everything but the routed experts, the community NVFP4-FP8 requants quantize the attention / GDN projections.
     Fusions, per kind: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + bf16 ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
+    With FREETOKEN_GEMV_CONCAT a second stage then concatenates, cross-parent (see
+    gemv_concat.py): ``mlp.gate`` | ``mlp.shared_expert.gate_up_proj`` ->
+    ``mlp.router_gate_up`` and ``self_attn.qkv_proj`` | ``self_attn.indexer.index_qk_proj``
+    -> ``self_attn.qkv_index_proj``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
 
     ``tp_shard`` enables the rank-local TP path: each RAW tensor is sliced with
@@ -480,6 +484,18 @@ def iter_weights(
     fuser = _DenseFuser(
         get_quant_config(), spec.packed_modules_mapping, dequantized=not serve_block_fp8
     )
+    # Second-stage cross-parent concat (FREETOKEN_GEMV_CONCAT): router|gate|up and
+    # qkv|index_qk. Gated on the same quant flags the model build used, so the emitted
+    # buffers always match the built modules.
+    from freetoken.models.qwen4_exp.gemv_concat import _GemvConcatFuser, f1_enabled, f2_enabled, gemv_concat_env
+
+    concat_fuser = None
+    if gemv_concat_env():
+        if config is None:
+            from freetoken.models.qwen4_exp.config import parse_config
+
+            config = parse_config(hf_config)
+        concat_fuser = _GemvConcatFuser(f1=f1_enabled(config), f2=f2_enabled(config))
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -511,11 +527,20 @@ def iter_weights(
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
-                    yield name, tensor
-                else:
-                    yield from fused
+                    fused = [(name, tensor)]
+                for item_name, item_tensor in fused:
+                    if concat_fuser is not None:
+                        out = concat_fuser.fuse(item_name, item_tensor)
+                        if out is None:
+                            yield item_name, item_tensor
+                        else:
+                            yield from out
+                    else:
+                        yield item_name, item_tensor
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    if concat_fuser is not None:
+        concat_fuser.finish()
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:

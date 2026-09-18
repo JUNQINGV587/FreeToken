@@ -69,6 +69,8 @@ def test_fused_copy_matches_per_bank(num_indices):
     for _, c in cache.banks:
         c.zero_()
     cache._copy_fused_ok = True
+    # copy_missing consumes the staged layer, so re-arm it for the second launch.
+    cache._pending_src_layer = layer_id
     cache.copy_missing()
     torch.cuda.synchronize()
 

@@ -54,6 +54,7 @@ from .generation import (
     with_keepalive,
 )
 from .request_logger import log_request
+from .admission import AdmissionThrottledError
 
 # Emit a protocol-native `ping` event after this many seconds of stream silence,
 # bridging long queue/prefill/decode gaps for clients with stream-idle timeouts.
@@ -122,6 +123,10 @@ async def handle_anthropic_messages(
             ),
         )
         uid = await submit_generation(spec, state)
+    except AdmissionThrottledError as exc:
+        response = _anthropic_error_response(429, "rate_limit_error", str(exc))
+        response.headers["Retry-After"] = str(exc.retry_after)
+        return response
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
 

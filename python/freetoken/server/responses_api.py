@@ -78,6 +78,7 @@ from .generation import (
     with_keepalive,
 )
 from .request_logger import log_request
+from .admission import AdmissionThrottledError
 
 # Seconds of event silence before a keep-alive frame is emitted on the stream.
 # codex's stream-idle timeout (default 300s) only resets on a data-bearing SSE
@@ -159,6 +160,10 @@ async def handle_responses(
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
+    except AdmissionThrottledError as exc:
+        response = _error_response(429, str(exc), "rate_limit_exceeded", err_type="rate_limit_error")
+        response.headers["Retry-After"] = str(exc.retry_after)
+        return response
     except ValueError as exc:
         return _error_response(400, str(exc))
 
@@ -773,8 +778,8 @@ def _sse(event) -> str:
     return f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"
 
 
-def _error_response(status_code: int, message: str, code: str | None = None) -> JSONResponse:
+def _error_response(status_code: int, message: str, code: str | None = None, *, err_type: str = "invalid_request_error") -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content={"error": {"message": message, "type": "invalid_request_error", "code": code}},
+        content={"error": {"message": message, "type": err_type, "code": code}},
     )

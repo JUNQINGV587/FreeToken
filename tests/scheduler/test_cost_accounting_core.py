@@ -133,7 +133,8 @@ def test_prepare_failure_emits_no_prompt_admission():
 
 def test_scheduler_rejection_emits_error_but_no_admission():
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.engine = SimpleNamespace(max_seq_len=4)
+    scheduler.engine = SimpleNamespace(max_seq_len=4, num_pages=1)
+    scheduler.config = SimpleNamespace(page_size=64)  # PR #118: admission clamps to the pool
     added = []
     scheduler.prefill_manager = SimpleNamespace(add_one_req=added.append)
     sent = []
@@ -150,6 +151,30 @@ def test_scheduler_rejection_emits_error_but_no_admission():
     assert added == []
     assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg)
     assert not any(isinstance(msg, PromptAdmittedMsg) for msg in sent)
+
+
+def test_scheduler_clamps_admission_to_the_actual_kv_pool():
+    """PR #118: a prompt that fits the advertised context but not the allocated pool must be
+    rejected with the pool-derived limit instead of being queued forever."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(max_seq_len=100_000, num_pages=1)
+    scheduler.config = SimpleNamespace(page_size=64)  # pool holds 64 tokens, not 100_000
+    added = []
+    scheduler.prefill_manager = SimpleNamespace(add_one_req=added.append)
+    sent = []
+    scheduler.send_result = sent.extend
+
+    Scheduler._process_one_msg(
+        scheduler,
+        UserMsg(
+            uid=9,
+            input_ids=torch.arange(100, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=1),
+        ),
+    )
+    assert added == []
+    assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg)
+    assert "64" in sent[0].error, sent[0].error
 
 
 def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():

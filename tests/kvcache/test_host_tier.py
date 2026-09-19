@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from freetoken.kvcache.base import HostTierKeyCollision
 from freetoken.kvcache.host_tier import HostKVTier, TierGeometry
 
 LAYERS, PAGE, HEADS, DIM = 3, 4, 2, 8
@@ -157,3 +158,39 @@ def test_bytes_per_page_matches_the_pool_slab_sizes():
     )
     assert tier.capacity_bytes == 4 * tier.bytes_per_page
     assert tier.resident_bytes == 0
+
+
+def test_spill_refuses_a_key_that_is_already_resident():
+    """A pool page id is not a safe key: the pool recycles it, so a second spill under the
+    same key must fail rather than silently hand the first owner the second owner's bytes."""
+    g = geom()
+    tier = HostKVTier(g, 2)
+    buf = pool_buffer(2, g)
+    k, v = page_views(buf, 0)
+    k.fill_(1.0)
+    tier.spill(7, k, v)
+
+    with pytest.raises(HostTierKeyCollision):
+        tier.spill(7, *page_views(buf, 1))
+
+    assert torch.equal(k, torch.ones_like(k)), "the resident copy is untouched"
+    assert tier.resident_pages == 1
+    assert tier.stats.spills == 1
+
+
+def test_clear_reports_every_resident_key_to_on_drop():
+    """clear() is what a pool rebuild calls; a silent clear would leave host-resident nodes
+    pointing at a tier that no longer holds their bytes."""
+    g = geom()
+    dropped: list[int] = []
+    tier = HostKVTier(g, 3, on_drop=dropped.append)
+    buf = pool_buffer(3, g)
+    tier.spill(1, *page_views(buf, 0))
+    tier.spill(2, *page_views(buf, 1))
+
+    tier.clear()
+
+    assert sorted(dropped) == [1, 2]
+    assert tier.resident_pages == 0
+    assert 1 not in tier
+    assert not tier.restore(1, *page_views(buf, 0)), "cleared copies are gone, not stale"

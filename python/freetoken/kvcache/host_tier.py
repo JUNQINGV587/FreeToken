@@ -5,10 +5,14 @@ no prefix longer than VRAM allows can ever be reused. This module adds the missi
 behind that call -- a bounded LRU store of evicted pages held in a host bank, written and read
 with plain device<->host copies.
 
-Scope of v0 (deliberately not wired into the engine yet):
-- Pages are addressed by the pool's own page id; the tier keeps no radix state and no free list.
+Scope of v0 (the engine-side bridge lives in ``host_tier_bridge``):
+- Pages are addressed by a caller-supplied opaque key; the tier never interprets it (a pool
+  page id is NOT a safe key: the pool hands the id out again as soon as the pages come back).
 - ``spill`` is called BEFORE the pool frees a page, ``restore`` fills a page the caller has
   already allocated. A page the LRU dropped is gone for good -- ``on_drop`` tells the caller so.
+- An *entry* groups the pages of one unit (one radix node's KV span) under a single key and is
+  evicted as a whole: a node whose pages are half in host memory is not a usable prefix, so the
+  LRU never has to reason about partial entries.
 - GDN state has no host format (``LinearStatePool`` snapshots are a GPU-only COW pool), so a
   restored prefix is attention-only as far as this tier is concerned: the caller treats a
   restored prefix as cold for the recurrent state and recomputes it.
@@ -17,13 +21,15 @@ Scope of v0 (deliberately not wired into the engine yet):
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
 
 import torch
 
 from freetoken.moe.host_banks import HostBank
 from freetoken.utils import init_logger, mem_GB
+
+from .base import HostTierKeyCollision
 
 logger = init_logger(__name__)
 
@@ -87,7 +93,7 @@ class HostKVTier:
         num_pages: int,
         *,
         backing: str = "mmap",
-        on_drop: Callable[[int], None] | None = None,
+        on_drop: Callable[[Hashable], None] | None = None,
     ) -> None:
         assert num_pages > 0, "a host tier needs at least one page of capacity"
         if geometry.index_layers:
@@ -118,9 +124,9 @@ class HostKVTier:
             else None
         )
 
-        self._slots: dict[int, int] = {}  # page id -> slot
+        self._slots: dict[Hashable, list[int]] = {}  # key -> its page slots, in key order
         self._free: list[int] = list(range(num_pages - 1, -1, -1))
-        self._lru: OrderedDict[int, None] = OrderedDict()
+        self._lru: OrderedDict[Hashable, None] = OrderedDict()
 
     # -- sizing ---------------------------------------------------------------------------
 
@@ -136,14 +142,18 @@ class HostKVTier:
 
     @property
     def resident_pages(self) -> int:
-        return len(self._slots)
+        return sum(len(slots) for slots in self._slots.values())
 
     @property
     def resident_bytes(self) -> int:
-        return self.bytes_per_page * len(self._slots)
+        return self.bytes_per_page * self.resident_pages
 
-    def __contains__(self, page_id: int) -> bool:
-        return page_id in self._slots
+    @property
+    def resident_entries(self) -> int:
+        return len(self._slots)
+
+    def __contains__(self, key: Hashable) -> bool:
+        return key in self._slots
 
     def pin(self) -> None:
         """Page-lock the banks so device copies can be non-blocking (needs CUDA)."""
@@ -158,11 +168,45 @@ class HostKVTier:
             banks.append(self._rope)
         return banks
 
+    # -- entries --------------------------------------------------------------------------
+
+    def alloc_entry(self, key: Hashable, num_pages: int) -> list[int]:
+        """Reserve ``num_pages`` slots for one entry (one radix node's KV span) and return them.
+
+        The entry is visible to :meth:`entry_slots` as soon as it is allocated, so the caller
+        must fill every slot through :meth:`k_page`/:meth:`v_page` and call :meth:`drop` if it
+        cannot -- a half-written entry is one a later restore would trust.
+
+        Making room happens here: victims are reported to ``on_drop`` as whole entries.
+        """
+        return self._alloc(key, num_pages)
+
+    def entry_slots(self, key: Hashable) -> list[int] | None:
+        return self._slots.get(key)
+
+    def k_page(self, slot: int) -> torch.Tensor:
+        """[num_layers, page_size, num_kv_heads, head_dim] view of one stored page.
+
+        The bridge fills and drains whole pages through these: one page of the pool is
+        ``[2, num_layers, page_size, num_kv_heads, head_dim]``, so going layer by layer would
+        cost 2*num_layers copies per page instead of two.
+        """
+        return self._k.tensor[slot]
+
+    def v_page(self, slot: int) -> torch.Tensor:
+        return self._v.tensor[slot]
+
+    def index_page(self, slot: int) -> torch.Tensor | None:
+        return None if self._index is None else self._index.tensor[slot]
+
+    def rope_page(self, slot: int) -> torch.Tensor | None:
+        return None if self._rope is None else self._rope.tensor[slot]
+
     # -- movement -------------------------------------------------------------------------
 
     def spill(
         self,
-        page_id: int,
+        key: Hashable,
         k_slab: torch.Tensor,
         v_slab: torch.Tensor,
         *,
@@ -174,6 +218,11 @@ class HostKVTier:
 
         Slabs are the pool's own page views: ``k_slab``/``v_slab`` are ``[num_layers,
         page_size, num_kv_heads, head_dim]`` and may be strided (``pool._k_buffer[:, page]``).
+
+        ``key`` names one resident copy, so a key that is already resident is an error rather
+        than an overwrite: the pool recycles page ids, and a silent overwrite would leave the
+        first owner reading the second owner's bytes. Callers key by something that cannot be
+        reused while the copy is resident.
         """
         self._check_kv(k_slab, v_slab)
         if self._index is not None:
@@ -182,13 +231,7 @@ class HostKVTier:
         if self._rope is not None:
             assert rope_slab is not None, "geometry carries rope positions; pass rope_slab"
 
-        slot = self._slots.get(page_id)
-        if slot is None:
-            slot = self._take_slot(page_id)
-            self._slots[page_id] = slot
-        else:
-            self._lru.move_to_end(page_id)
-
+        slot = self._alloc(key, 1)[0]
         self._k.tensor[slot].copy_(k_slab, non_blocking=non_blocking)
         self._v.tensor[slot].copy_(v_slab, non_blocking=non_blocking)
         if self._index is not None:
@@ -199,7 +242,7 @@ class HostKVTier:
 
     def restore(
         self,
-        page_id: int,
+        key: Hashable,
         k_slab: torch.Tensor,
         v_slab: torch.Tensor,
         *,
@@ -213,10 +256,12 @@ class HostKVTier:
         the buffers are left untouched in that case.
         """
         self._check_kv(k_slab, v_slab)
-        slot = self._slots.get(page_id)
-        if slot is None:
+        slots = self._slots.get(key)
+        if slots is None:
             self.stats.misses += 1
             return False
+        assert len(slots) == 1, "restore() takes whole-page slabs; a multi-page entry has none"
+        slot = slots[0]
         if self._index is not None:
             assert index_slab is not None, "geometry carries a QSA index shadow; pass index_slab"
             self._check_index(index_slab)
@@ -229,42 +274,69 @@ class HostKVTier:
             index_slab.copy_(self._index.tensor[slot], non_blocking=non_blocking)
         if self._rope is not None:
             rope_slab.copy_(self._rope.tensor[slot], non_blocking=non_blocking)
-        self._lru.move_to_end(page_id)
+        self._lru.move_to_end(key)
         self.stats.restores += 1
         self.stats.hits += 1
         return True
 
-    def drop(self, page_id: int) -> bool:
-        """Release a page's slot without restoring it (the caller freed the prefix)."""
-        slot = self._slots.pop(page_id, None)
-        if slot is None:
+    def drop(self, key: Hashable) -> bool:
+        """Release an entry's slots without restoring it (the caller freed the prefix)."""
+        slots = self._slots.pop(key, None)
+        if slots is None:
             return False
-        self._lru.pop(page_id, None)
-        self._free.append(slot)
+        self._lru.pop(key, None)
+        self._free.extend(slots)
         return True
 
     def clear(self) -> None:
+        """Drop every resident page, reporting each to ``on_drop``.
+
+        The callback is what unlinks the cache's host-resident node; a silent clear would leave
+        nodes pointing at a tier that no longer holds their bytes.
+        """
+        for key in self._slots:
+            if self.on_drop is not None:
+                self.on_drop(key)
         self._slots.clear()
         self._lru.clear()
         self._free = list(range(self.num_pages - 1, -1, -1))
 
     # -- internals ------------------------------------------------------------------------
 
-    def _take_slot(self, page_id: int) -> int:
-        if self._free:
-            slot = self._free.pop()
-        else:
-            victim, slot = self._lru.popitem(last=False)
-            del self._slots[victim]
-            self.stats.dropped += 1
-            self.stats.dropped_bytes += self.bytes_per_page
-            if self.on_drop is not None:
-                self.on_drop(victim)
-            logger.debug(
-                "host KV tier full (%s): dropped page %s", mem_GB(self.capacity_bytes), victim
+    def _alloc(self, key: Hashable, num_pages: int) -> list[int]:
+        if key in self._slots:
+            raise HostTierKeyCollision(
+                f"host tier key {key!r} is already resident (page ids are recycled by the "
+                "pool, so key by a value unique per resident copy)"
             )
-        self._lru[page_id] = None
-        return slot
+        assert 0 < num_pages <= self.num_pages, (
+            f"{num_pages} pages for a {self.num_pages}-page tier"
+        )
+        while len(self._free) < num_pages:
+            self._evict_lru()
+        slots = [self._free.pop() for _ in range(num_pages)]
+        self._slots[key] = slots
+        self._lru[key] = None
+        return slots
+
+    def _evict_lru(self) -> None:
+        """Free one whole entry for room.
+
+        The victim is out of ``_slots`` and its slots are back on the free list BEFORE
+        ``on_drop`` runs, so a callback that calls back in (drop, or a re-entrant spill) sees a
+        consistent tier instead of a half-freed one.
+        """
+        victim, _ = self._lru.popitem(last=False)
+        slots = self._slots.pop(victim)
+        self._free.extend(slots)
+        self.stats.dropped += len(slots)
+        self.stats.dropped_bytes += self.bytes_per_page * len(slots)
+        if self.on_drop is not None:
+            self.on_drop(victim)
+        logger.debug(
+            "host KV tier full (%s): dropped entry %s (%d pages)",
+            mem_GB(self.capacity_bytes), victim, len(slots),
+        )
 
     def _check_kv(self, k_slab: torch.Tensor, v_slab: torch.Tensor) -> None:
         g = self.geometry

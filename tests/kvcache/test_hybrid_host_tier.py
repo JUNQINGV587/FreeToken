@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from freetoken.kvcache.base import HostTierKeyCollision
 from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
 
 PAGE = 2
@@ -193,3 +194,23 @@ def test_tokens_are_conserved_through_spill_and_materialize(evict: int):
     cache.match_prefix(ids)
     cache.check_integrity()
     assert accounts(cache) == 16
+
+
+def test_spill_refuses_a_tier_key_that_already_names_another_node():
+    """Two nodes under one tier key would make whichever materializes second read the other
+    prefix's bytes, so the second spill must fail before the pages leave."""
+    cache, _ = make_cache()
+    cache.host_spill = lambda node: "shared"      # a key space that is not per node
+    cache.insert(tokens(8), pages(8), mamba_value=1)
+    cache.insert(tokens(8) + 100, pages(8) + 100, mamba_value=2)  # a sibling leaf
+
+    cache.evict_full(8)                           # eviction takes whole leaves, so this is one
+    assert cache.host_resident_size == 8
+    assert accounts(cache) == 16
+
+    with pytest.raises(HostTierKeyCollision):
+        cache.evict_full(8)                       # the other sibling would reuse the key
+
+    assert cache.host_resident_size == 8, "the refused spill must move no accounting"
+    assert accounts(cache) == 16
+    cache.check_integrity()

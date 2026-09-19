@@ -10,6 +10,16 @@ from freetoken.utils import div_even, init_logger, mem_GB
 logger = init_logger(__name__)
 
 
+class HostTierKeyCollision(RuntimeError):
+    """A host tier key already names a resident page.
+
+    Raised by both sides of the host-tier contract -- ``HostKVTier.spill`` for the tier's own
+    key space and ``HybridRadixCache._spill`` for the node key space. Overwriting a resident
+    copy would make the earlier owner's ``host_value`` resolve to another prefix's bytes, and a
+    pool page id is NOT a safe key: the pool hands the id out again as soon as the spill
+    returns its pages, so a caller must mint a key that is unique per resident copy."""
+
+
 class CacheRebuildRejected(Exception):
     """A runtime cache rebuild was rejected BEFORE any destructive free (e.g. the
     requested geometry does not fit). The old caches are intact and serving continues --

@@ -22,7 +22,7 @@ import torch
 
 from freetoken.utils import align_down
 
-from .base import BaseCacheHandle
+from .base import BaseCacheHandle, HostTierKeyCollision
 from .radix_cache import RadixTreeNode, _get_key_fn
 
 
@@ -284,6 +284,13 @@ class HybridRadixCache:
         key = self.host_spill(node)
         if key is None:
             return False
+        if key in self._host_nodes:
+            # Checked before the pages leave: two nodes sharing a tier key would make whichever
+            # one materializes second read the other prefix's bytes.
+            raise HostTierKeyCollision(
+                f"host tier key {key!r} already names another node; a tier key must be unique "
+                "per resident copy"
+            )
         kv_out.append(node.value)          # the caller returns these pages to the pool
         self.full_evictable -= node.length
         self.host_resident += node.length

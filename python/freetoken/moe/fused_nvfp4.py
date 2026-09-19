@@ -26,25 +26,34 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
 from freetoken.layers import gated_act_and_mul
 from freetoken.moe.fused import moe_align_block_size
 
+def _decode_env_int(name: str, default: int) -> int:
+    # Read once at import: decode runs inside a CUDA graph, so a runtime flip would
+    # desync the captured launch geometry from the config the launch then reads.
+    value = int(os.environ.get(name, "0") or 0)
+    return value if value > 0 else default
+
+
 # Decode is captured into a CUDA graph, so the config must be fixed (no triton.autotune,
 # which benchmarks at run time). Tuned offline against the NVFP4 decode kernels.
 # These drive the original LUT-gather decode (_decode_gemm), kept only for A/B.
-_DECODE_BLOCK_N = 64
-_DECODE_BLOCK_KB = 128
-_DECODE_WARPS = 4
+_DECODE_BLOCK_N = _decode_env_int("FREETOKEN_NVFP4_DECODE_BN", 64)
+_DECODE_BLOCK_KB = _decode_env_int("FREETOKEN_NVFP4_DECODE_BKB", 128)
+_DECODE_WARPS = _decode_env_int("FREETOKEN_NVFP4_DECODE_WARPS", 4)
 
 # Marlin-style decode config (int32 wide loads + deferred reduction). Offline sweep over
 # the qwen35/qwen3moe (I=512/768) decode shapes picked BLOCK_N=16, BLOCK_KW=16 (== 128
 # k-values/iter), 4 warps -- the wide load lifts the gate/up GEMM ~43%->~51% of peak BW.
-_DECODE_MARLIN_BLOCK_N = 16
-_DECODE_MARLIN_BLOCK_KW = 16
-_DECODE_MARLIN_WARPS = 4
+# The FREETOKEN_NVFP4_DECODE_MARLIN_* envs let a sweep retune this without a rebuild;
+# unset (or 0) keeps the values above, so an env-free run is unchanged.
+_DECODE_MARLIN_BLOCK_N = _decode_env_int("FREETOKEN_NVFP4_DECODE_MARLIN_BN", 16)
+_DECODE_MARLIN_BLOCK_KW = _decode_env_int("FREETOKEN_NVFP4_DECODE_MARLIN_BKW", 16)
+_DECODE_MARLIN_WARPS = _decode_env_int("FREETOKEN_NVFP4_DECODE_MARLIN_WARPS", 4)
 # Deep-K variant: at K > 2048 (qwen4_exp gate_up, K=2560) a narrower N tile with the whole
 # K strip in one program iteration measures ~13% faster (18.6 vs 21.0us); short-K shapes
 # regress under it, so the split is by K, not by gemm position.
-_DECODE_MARLIN_DEEPK_BLOCK_N = 8
-_DECODE_MARLIN_DEEPK_BLOCK_KW = 128
-_DECODE_MARLIN_DEEPK_THRESHOLD = 2048
+_DECODE_MARLIN_DEEPK_BLOCK_N = _decode_env_int("FREETOKEN_NVFP4_DECODE_MARLIN_DEEPK_BN", 8)
+_DECODE_MARLIN_DEEPK_BLOCK_KW = _decode_env_int("FREETOKEN_NVFP4_DECODE_MARLIN_DEEPK_BKW", 128)
+_DECODE_MARLIN_DEEPK_THRESHOLD = _decode_env_int("FREETOKEN_NVFP4_DECODE_MARLIN_DEEPK_THRESHOLD", 2048)
 
 
 def _tl_dtype(dt: torch.dtype):

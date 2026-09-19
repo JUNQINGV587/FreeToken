@@ -286,7 +286,7 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
-def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
+def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     import torch
 
     from freetoken.engine.engine import Engine
@@ -356,6 +356,34 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
+
+    # PR #198: the KV floor must also cover --num-page-override pages, not just --num-tokens.
+    import freetoken.engine.cache_budget as _cb
+    import freetoken.engine.engine as _eng
+
+    state = {"override": 0}
+
+    class _OverrideCfg(StubConfig):
+        @property
+        def num_page_override(self):
+            return state["override"]
+
+    seen = {}
+    # canned result: the real function would reject a 300-page floor under this stub budget,
+    # and this test is about the kwargs the engine passes, not about plan_cache_budget.
+    recorder = lambda **kw: (seen.update(kw), (8, 64, True))[1]
+    monkeypatch.setattr(
+        _eng if hasattr(_eng, "resolve_moe_cache_auto") else _cb,
+        "resolve_moe_cache_auto",
+        recorder,
+    )
+    engine._resolve_auto_moe_cache_size(_OverrideCfg(), StubBanks())
+    floor_0 = seen["kv_reserve_tokens"]
+    state["override"] = 300
+    engine._resolve_auto_moe_cache_size(_OverrideCfg(), StubBanks())
+    floor_override = seen["kv_reserve_tokens"]
+    assert floor_override >= 300 * 16, (floor_0, floor_override)
+    assert floor_override == max(floor_0, 300 * 16), (floor_0, floor_override)
 
 
 # ---------------------------------------------------------------------------

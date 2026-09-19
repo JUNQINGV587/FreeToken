@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from freetoken.kvcache.base import HostTierKeyCollision
-from freetoken.kvcache.host_tier import HostKVTier, TierGeometry
+from freetoken.kvcache.host_tier import HostKVTier, HostTierUnpinned, TierGeometry
 
 LAYERS, PAGE, HEADS, DIM = 3, 4, 2, 8
 
@@ -176,6 +176,22 @@ def test_spill_refuses_a_key_that_is_already_resident():
     assert torch.equal(k, torch.ones_like(k)), "the resident copy is untouched"
     assert tier.resident_pages == 1
     assert tier.stats.spills == 1
+
+
+def test_non_blocking_without_pinning_is_refused():
+    """pageable + non_blocking silently degrades to a synchronous copy in torch, so the flag
+    would be a performance lie rather than an error."""
+    g = geom()
+    tier = HostKVTier(g, 2)
+    buf = pool_buffer(2, g)
+
+    with pytest.raises(HostTierUnpinned):
+        tier.spill(0, *page_views(buf, 0), non_blocking=True)
+    with pytest.raises(HostTierUnpinned):
+        tier.restore(0, *page_views(buf, 0), non_blocking=True)
+
+    assert tier.resident_pages == 0, "the refused spill must not take a slot"
+    assert tier.stats.spills == 0
 
 
 def test_clear_reports_every_resident_key_to_on_drop():

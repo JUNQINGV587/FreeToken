@@ -13,6 +13,10 @@ Scope of v0 (callbacks are injected into ``HybridRadixCache``; no engine constru
 - An *entry* groups the pages of one unit (one radix node's KV span) under a single key and is
   evicted as a whole: a node whose pages are half in host memory is not a usable prefix, so the
   LRU never has to reason about partial entries.
+- Both directions copy on the caller's current stream and leave the ordering to the caller: a
+  spill is ordered before the pages return to the pool, a restore before the page is read. Two
+  streams have no ordering between them, so a copy must not move to a side stream without a
+  matching ``wait_stream``; ``non_blocking=True`` additionally requires ``pin()``.
 - This tier carries K/V, the QSA index shadow and mrope positions, and NOTHING else. It has no
   GDN/PLE state and must not grow one: ``LinearStatePool`` is a GPU-only COW pool, and a hybrid
   prefix is resumable only through a LIVE snapshot on its node. The caller therefore spills only
@@ -69,6 +73,13 @@ class TierGeometry:
     @property
     def rope_page_elems(self) -> int:
         return self.page_size * 3 if self.rope_pos else 0
+
+
+class HostTierUnpinned(RuntimeError):
+    """A non-blocking copy was asked of a bank that is not page-locked.
+
+    torch falls back to a synchronous copy for pageable host memory, so the flag would become a
+    silent performance lie instead of an error. ``pin()`` first."""
 
 
 @dataclass
@@ -227,6 +238,7 @@ class HostKVTier:
         reused while the copy is resident.
         """
         self._check_kv(k_slab, v_slab)
+        self._check_async(non_blocking)
         if self._index is not None:
             assert index_slab is not None, "geometry carries a QSA index shadow; pass index_slab"
             self._check_index(index_slab)
@@ -258,6 +270,7 @@ class HostKVTier:
         the buffers are left untouched in that case.
         """
         self._check_kv(k_slab, v_slab)
+        self._check_async(non_blocking)
         slots = self._slots.get(key)
         if slots is None:
             self.stats.misses += 1
@@ -340,6 +353,17 @@ class HostKVTier:
             mem_GB(self.capacity_bytes), victim, len(slots),
         )
 
+    def _check_async(self, non_blocking: bool) -> None:
+        """A non-blocking copy is only real on page-locked banks (see HostTierUnpinned)."""
+        if not non_blocking:
+            return
+        unpinned = [i for i, bank in enumerate(self._banks()) if not bank.tensor.is_pinned()]
+        if unpinned:
+            raise HostTierUnpinned(
+                f"non_blocking=True needs page-locked host banks (unpinned banks: {unpinned}); "
+                "call pin() first -- torch copies pageable memory synchronously without saying so"
+            )
+
     def _check_kv(self, k_slab: torch.Tensor, v_slab: torch.Tensor) -> None:
         g = self.geometry
         want = (g.num_layers, g.page_size, g.num_kv_heads, g.head_dim)
@@ -356,4 +380,4 @@ class HostKVTier:
         )
 
 
-__all__ = ["HostKVTier", "TierGeometry", "TierStats"]
+__all__ = ["HostKVTier", "HostTierUnpinned", "TierGeometry", "TierStats"]

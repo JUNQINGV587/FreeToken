@@ -75,6 +75,93 @@ class TierGeometry:
         return self.page_size * 3 if self.rope_pos else 0
 
 
+class TierGeometryMismatch(ValueError):
+    """A TierGeometry does not describe the pool whose pages it will move.
+
+    Raised at wiring time, never at movement time: a missing index or rope bank is invisible
+    in the copied bytes and only shows up later as a different QSA block selection or a wrong
+    rope position, so it has to fail before the first request is served."""
+
+
+def _pool_slab_shape(pool) -> tuple[int, int, int, int, torch.dtype]:
+    """``(num_layers, page_size, num_kv_heads, head_dim, dtype)`` from the pool's own buffers.
+
+    A host tier moves ``[num_layers, page_size, num_kv_heads, head_dim]`` slabs, so the pool's
+    K buffer is the authority -- not a re-derived config, which is what the mismatch this
+    guards against looks like.
+    """
+    for name, idx in (("_k_buffer", (0, 2, 3, 4)), ("_kv_buffer", (1, 3, 4, 5))):
+        buf = getattr(pool, name, None)
+        if buf is not None and buf.dim() == len(idx) + 1:
+            return (*(int(buf.shape[i]) for i in idx), buf.dtype)
+    raise TierGeometryMismatch(
+        f"cannot read a paged KV slab shape from {type(pool).__name__}: the host tier addresses "
+        "pools that keep their K/V in a paged buffer"
+    )
+
+
+def check_tier_geometry(geometry: TierGeometry, pool, *, page_size: int) -> None:
+    """Cross-check ``geometry`` against the pool it will move pages for. Raises
+    :class:`TierGeometryMismatch`.
+
+    Only the fields that become bank shapes are compared: a wrong K/V shape still gets caught
+    by ``_check_kv`` on the first call, while a missing index or rope bank is never read back
+    by anything.
+    """
+    layers, pool_page_size, kv_heads, head_dim, dtype = _pool_slab_shape(pool)
+    for name, want, got in (
+        ("num_layers", geometry.num_layers, layers),
+        ("page_size", geometry.page_size, pool_page_size),
+        ("num_kv_heads", geometry.num_kv_heads, kv_heads),
+        ("head_dim", geometry.head_dim, head_dim),
+        ("dtype", geometry.dtype, dtype),
+    ):
+        if want != got:
+            raise TierGeometryMismatch(
+                f"tier geometry {name}={want!r} does not match the pool's {got!r}"
+            )
+    if page_size != pool_page_size:
+        raise TierGeometryMismatch(
+            f"tier is being built with page_size={page_size} but the pool uses {pool_page_size}"
+        )
+
+    index_layers = getattr(pool, "num_index_layers", None)
+    if index_layers is None:
+        index_layers = getattr(pool, "_num_index_layers", None)
+    if index_layers is None:
+        cmp_buf = getattr(pool, "_cmp_k_buffer", None)
+        index_layers = 0 if cmp_buf is None else int(cmp_buf.shape[0])
+    if geometry.index_layers != index_layers:
+        raise TierGeometryMismatch(
+            f"tier geometry index_layers={geometry.index_layers} but the pool has "
+            f"{index_layers}: a restored prefix would select different QSA blocks"
+        )
+    if index_layers:
+        index_head_dim = getattr(pool, "index_head_dim", None)
+        if index_head_dim is None:
+            index_head_dim = getattr(pool, "_index_head_dim", None)
+        index_ratio = getattr(pool, "index_ratio", None)
+        if index_ratio is None:
+            index_ratio = getattr(pool, "_index_ratio", None)
+        for name, want, got in (
+            ("index_head_dim", geometry.index_head_dim, index_head_dim),
+            ("index_ratio", geometry.index_ratio, index_ratio),
+        ):
+            if want != got:
+                raise TierGeometryMismatch(
+                    f"tier geometry {name}={want!r} does not match the pool's {got!r}"
+                )
+
+    mrope = getattr(pool, "mrope", None)
+    if mrope is None:
+        mrope = getattr(pool, "_mrope", False)
+    if geometry.rope_pos != bool(mrope):
+        raise TierGeometryMismatch(
+            f"tier geometry rope_pos={geometry.rope_pos} but the pool keeps rope positions: "
+            f"{bool(mrope)}"
+        )
+
+
 class HostTierUnpinned(RuntimeError):
     """A non-blocking copy was asked of a bank that is not page-locked.
 
@@ -244,6 +331,7 @@ class HostKVTier:
             self._check_index(index_slab)
         if self._rope is not None:
             assert rope_slab is not None, "geometry carries rope positions; pass rope_slab"
+            self._check_rope(rope_slab)
 
         slot = self._alloc(key, 1)[0]
         self._k.tensor[slot].copy_(k_slab, non_blocking=non_blocking)
@@ -282,6 +370,7 @@ class HostKVTier:
             self._check_index(index_slab)
         if self._rope is not None:
             assert rope_slab is not None, "geometry carries rope positions; pass rope_slab"
+            self._check_rope(rope_slab)
 
         k_slab.copy_(self._k.tensor[slot], non_blocking=non_blocking)
         v_slab.copy_(self._v.tensor[slot], non_blocking=non_blocking)
@@ -378,6 +467,28 @@ class HostKVTier:
         assert tuple(index_slab.shape) == want, (
             f"index_slab shape {tuple(index_slab.shape)} != {want}"
         )
+        assert index_slab.dtype == g.dtype, (
+            f"index_slab dtype {index_slab.dtype} != {g.dtype} (the shadow slab rides the "
+            "compute dtype; copy_ would cast it silently)"
+        )
+
+    def _check_rope(self, rope_slab: torch.Tensor) -> None:
+        g = self.geometry
+        want = (g.page_size, 3)
+        assert tuple(rope_slab.shape) == want, (
+            f"rope_slab shape {tuple(rope_slab.shape)} != {want}"
+        )
+        assert rope_slab.dtype == torch.int32, (
+            f"rope_slab dtype {rope_slab.dtype} != torch.int32 (copy_ casts silently, and a "
+            "float slab would round the position)"
+        )
 
 
-__all__ = ["HostKVTier", "HostTierUnpinned", "TierGeometry", "TierStats"]
+__all__ = [
+    "HostKVTier",
+    "HostTierUnpinned",
+    "TierGeometry",
+    "TierGeometryMismatch",
+    "TierStats",
+    "check_tier_geometry",
+]

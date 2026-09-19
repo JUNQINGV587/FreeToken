@@ -7,11 +7,19 @@ exercised, not just a contiguous one.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
 from freetoken.kvcache.base import HostTierKeyCollision
-from freetoken.kvcache.host_tier import HostKVTier, HostTierUnpinned, TierGeometry
+from freetoken.kvcache.host_tier import (
+    HostKVTier,
+    HostTierUnpinned,
+    TierGeometry,
+    TierGeometryMismatch,
+    check_tier_geometry,
+)
 
 LAYERS, PAGE, HEADS, DIM = 3, 4, 2, 8
 
@@ -210,3 +218,82 @@ def test_clear_reports_every_resident_key_to_on_drop():
     assert tier.resident_pages == 0
     assert 1 not in tier
     assert not tier.restore(1, *page_views(buf, 0)), "cleared copies are gone, not stale"
+
+
+def test_index_and_rope_slabs_are_validated():
+    """copy_ casts silently, so a wrongly typed shadow or rope slab would be accepted -- and a
+    bf16 index slab read as fp32 changes which QSA blocks a restored prefix selects."""
+    g = geom(index_layers=2, index_head_dim=6, index_ratio=2, rope_pos=True)
+    tier = HostKVTier(g, 1)
+    kv = pool_buffer(1, g)
+    index = torch.zeros(g.index_layers, g.index_rows_per_page, g.index_head_dim, dtype=g.dtype)
+    rope = torch.zeros(g.page_size, 3, dtype=torch.int32)
+
+    with pytest.raises(AssertionError, match="index_slab dtype"):
+        tier.spill(0, *page_views(kv, 0), index_slab=index.float(), rope_slab=rope)
+    with pytest.raises(AssertionError, match="rope_slab dtype"):
+        tier.spill(0, *page_views(kv, 0), index_slab=index, rope_slab=rope.float())
+    with pytest.raises(AssertionError, match="rope_slab shape"):
+        tier.spill(0, *page_views(kv, 0), index_slab=index, rope_slab=rope[:2])
+
+    assert tier.resident_entries == 0
+
+
+@pytest.fixture
+def qsa_pool(monkeypatch):
+    """A real CPU QSA pool: the geometry check reads buffers, so a stub could not catch a
+    wrong buffer layout."""
+    from freetoken.distributed.info import DistributedInfo
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    monkeypatch.setattr(
+        "freetoken.kvcache.mha_pool.get_tp_info", lambda: DistributedInfo(rank=0, size=1)
+    )
+    return QSAKVCache(
+        num_kv_heads=2, num_layers=8, head_dim=64, num_pages=4, page_size=64,
+        dtype=torch.bfloat16, device=torch.device("cpu"), index_head_dim=32,
+        num_index_layers=4, index_ratio=4, num_req_slots=4, layer_ids=(1, 3, 5, 7),
+    )
+
+
+def geometry_of(pool) -> TierGeometry:
+    """What the bridge has to build: the shapes off the pool's own K buffer."""
+    k_buf = pool._k_buffer
+    return TierGeometry(
+        num_layers=int(k_buf.shape[0]),
+        page_size=int(k_buf.shape[2]),
+        num_kv_heads=int(k_buf.shape[3]),
+        head_dim=int(k_buf.shape[4]),
+        dtype=k_buf.dtype,
+        index_layers=pool._num_index_layers,
+        index_head_dim=pool._index_head_dim,
+        index_ratio=pool._index_ratio,
+        rope_pos=False,
+    )
+
+
+def test_geometry_check_passes_for_the_pool_it_describes(qsa_pool):
+    g = geometry_of(qsa_pool)
+
+    check_tier_geometry(g, qsa_pool, page_size=g.page_size)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_layers", 9),
+        ("page_size", 128),
+        ("num_kv_heads", 3),
+        ("head_dim", 128),
+        ("dtype", torch.float16),
+        ("index_layers", 0),      # the silent one: no shadow bank is built at all
+        ("index_head_dim", 64),
+        ("index_ratio", 1),
+        ("rope_pos", True),
+    ],
+)
+def test_geometry_check_rejects_a_mismatched_field(qsa_pool, field, value):
+    g = replace(geometry_of(qsa_pool), **{field: value})
+
+    with pytest.raises(TierGeometryMismatch):
+        check_tier_geometry(g, qsa_pool, page_size=g.page_size)

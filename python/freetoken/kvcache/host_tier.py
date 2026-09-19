@@ -5,7 +5,7 @@ no prefix longer than VRAM allows can ever be reused. This module adds the missi
 behind that call -- a bounded LRU store of evicted pages held in a host bank, written and read
 with plain device<->host copies.
 
-Scope of v0 (the engine-side bridge lives in ``host_tier_bridge``):
+Scope of v0 (callbacks are injected into ``HybridRadixCache``; no engine constructs them yet):
 - Pages are addressed by a caller-supplied opaque key; the tier never interprets it (a pool
   page id is NOT a safe key: the pool hands the id out again as soon as the pages come back).
 - ``spill`` is called BEFORE the pool frees a page, ``restore`` fills a page the caller has
@@ -13,9 +13,11 @@ Scope of v0 (the engine-side bridge lives in ``host_tier_bridge``):
 - An *entry* groups the pages of one unit (one radix node's KV span) under a single key and is
   evicted as a whole: a node whose pages are half in host memory is not a usable prefix, so the
   LRU never has to reason about partial entries.
-- GDN state has no host format (``LinearStatePool`` snapshots are a GPU-only COW pool), so a
-  restored prefix is attention-only as far as this tier is concerned: the caller treats a
-  restored prefix as cold for the recurrent state and recomputes it.
+- This tier carries K/V, the QSA index shadow and mrope positions, and NOTHING else. It has no
+  GDN/PLE state and must not grow one: ``LinearStatePool`` is a GPU-only COW pool, and a hybrid
+  prefix is resumable only through a LIVE snapshot on its node. The caller therefore spills only
+  nodes that still own their snapshot, keeps that snapshot alive for the whole host residency,
+  and resumes a restored prefix FROM the snapshot -- never by recomputing it.
 """
 
 from __future__ import annotations

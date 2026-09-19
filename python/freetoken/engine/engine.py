@@ -699,7 +699,14 @@ class Engine:
         if num_token_override is not None:
             kv_reserve_tokens = num_token_override
         else:
-            kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+            kv_reserve_tokens = max(
+                config.kv_reserve_tokens,
+                min_reserve,
+                # PR #198: the pool always carries one dummy page, so the KV floor must
+                # cover --num-page-override pages even when the caller sets no token override.
+                # getattr: stub configs in tests predate this field.
+                (getattr(config, "num_page_override", 0) or 0) * page_tokens,
+            )
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,

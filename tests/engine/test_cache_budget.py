@@ -125,9 +125,9 @@ def test_resolve_auto_reserves_usable_tokens_beyond_the_dummy_page():
         prefill_overlap=False,
         kv_reserve_tokens=256,
         page_size=64,
-        quant_format="bf16",
     )
     assert overlap is False
+    # The floor is expressed in usable tokens, so page 0 stays reserved on top of it.
     assert (pages - 1) * 64 >= 256
     assert size == 8 and pages == 14
 

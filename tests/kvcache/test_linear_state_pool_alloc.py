@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from freetoken.kvcache import linear_state_pool as ssm_mod
 from freetoken.kvcache.linear_state_pool import (
     LinearStatePool,
     linear_state_bytes_per_req,
@@ -205,3 +206,22 @@ def test_tp2_state_geometry_matches_byte_accounting():
     assert pool.recurrent_states.shape == (2, 5, 2, 16, 16)
     expected = linear_state_bytes_per_req(group, 2, torch.bfloat16)
     assert pool.bytes_per_slot() == expected
+
+
+def test_an_unknown_ssm_state_dtype_is_an_error(monkeypatch):
+    """A typo used to fall back to fp32 with no complaint: the GDN state pool then doubles its
+    footprint, and the only symptom is a KV-fit failure (or an OOM) much later."""
+    monkeypatch.setattr(ssm_mod, "ENV", SimpleNamespace(MAMBA_SSM_DTYPE="bf16"))
+
+    with pytest.raises(ValueError, match="FREETOKEN_MAMBA_SSM_DTYPE"):
+        ssm_mod.ssm_state_dtype()
+
+
+@pytest.mark.parametrize(
+    "declared,expected",
+    [("float32", torch.float32), ("BFloat16", torch.bfloat16), ("float16", torch.float16)],
+)
+def test_a_declared_ssm_state_dtype_is_honoured(monkeypatch, declared, expected):
+    monkeypatch.setattr(ssm_mod, "ENV", SimpleNamespace(MAMBA_SSM_DTYPE=declared))
+
+    assert ssm_mod.ssm_state_dtype() is expected

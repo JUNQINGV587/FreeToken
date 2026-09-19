@@ -16,8 +16,19 @@ _SSM_DTYPES = {
 
 
 def ssm_state_dtype() -> torch.dtype:
-    """Recurrent (SSM) state dtype, from FREETOKEN_MAMBA_SSM_DTYPE (default fp32)."""
-    return _SSM_DTYPES.get(str(ENV.MAMBA_SSM_DTYPE).lower(), torch.float32)
+    """Recurrent (SSM) state dtype, from FREETOKEN_MAMBA_SSM_DTYPE (default fp32).
+
+    An unknown value is an error, not a fallback: silently running fp32 while the operator
+    asked for a narrower state doubles this pool's footprint and only shows up as a KV-fit
+    failure or an OOM much later, with nothing pointing back at the typo.
+    """
+    name = str(ENV.MAMBA_SSM_DTYPE).lower()
+    if name not in _SSM_DTYPES:
+        raise ValueError(
+            f"FREETOKEN_MAMBA_SSM_DTYPE={ENV.MAMBA_SSM_DTYPE!r} is not one of "
+            f"{sorted(_SSM_DTYPES)}"
+        )
+    return _SSM_DTYPES[name]
 
 
 def _linear_local_dims(

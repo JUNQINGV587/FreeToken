@@ -810,9 +810,166 @@ def nvfp4_dense_linear_t(
     )
 
 
+# ======================================================================================
+# BaseOP linear layers (TP=1, replicated). Buffers: uint8 packed ``weight`` + fp8 block
+# ``weight_scale`` + fp16 per-row ``weight_global``.
+# ======================================================================================
+class Nvfp4DenseLinear(BaseOP):
+    """Replicated NVFP4 dense linear (W4A16). Drop-in for ``LinearReplicated`` /
+    ``LinearRowParallel`` at TP=1 on the mixed-precision checkpoint's NVFP4 dense weights.
+
+    Buffers are declared (and loaded) in the checkpoint's row-major layout; at load the
+    packed weight + block scales are repacked to K-major (:func:`nvfp4_transpose_resident`)
+    so the decode kernels' weight loads coalesce along N (~2x batched-decode throughput)."""
+
+    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
+        assert in_features % 16 == 0, f"NVFP4 in_features must be %16, got {in_features}"
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = torch.empty(out_features, in_features // 2, dtype=torch.uint8)
+        self.weight_scale = torch.empty(out_features, in_features // 16, dtype=FP8)
+        self.weight_global = torch.empty(out_features, dtype=torch.float16)
+        self.bias = torch.empty(out_features) if has_bias else None
+        self._transposed = False
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        w = state_dict.pop(_concat_prefix(prefix, "weight"))
+        s = state_dict.pop(_concat_prefix(prefix, "weight_scale"))
+        assert w.shape == self.weight.shape and w.dtype == torch.uint8
+        assert s.shape == self.weight_scale.shape
+        self.weight, self.weight_scale = nvfp4_transpose_resident(w, s)
+        self.weight_global = state_dict.pop(_concat_prefix(prefix, "weight_global"))
+        if self.bias is not None:
+            self.bias = state_dict.pop(_concat_prefix(prefix, "bias"))
+        self._transposed = True
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._transposed:
+            return nvfp4_dense_linear_t(
+                x, self.weight, self.weight_scale, self.weight_global, self.bias
+            )
+        return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global, self.bias)
+
+
+class Nvfp4DenseColMerged(Nvfp4DenseLinear):
+    """Column-merged NVFP4 dense linear (drop-in for ``LinearColParallelMerged`` at TP=1):
+    one packed weight concatenating several projections on the output dim; each part keeps its
+    own per-row ``weight_global`` (and block scales), so the fused weight is exact. The caller
+    splits the output by ``output_sizes`` (e.g. shared-expert gate|up) as before."""
+
+    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
+        self.output_sizes = list(output_sizes)
+        super().__init__(in_features, sum(output_sizes), has_bias)
+
+
+class Nvfp4LMHead(BaseOP):
+    """NVFP4 (W4A16) LM head for the mixed checkpoint (TP=1, untied). Mirrors
+    ``ParallelLMHead.forward`` at TP=1: slice to the last token per sequence at prefill, then
+    the W4A16 GEMV/GEMM instead of a bf16 ``F.linear`` over the (here ~1 GB) bf16 weight."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        assert embedding_dim % 16 == 0
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = torch.empty(num_embeddings, embedding_dim // 2, dtype=torch.uint8)
+        self.weight_scale = torch.empty(num_embeddings, embedding_dim // 16, dtype=FP8)
+        self.weight_global = torch.empty(num_embeddings, dtype=torch.float16)
+        self._transposed = False
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        w = state_dict.pop(_concat_prefix(prefix, "weight"))
+        s = state_dict.pop(_concat_prefix(prefix, "weight_scale"))
+        assert w.shape == self.weight.shape and w.dtype == torch.uint8
+        self.weight, self.weight_scale = nvfp4_transpose_resident(w, s)
+        self.weight_global = state_dict.pop(_concat_prefix(prefix, "weight_global"))
+        self._transposed = True
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        if self._transposed:
+            return nvfp4_dense_linear_t(x, self.weight, self.weight_scale, self.weight_global)
+        return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global)
+
+
+def warmup_nvfp4_dense_decode(model: BaseOP, batch_sizes: list[int]) -> int:
+    """Load dense NVFP4 decode kernels before runtime caches consume remaining VRAM.
+
+    Triton loads a compiled CUDA module on its first launch. On memory-constrained Ada
+    cards, postponing that load until the eager forward immediately before CUDA graph
+    capture can make ``cuModuleLoadData`` take minutes while the GPU reports misleading
+    100% SM utilisation. Run one representative of every distinct resident weight
+    geometry while startup still has its post-weights VRAM headroom.
+    """
+    wanted_m = sorted({m for m in batch_sizes if 0 < m <= _GEMM_MAX_INKERNEL_M})
+    if not wanted_m:
+        return 0
+
+    seen_objects: set[int] = set()
+    representatives: dict[tuple, Nvfp4DenseLinear | Nvfp4LMHead] = {}
+
+    def visit(value) -> None:
+        value_id = id(value)
+        if value_id in seen_objects:
+            return
+        seen_objects.add(value_id)
+        if isinstance(value, (Nvfp4DenseLinear, Nvfp4LMHead)):
+            if not value._transposed:
+                return
+            key = (
+                value.weight.shape,
+                value.weight.stride(),
+                value.weight_scale.shape,
+                value.weight_scale.stride(),
+                value.weight_global.shape,
+                value.weight.dtype,
+                value.weight_scale.dtype,
+            )
+            representatives.setdefault(key, value)
+            return
+        if isinstance(value, BaseOP):
+            for child in value.__dict__.values():
+                visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+        elif isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+
+    visit(model)
+    launched = 0
+    with torch.inference_mode():
+        for op in representatives.values():
+            in_features = op.weight.shape[0] * 8
+            for m in wanted_m:
+                x = torch.zeros((m, in_features), dtype=torch.bfloat16, device=op.weight.device)
+                y = nvfp4_dense_linear_t(
+                    x, op.weight, op.weight_scale, op.weight_global,
+                    getattr(op, "bias", None),
+                )
+                # Compiling is insufficient: Triton's CUDA module is loaded lazily at launch.
+                torch.cuda.synchronize(op.weight.device)
+                del x, y
+                launched += 1
+    return launched
+
+
 __all__ = [
     "FP8",
     "nvfp4_dense_linear",
     "nvfp4_dense_linear_t",
     "nvfp4_transpose_resident",
+    "Nvfp4DenseLinear",
+    "Nvfp4DenseColMerged",
+    "Nvfp4LMHead",
+    "warmup_nvfp4_dense_decode",
 ]

@@ -412,6 +412,8 @@ def resolve_sampling(
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -442,6 +444,8 @@ def resolve_sampling(
         top_k=resolved_top_k,
         top_p=resolved_top_p,
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
     )
 
 

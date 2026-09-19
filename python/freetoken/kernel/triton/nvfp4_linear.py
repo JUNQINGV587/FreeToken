@@ -39,6 +39,8 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from freetoken.layers import BaseOP
+from freetoken.layers.base import _concat_prefix
 
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,

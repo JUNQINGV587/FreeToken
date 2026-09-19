@@ -44,6 +44,13 @@ class RadixTreeNode:
         self.swa_ref_count: int = 0
         self.swa_uuid: int | None = None
 
+        # Host-tier residency (HybridRadixCache + a KV host tier): the tier's key for this
+        # node's KV once its GPU pages have been returned to the pool. ``_value`` is then
+        # EMPTY, so no code path can hand stale page indices back to a pool; the node stays in
+        # the tree so a later match materializes it. None = GPU-resident, which is every node
+        # of every other radix class.
+        self.host_value: Any | None = None
+
         # these fields should be updated later
         self._key: torch.Tensor
         self._value: torch.Tensor
@@ -58,6 +65,13 @@ class RadixTreeNode:
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
         parent.children[self.key_fn(self._key)] = self
+
+    def set_host_resident(self, host_key) -> None:
+        """Mark the node host-resident: its KV now lives in the host tier, so ``_value`` must
+        stop being readable as pool page indices. ``length`` (the token span) is unchanged."""
+        assert len(self._value) == self._length
+        self.host_value = host_key
+        self._value = self._value[:0]
 
     @property
     def length(self) -> int:

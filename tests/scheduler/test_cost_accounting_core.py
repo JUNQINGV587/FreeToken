@@ -25,6 +25,7 @@ from freetoken.message import (
     UserMsg,
     UserReply,
 )
+from freetoken.scheduler.interleave import DecodeInterleavePolicy
 from freetoken.scheduler.io import SchedulerIOMixin
 from freetoken.scheduler.scheduler import Scheduler
 from freetoken.server.api_server import FrontendManager
@@ -94,9 +95,6 @@ def test_schedule_reports_admission_only_after_prepare_succeeds():
     scheduler.prefill_budget = 99
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None, runnable=False)
-    # _schedule_next_batch alternates one decode step per prefill chunk; a stub built with
-    # __new__ has to carry the counter the real __init__ installs.
-    scheduler._prefill_chunks_since_decode = 0
     events = []
 
     def prepare(value):
@@ -121,9 +119,6 @@ def test_prepare_failure_emits_no_prompt_admission():
     scheduler.prefill_budget = 99
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None, runnable=False)
-    # _schedule_next_batch alternates one decode step per prefill chunk; a stub built with
-    # __new__ has to carry the counter the real __init__ installs.
-    scheduler._prefill_chunks_since_decode = 0
     sent = []
 
     def fail_prepare(_batch):
@@ -333,7 +328,7 @@ def test_a_long_prefill_does_not_starve_an_active_decode():
     scheduler.decode_manager = SimpleNamespace(
         schedule_next_batch=lambda: served.append("decode") or decode_batch, runnable=True
     )
-    scheduler._prefill_chunks_since_decode = 0
+    scheduler._interleave = DecodeInterleavePolicy(1)
     scheduler._prepare_batch = lambda batch: batch
     scheduler._report_prompt_admissions = lambda batch: None
 
@@ -352,10 +347,10 @@ def test_without_a_runnable_decode_the_prefill_order_is_unchanged():
     scheduler.prefill_manager = SimpleNamespace(
         schedule_next_batch=lambda budget: served.append("prefill") or prefill_batch, runnable=True
     )
-    scheduler.decode_manager = SimpleNamespace(
-        schedule_next_batch=lambda: served.append("decode") or None, runnable=False
-    )
-    scheduler._prefill_chunks_since_decode = 0
+    # A decode that is not runnable returns None; the policy then falls through to prefill
+    # instead of spending the slot idle (upstream calls schedule_next_batch, not runnable).
+    scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None, runnable=False)
+    scheduler._interleave = DecodeInterleavePolicy(1)
     scheduler._prepare_batch = lambda batch: batch
     scheduler._report_prompt_admissions = lambda batch: None
 

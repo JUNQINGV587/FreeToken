@@ -1063,7 +1063,7 @@ def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
                 req.cached_len + req.mrope_delta,
                 req.device_len + req.mrope_delta,
                 dtype=torch.int32,
-            )
+            )  # device-audit: ok - staged into a pinned host row below, then moved to the device
             out.copy_(row.unsqueeze(0).expand(3, -1))
         offset += length
     return host.to(device, non_blocking=True)

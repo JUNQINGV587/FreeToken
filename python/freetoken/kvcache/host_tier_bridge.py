@@ -144,7 +144,12 @@ class PoolHostBridge:
                 f"tier geometry index_layers={self.index_layers} but "
                 f"{type(pool).__name__} keeps no compressed index slab"
             )
-        if self.rope_pos and getattr(pool, "rope_positions", None) is None:
+        try:
+            # A pool that keeps no rope bank signals absence by asserting in the property.
+            rope_rows = getattr(pool, "rope_positions", None)
+        except AssertionError:
+            rope_rows = None
+        if self.rope_pos and rope_rows is None:
             raise TierGeometryMismatch(
                 f"tier geometry rope_pos={self.rope_pos} but {type(pool).__name__} keeps "
                 "no per-token rope positions"
@@ -302,9 +307,13 @@ class PoolHostBridge:
                 self._scatter_index(page, self.tier.index_page(slots[i]))
             if self.rope_pos:
                 self._rope_rows(page).copy_(self.tier.rope_page(slots[i]))
-        self.tier.drop(key)
-        # Same layout as node.value: each token names its page by the page's first slot id.
-        return (fresh.to(torch.int32) * self.page_size).repeat_interleave(self.page_size), _OK
+        self.tier.release(key)
+        # The per-token form the pool itself writes into a page table (`_page_to_token`): page-start
+        # slot id plus the token's offset. Repeating the page start instead left a materialized
+        # node's value as the only one in the tree that a token-indexed reader would mis-read.
+        starts = fresh.to(torch.int32) * self.page_size
+        offsets = torch.arange(self.page_size, dtype=torch.int32)
+        return (starts.unsqueeze(1) + offsets).flatten(), _OK
 
     def forget(self, key: Hashable) -> bool:
         """Release an entry nobody will restore (the cache freed its node).

@@ -6,6 +6,7 @@ plus the compressed index slab and the per-token rope positions that a restore h
 """
 from __future__ import annotations
 
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -33,18 +34,20 @@ ROWS_PER_PAGE = PAGE // RATIO
 class FakeQSAPool:
     """``QSAKVCache``'s slab layouts, with the same accessors the bridge uses."""
 
-    def __init__(self, *, index_layers: int = LAYERS, mrope: bool = True) -> None:
-        self._kv_buffer = torch.zeros(2, LAYERS, PAGES, PAGE, HEADS, DIM, dtype=torch.float16)
+    def __init__(self, *, index_layers: int = LAYERS, mrope: bool = True,
+                 pages: int = PAGES) -> None:
+        self._pages = pages
+        self._kv_buffer = torch.zeros(2, LAYERS, pages, PAGE, HEADS, DIM, dtype=torch.float16)
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._num_index_layers = index_layers
         self._index_head_dim = INDEX_DIM
         self._index_ratio = RATIO
         self._mrope = mrope
-        rows = PAGES * ROWS_PER_PAGE
+        rows = pages * ROWS_PER_PAGE
         self._cmp_k_buffer = torch.zeros(index_layers, rows + 2, INDEX_DIM, dtype=torch.float16)
         self._pending_ring = torch.zeros(2, index_layers, RATIO, INDEX_DIM, dtype=torch.float16)
-        self._rope_positions = torch.zeros(PAGES * PAGE, 3, dtype=torch.int32)
+        self._rope_positions = torch.zeros(pages * PAGE, 3, dtype=torch.int32)
 
     @property
     def num_storage_layers(self) -> int:
@@ -56,7 +59,7 @@ class FakeQSAPool:
 
     @property
     def cmp_scratch_base(self) -> int:
-        return PAGES * ROWS_PER_PAGE
+        return self._pages * ROWS_PER_PAGE
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         return self._cmp_k_buffer[slot]
@@ -81,7 +84,8 @@ class Node:
     def __init__(self, uuid: str, length: int, first_page: int) -> None:
         self.uuid = uuid
         self.length = length
-        self.value = (torch.arange(length, dtype=torch.int32) // PAGE + first_page) * PAGE
+        # Per token, like the pool writes it (`_page_to_token`): the span is contiguous pages.
+        self.value = torch.arange(first_page * PAGE, first_page * PAGE + length, dtype=torch.int32)
 
 
 class Alloc:
@@ -100,15 +104,26 @@ class Alloc:
 
 
 def fill_page(pool: FakeQSAPool, page: int, seed: int) -> None:
-    """Distinct, exactly representable payload per page, in all three slabs."""
+    """Distinct payload per page *and per row*, in all three slabs, exactly representable.
+
+    Row-constant fillers (``fill_(seed)``) cannot see a row swap inside a page: every row holds
+    the same bytes, so a transposition of the index or V rows is invisible -- a probe that flips
+    them survived this whole file. The base stays under 512 because fp16 is only exact to 2048.
+    """
+    base = seed % 512
+    rows = torch.arange(PAGE, dtype=torch.float16).view(1, -1, 1, 1)
+    layers = torch.arange(LAYERS, dtype=torch.float16).view(-1, 1, 1, 1)
     kv = pool.page_kv_view(page)
-    kv[0].fill_(seed)
-    kv[1].fill_(-seed)
+    # distinct in layer AND row: a filler constant along either axis makes a swap on that axis
+    # invisible, which is how a layer flip on restore survived this file the first time.
+    kv[0].copy_(base + 7 * layers + rows)
+    kv[1].copy_(base - 7 * layers - rows)
     for layer in range(pool._num_index_layers):
         r0 = page * ROWS_PER_PAGE
-        pool.cmp_k_cache(layer)[r0:r0 + ROWS_PER_PAGE].fill_(seed * 10 + layer)
+        idx = torch.arange(ROWS_PER_PAGE, dtype=torch.float16).view(-1, 1)
+        pool.cmp_k_cache(layer)[r0:r0 + ROWS_PER_PAGE].copy_(base + 100 * layer + idx)
     pool.rope_positions[page * PAGE:(page + 1) * PAGE] = torch.tensor(
-        [[seed, page, layer] for layer in range(PAGE)], dtype=torch.int32
+        [[seed, page, row] for row in range(PAGE)], dtype=torch.int32
     )
 
 
@@ -146,7 +161,8 @@ def test_round_trip_into_fresh_pages_is_bit_exact_in_all_three_slabs():
     value = br.materialize(node, key)
 
     assert value is not None
-    assert [int(v) for v in value] == [5 * PAGE] * PAGE + [6 * PAGE] * PAGE + [7 * PAGE] * PAGE
+    per_token = [p * PAGE + offset for p in (5, 6, 7) for offset in range(PAGE)]
+    assert [int(v) for v in value] == per_token, "the value must be in the pool's per-token form"
     assert tier.entry_slots(key) is None, "the entry is released once the KV is back on the device"
     for fresh, src in zip((5, 6, 7), (1, 2, 3)):
         got = snapshot(pool, fresh)
@@ -166,9 +182,10 @@ def test_a_slot_id_is_never_read_as_a_page_number():
 
     assert key is not None
     tier_k = tier.k_page(tier.entry_slots(key)[0])
-    assert torch.equal(tier_k, pool.page_kv_view(0)[0].new_full(tier_k.shape, 10)), (
+    assert torch.equal(tier_k, pool.page_kv_view(3)[0]), (
         "spilled page 3 (seed 10); page 12 does not exist and would have raised"
     )
+    assert not torch.equal(tier_k, pool.page_kv_view(0)[0]), "the case needs pages to differ"
 
 
 def test_the_index_shadow_and_rope_land_on_the_fresh_page_rows():
@@ -237,6 +254,18 @@ def test_a_pool_without_the_rope_bank_is_refused_at_construction():
 
     with pytest.raises(TierGeometryMismatch):
         PoolHostBridge(pool, HostKVTier(geom(), 2), PAGE, alloc_pages=Alloc())
+
+
+def test_a_pool_that_asserts_its_rope_bank_is_absent_is_refused_not_fatal():
+    """The property raises instead of returning None on a pool without the bank. Refusing to
+    build an optional hit-rate tier must never take the engine down (maybe_build_bridge)."""
+    class AssertsAbsence(FakeQSAPool):
+        @property
+        def rope_positions(self):
+            raise AssertionError("rope positions are only kept on mrope models")
+
+    assert maybe_build_bridge(AssertsAbsence(), PAGE, alloc_pages=Alloc(),
+                              env={HOST_TIER_PAGES_ENV: "2"}) is None
 
 
 def test_an_index_layers_mismatch_is_refused_at_construction():
@@ -483,3 +512,157 @@ def test_dropping_and_clearing_release_pages_the_ledger_accounts_for():
     assert cleared["dropped"] == 2, "clearing releases a page too"
     assert cleared["dropped_bytes"] == 2 * tier.bytes_per_page
     assert cleared["resident_entries"] == 0 and cleared["resident_pages"] == 0
+
+
+def test_a_successful_restore_is_not_a_drop():
+    """The bridge releases the entry once its bytes are back on the device. Those pages were
+    used, not thrown away -- letting a restore count as a drop makes the ledger unusable for
+    telling evictions apart from restores, which is the one thing it is read for."""
+    pool = FakeQSAPool()
+    fill_page(pool, 0, seed=2)
+    br, tier = bridge(pool, alloc=Alloc(6, 7))
+    node = Node("n10", 2 * PAGE, first_page=0)
+
+    key = br.spill(node)
+    assert br.materialize(node, key) is not None
+
+    snap = tier.stats_snapshot()
+    assert (snap["restores"], snap["hits"]) == (1, 1)
+    assert snap["dropped"] == 0 and snap["dropped_bytes"] == 0, "a restore is not a drop"
+    assert snap["resident_entries"] == 0 and snap["resident_pages"] == 0
+
+
+class RecyclingAlloc:
+    """Hands out pages and takes them back, so a restore can land on a page that still holds
+    the previous tenant's bytes -- the state a real pool is in after an eviction."""
+
+    def __init__(self, *pages: int) -> None:
+        self.free = list(pages)
+        self.calls: list[int] = []
+
+    def __call__(self, n: int) -> torch.Tensor:
+        self.calls.append(n)
+        if len(self.free) < n:
+            return torch.empty(0, dtype=torch.int32)
+        return torch.tensor([self.free.pop(0) for _ in range(n)], dtype=torch.int32)
+
+    def release(self, pages) -> None:
+        self.free[:0] = [int(p) for p in pages]      # LIFO: the next restore reuses them
+
+
+def test_a_restore_into_a_reused_page_rewrites_every_slab():
+    """The target page still holds its previous tenant, so a slab the restore leaves alone is
+    visible -- against a zeroed target, a full-page zero fill looks exactly like a slab the
+    restore forgot to write."""
+    pool = FakeQSAPool(pages=12)
+    alloc = RecyclingAlloc(8, 9)
+    br, _ = bridge(pool, alloc=alloc)
+    fill_page(pool, 0, seed=5)
+    fill_page(pool, 1, seed=9)
+    source = {0: snapshot(pool, 0), 1: snapshot(pool, 1)}
+    first, second = Node("d1", PAGE, first_page=0), Node("d2", PAGE, first_page=1)
+
+    landed = br.materialize(first, br.spill(first))
+    target = int(landed[0]) // PAGE
+    alloc.release([target])                          # the device frees the page again
+
+    value = br.materialize(second, br.spill(second))
+
+    assert int(value[0]) // PAGE == target, "the case needs the same page reused"
+    for got, want in zip(snapshot(pool, target), source[1]):
+        assert torch.equal(got, want), "the reused page kept the first tenant's bytes"
+    for got, want in zip(snapshot(pool, 0), source[0]):
+        assert torch.equal(got, want), "spilling must not disturb the source page"
+
+
+def test_a_random_op_sequence_keeps_the_ledger_and_the_bytes_honest():
+    """A deterministic random walk over spill, restore, miss and forget.
+
+    The cases above each pin one path; here they interleave, so a slot handed out twice, a
+    counter that drifts by one, or a restore that lands on the wrong page shows up as a
+    mismatch against a model of what should have happened. The seed is fixed and the op log
+    is in every failure message, so a failure is reproducible.
+    """
+    rng = random.Random(20260920)
+    SOURCES, TARGETS = 16, 12
+    pool = FakeQSAPool(pages=SOURCES + TARGETS)
+    alloc = RecyclingAlloc(*range(SOURCES, SOURCES + TARGETS))
+    tier = HostKVTier(geom(), 10)
+    br = PoolHostBridge(pool, tier, PAGE, alloc_pages=alloc)
+
+    live: dict[str, tuple[int, ...]] = {}    # key -> source pages resident on the host now
+    payload: dict[str, list] = {}            # key -> its three slabs as they were spilled
+    nodes: dict[str, Node] = {}
+    want = dict(spills=0, restores=0, hits=0, misses=0, refusals=0, dropped=0, alloc_starved=0)
+    log: list[str] = []
+    serial = 0
+
+    def check(where: str) -> None:
+        snap = tier.stats_snapshot()
+        for field, expected in want.items():
+            assert snap[field] == expected, f"{where}: {field}={snap[field]} != {expected}\n{log}"
+        assert snap["resident_entries"] == len(live), f"{where}\n{log}"
+        assert snap["resident_pages"] == sum(len(p) for p in live.values()), f"{where}\n{log}"
+        for key, pages in live.items():
+            slots = tier.entry_slots(key)
+            assert slots is not None and len(slots) == len(pages), f"{where}\n{log}"
+
+    for _ in range(120):
+        roll = rng.random()
+        if roll < 0.45 or not live:
+            n_pages = rng.choice((1, 2, 3))
+            if sum(len(p) for p in live.values()) + n_pages > 9:
+                continue                                 # stay clear of the LRU path
+            first = rng.randrange(SOURCES - n_pages + 1)
+            pages = tuple(range(first, first + n_pages))
+            for page in pages:
+                fill_page(pool, page, seed=1000 + 7 * serial + page)
+            key = f"r{serial}"
+            serial += 1
+            node = Node(key, n_pages * PAGE, first_page=first)
+            log.append(f"spill {key} pages={pages}")
+
+            tier_key = br.spill(node)
+            assert tier_key is not None, f"a fresh key is never refused\n{log}"
+            nodes[tier_key] = node
+            live[tier_key] = pages
+            payload[tier_key] = [snapshot(pool, page) for page in pages]
+            want["spills"] += 1
+            for page in pages:                           # the cache frees the span once banked
+                pool.page_kv_view(page).zero_()
+                for layer in range(LAYERS):
+                    rows = slice(page * ROWS_PER_PAGE, (page + 1) * ROWS_PER_PAGE)
+                    pool.cmp_k_cache(layer)[rows].zero_()
+                pool.rope_positions[page * PAGE:(page + 1) * PAGE].zero_()
+        elif roll < 0.70:
+            key = rng.choice(sorted(live))
+            pages = live.pop(key)
+            log.append(f"restore {key}")
+            value = br.materialize(nodes[key], key)
+
+            assert value is not None, f"a resident entry must restore\n{log}"
+            targets = [int(v) // PAGE for v in value[::PAGE]]
+            assert len(targets) == len(pages), f"{log}"
+            for target, spilled in zip(targets, payload.pop(key)):
+                for got, want_slab in zip(snapshot(pool, target), spilled):
+                    assert torch.equal(got, want_slab), f"{key} -> page {target}\n{log}"
+            alloc.release(targets)
+            want["restores"] += 1
+            want["hits"] += 1
+        elif roll < 0.80:
+            key = rng.choice(sorted(live))
+            log.append(f"forget {key}")
+            assert br.forget(key) is True
+            want["dropped"] += len(live.pop(key))
+            payload.pop(key)
+        elif roll < 0.90:
+            log.append("miss: restore a key that was never spilled")
+            assert br.materialize(Node("ghost", PAGE, first_page=0), "ghost") is None
+            want["misses"] += 1
+        else:
+            log.append("forget a key that was never spilled")
+            assert br.forget("never-spilled") is False
+        check(f"step {len(log)}")
+
+    # The walk must actually have exercised the paths it models, not just walked in circles.
+    assert want["spills"] > 20 and want["restores"] > 10 and want["dropped"] > 0

@@ -261,8 +261,13 @@ class HostKVTier:
     ) -> None:
         assert num_pages > 0, "a host tier needs at least one page of capacity"
         if geometry.index_layers:
-            # the shadow slab rides the compute dtype, same 2-byte constraint as QSAKVCache
-            assert geometry.dtype.itemsize == 2, "the QSA index shadow is a 2-byte slab"
+            # The shadow slab rides the compute dtype, same 2-byte constraint as QSAKVCache.
+            # Raised as a geometry refusal, not asserted: an optional tier must be declined
+            # rather than fatal, and maybe_build_bridge catches this one.
+            if geometry.dtype.itemsize != 2:
+                raise TierGeometryMismatch(
+                    f"the QSA index shadow is a 2-byte slab, got {geometry.dtype}"
+                )
         self.geometry = geometry
         self.num_pages = num_pages
         self.on_drop = on_drop
@@ -466,15 +471,27 @@ class HostKVTier:
         self.stats.hits += 1
         return True
 
-    def drop(self, key: Hashable) -> bool:
-        """Release an entry's slots without restoring it (the caller freed the prefix)."""
+    def release(self, key: Hashable) -> int:
+        """Free an entry's slots after its bytes were restored elsewhere; count no drop.
+
+        A consuming restore releases the entry, but those pages were used, not thrown away --
+        counting them as dropped buries the LRU evictions the ledger exists to show.
+        Returns the number of pages freed, or 0 when the key was not resident.
+        """
         slots = self._slots.pop(key, None)
         if slots is None:
-            return False
+            return 0
         self._lru.pop(key, None)
         self._free.extend(slots)
-        self.stats.dropped += len(slots)
-        self.stats.dropped_bytes += self.bytes_per_page * len(slots)
+        return len(slots)
+
+    def drop(self, key: Hashable) -> bool:
+        """Release an entry's slots without restoring it (the caller freed the prefix)."""
+        pages = self.release(key)
+        if not pages:
+            return False
+        self.stats.dropped += pages
+        self.stats.dropped_bytes += self.bytes_per_page * pages
         return True
 
     def clear(self) -> None:

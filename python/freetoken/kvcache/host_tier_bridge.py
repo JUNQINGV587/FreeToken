@@ -32,11 +32,74 @@ past the paged region are per-forward scratch, not per-page state.
 
 from __future__ import annotations
 
-from typing import Callable, Hashable
+import os
+from typing import Callable, Hashable, Mapping
 
 import torch
 
-from .host_tier import HostKVTier, TierGeometryMismatch, check_tier_geometry
+from freetoken.utils import init_logger
+
+from .host_tier import (
+    HostKVTier,
+    TierGeometryMismatch,
+    check_tier_geometry,
+    geometry_from_pool,
+)
+
+logger = init_logger(__name__)
+
+# Host RAM the tier may hold, as a page count. Unset or 0 keeps the tier off, which is the
+# default: spilling a prefix to host memory changes what a request reads, so it is turned on
+# deliberately and per deployment, not by a code path that a model shape happens to reach.
+HOST_TIER_PAGES_ENV = "FREETOKEN_KV_HOST_TIER_PAGES"
+
+
+def host_tier_pages_from_env(env: Mapping[str, str] | None = None) -> int:
+    """Capacity in pages from ``FREETOKEN_KV_HOST_TIER_PAGES``; 0 means "no host tier"."""
+    raw = (os.environ if env is None else env).get(HOST_TIER_PAGES_ENV)
+    if raw is None or not str(raw).strip():
+        return 0
+    try:
+        pages = int(str(raw).strip())
+    except ValueError:
+        logger.warning("%s=%r is not a page count; the KV host tier stays off",
+                       HOST_TIER_PAGES_ENV, raw)
+        return 0
+    return pages if pages > 0 else 0
+
+
+def maybe_build_bridge(
+    pool,
+    page_size: int,
+    *,
+    alloc_pages: Callable[[int], torch.Tensor],
+    on_drop: Callable[[Hashable], None] | None = None,
+    key_prefix: str = "kv",
+    backing: str = "mmap",
+    env: Mapping[str, str] | None = None,
+) -> tuple[HostKVTier, "PoolHostBridge"] | None:
+    """Build the host tier + bridge for ``pool``, or None when it is off or cannot carry it.
+
+    None is the whole contract for the caller: with no tier the prefix cache evicts exactly as it
+    did before. A pool whose slabs the tier cannot describe (a non-paged pool, a shadow bank the
+    geometry misses) disables the tier with a warning rather than failing the engine -- the
+    operator asked for host KV, not for a startup abort.
+    """
+    pages = host_tier_pages_from_env(env)
+    if pages <= 0:
+        return None
+    try:
+        geometry = geometry_from_pool(pool, page_size)
+        tier = HostKVTier(geometry, pages, backing=backing, on_drop=on_drop)
+        bridge = PoolHostBridge(pool, tier, page_size, alloc_pages=alloc_pages,
+                                key_prefix=key_prefix)
+    except TierGeometryMismatch as exc:
+        logger.warning("KV host tier stays off: %s", exc)
+        return None
+    logger.info("KV host tier: %d pages (%.2f GiB) behind %s",
+                pages, tier.capacity_bytes / (1 << 30), type(pool).__name__)
+    return tier, bridge
+
 
 
 class PoolHostBridge:
@@ -201,4 +264,4 @@ class PoolHostBridge:
         return self.tier.drop(key)
 
 
-__all__ = ["PoolHostBridge"]
+__all__ = ["HOST_TIER_PAGES_ENV", "PoolHostBridge", "host_tier_pages_from_env", "maybe_build_bridge"]

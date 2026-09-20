@@ -6,11 +6,18 @@ plus the compressed index slab and the per-token rope positions that a restore h
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from freetoken.kvcache.host_tier import HostKVTier, TierGeometry, TierGeometryMismatch
-from freetoken.kvcache.host_tier_bridge import PoolHostBridge
+from freetoken.kvcache.host_tier_bridge import (
+    HOST_TIER_PAGES_ENV,
+    PoolHostBridge,
+    host_tier_pages_from_env,
+    maybe_build_bridge,
+)
 
 LAYERS, PAGE, HEADS, DIM = 2, 4, 1, 6
 INDEX_DIM, RATIO, PAGES = 5, 2, 8
@@ -243,3 +250,64 @@ def test_forget_releases_the_entry():
     assert br.forget(key) is True
     assert br.forget(key) is False
     assert tier.resident_entries == 0
+
+
+# ---------------------------------------------------------------- opt-in wiring
+
+def test_the_tier_is_off_unless_the_deployment_asks_for_it():
+    pool = FakeQSAPool()
+
+    assert host_tier_pages_from_env({}) == 0
+    assert host_tier_pages_from_env({HOST_TIER_PAGES_ENV: ""}) == 0
+    assert host_tier_pages_from_env({HOST_TIER_PAGES_ENV: "0"}) == 0
+    assert host_tier_pages_from_env({HOST_TIER_PAGES_ENV: "-4"}) == 0
+    assert host_tier_pages_from_env({HOST_TIER_PAGES_ENV: "eight"}) == 0
+    assert host_tier_pages_from_env({HOST_TIER_PAGES_ENV: " 12 "}) == 12
+    assert maybe_build_bridge(pool, PAGE, alloc_pages=Alloc(), env={}) is None
+    assert maybe_build_bridge(pool, PAGE, alloc_pages=Alloc(),
+                              env={HOST_TIER_PAGES_ENV: "0"}) is None
+
+
+def test_asking_for_it_builds_a_tier_sized_by_the_variable():
+    pool = FakeQSAPool()
+
+    built = maybe_build_bridge(pool, PAGE, alloc_pages=Alloc(),
+                               env={HOST_TIER_PAGES_ENV: "6"})
+
+    assert built is not None
+    tier, br = built
+    assert tier.num_pages == 6
+    assert tier.geometry.index_layers == LAYERS and tier.geometry.rope_pos is True
+    assert br.num_pages == PAGES
+    node = Node("w1", PAGE, first_page=2)
+    assert br.spill(node) is not None
+
+
+def test_a_pool_the_geometry_cannot_describe_disables_the_tier_instead_of_raising():
+    pool = FakeQSAPool(mrope=False)      # geometry_from_pool would say rope_pos=False...
+    pool._rope_positions = None          # ...and its rope slab is gone anyway
+
+    built = maybe_build_bridge(pool, PAGE, alloc_pages=Alloc(),
+                               env={HOST_TIER_PAGES_ENV: "4"})
+
+    assert built is not None, "a pool with no rope bank is still carriable"
+    assert built[0].geometry.rope_pos is (pool._mrope is True)
+    assert maybe_build_bridge(object(), PAGE, alloc_pages=Alloc(),
+                              env={HOST_TIER_PAGES_ENV: "4"}) is None
+
+
+def test_the_manager_allocator_hands_out_page_indices_and_never_evicts():
+    from freetoken.scheduler.cache import CacheManager
+
+    fake = SimpleNamespace(
+        free_slots=torch.tensor([0, PAGE, 2 * PAGE, 3 * PAGE], dtype=torch.int32),
+        page_size=PAGE, device=torch.device("cpu"),
+    )
+
+    got = CacheManager._host_alloc_pages(fake, 2)
+
+    assert [int(v) for v in got] == [0, 1], "page indices, not slot ids"
+    assert [int(v) for v in fake.free_slots] == [2 * PAGE, 3 * PAGE]
+    short = CacheManager._host_alloc_pages(fake, 3)
+    assert short.numel() == 0, "a short free list is a refusal, not an eviction"
+    assert [int(v) for v in fake.free_slots] == [2 * PAGE, 3 * PAGE], "nothing consumed"

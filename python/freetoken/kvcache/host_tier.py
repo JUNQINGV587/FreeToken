@@ -100,6 +100,45 @@ def _pool_slab_shape(pool) -> tuple[int, int, int, int, torch.dtype]:
     )
 
 
+def geometry_from_pool(pool, page_size: int) -> TierGeometry:
+    """Read the tier geometry off the pool it will move pages for.
+
+    The pool's own buffers are the authority: a geometry re-derived from the config would still
+    describe a pool whose index slab was built for another model, which is the mismatch
+    :func:`check_tier_geometry` exists to catch. Callers pair the two -- derive here, check
+    against the pool -- so a pool whose K/V slab and shadow banks disagree still fails loudly.
+    """
+    layers, pool_page_size, kv_heads, head_dim, dtype = _pool_slab_shape(pool)
+
+    def _first(*names, default=None):
+        for name in names:
+            value = getattr(pool, name, None)
+            if value is not None:
+                return value
+        return default
+
+    index_layers = _first("num_index_layers", "_num_index_layers", default=0)
+    cmp_buf = _first("cmp_k_buffer", "_cmp_k_buffer")
+    if cmp_buf is not None:
+        index_layers = max(int(index_layers or 0), int(cmp_buf.shape[0]))
+    if page_size != pool_page_size:
+        raise TierGeometryMismatch(
+            f"tier page_size={page_size} does not match the pool's {pool_page_size}"
+        )
+    mrope = _first("mrope", "_mrope", default=False)
+    return TierGeometry(
+        num_layers=layers,
+        page_size=page_size,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        index_layers=int(index_layers or 0),
+        index_head_dim=int(_first("index_head_dim", "_index_head_dim", default=0) or 0),
+        index_ratio=int(_first("index_ratio", "_index_ratio", default=1) or 1),
+        rope_pos=bool(mrope),
+    )
+
+
 def check_tier_geometry(geometry: TierGeometry, pool, *, page_size: int) -> None:
     """Cross-check ``geometry`` against the pool it will move pages for. Raises
     :class:`TierGeometryMismatch`.

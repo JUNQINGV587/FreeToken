@@ -53,12 +53,28 @@ class CacheManager:
         # Owned-pool capability pickup is a PROPERTY (below), not a snapshot taken here.
         # This used to read `getattr(swa_pool, "prefill_chunk_budget", None)` into an
         # instance attribute, which froze the cap at its construction-time value.
-        self.prefix_cache = self._make_prefix_cache(device, page_size, type)
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        # Opt-in host KV tier (FREETOKEN_KV_HOST_TIER_PAGES): with the variable unset this stays
+        # None and every path below is byte-for-byte the old one. When it is set, the hybrid tree
+        # gains a third node state -- host-resident -- so a spilled prefix keeps its pages off the
+        # device instead of being dropped.
+        self._host_tier = None
+        self._host_bridge = None
+        if self.is_hybrid and swa_pool is not None:
+            from freetoken.kvcache.host_tier_bridge import maybe_build_bridge
+            built = maybe_build_bridge(
+                swa_pool, page_size,
+                alloc_pages=self._host_alloc_pages,
+                on_drop=self._host_tier_dropped,
+            )
+            if built is not None:
+                self._host_tier, self._host_bridge = built
+        # Built after the host tier: the hybrid tree takes the bridge's callbacks.
+        self.prefix_cache = self._make_prefix_cache(device, page_size, type)
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -109,11 +125,34 @@ class CacheManager:
     def _make_prefix_cache(self, device, page_size, type):
         if type == "hybrid_radix":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
-            return HybridRadixCache(device, page_size)
+            bridge = self._host_bridge
+            return HybridRadixCache(
+                device, page_size,
+                host_spill=None if bridge is None else bridge.spill,
+                host_materialize=None if bridge is None else bridge.materialize,
+            )
         if type == "swa_radix":
             from freetoken.kvcache.swa_radix_cache import SWARadixCache
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
+
+    def _host_alloc_pages(self, n: int) -> torch.Tensor:
+        """Hand the bridge ``n`` free pages, or an empty tensor to make it give up.
+
+        Deliberately a free-list read and never ``_allocate``: that one evicts, and evicting from
+        inside a materialize would re-enter the cache whose walk asked for the pages.
+        """
+        if n > len(self.free_slots):
+            return torch.empty(0, dtype=torch.int32, device=self.device)
+        took, self.free_slots = self.free_slots[:n], self.free_slots[n:]
+        return (took // self.page_size).to(torch.int32)
+
+    def _host_tier_dropped(self, key) -> None:
+        """The tier's LRU dropped an entry: unlink the node that was pointing at it."""
+        cache = getattr(self, "prefix_cache", None)
+        if cache is not None and hasattr(cache, "host_drop"):
+            cache.host_drop(key)
+
 
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
@@ -587,6 +626,11 @@ class CacheManager:
         self.num_pages = num_pages
         self.page_table = page_table
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
+        if self._host_tier is not None:
+            # Before the new tree replaces the old one: the host tier's entries describe nodes of
+            # the tree being discarded, so it must not outlive them. clear() reports every key to
+            # on_drop, which still resolves to the OLD cache here and unlinks those nodes.
+            self._host_tier.clear()
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).

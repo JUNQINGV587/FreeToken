@@ -253,3 +253,48 @@ def test_node_value_holds_pool_slot_ids_not_page_numbers():
     assert int(node.value[0]) != 2, "value[0] is a slot id, never a page number"
     # The conversion every consumer needs (the read side does the same: fa.py, qsa_sparse.py).
     assert [int(v) // PAGE for v in node.value[::PAGE]] == [2, 3, 4, 5]
+
+
+def test_a_refused_materialize_retires_the_node_instead_of_stranding_it(monkeypatch):
+    """A tier that cannot serve a page must leave no trace in the tree: the walk returns the
+    node's PARENT, so a node still marked host-resident would keep the tier key while a later
+    insert took the same key_fn slot -- and the next host_drop would then unlink the live node
+    through the stale parent."""
+    cache, tier = make_cache()
+    cache.insert(tokens(8), pages(8), mamba_value=1)
+    cache.evict_full(8)
+    stale_key = tier.spilled[-1]
+    assert cache.host_resident_size == 8 and len(cache._host_nodes) == 1
+
+    monkeypatch.setattr(cache, "_materialize", lambda node: False)   # the tier says no
+
+    assert cache.match_prefix(tokens(8)).cached_len == 0
+    assert cache.host_resident_size == 0, "no bytes claimed that the tier cannot serve"
+    assert cache._host_nodes == {}, "and no tier key left pointing at a dropped entry"
+
+    cache.insert(tokens(8), pages(8), mamba_value=2)   # same span, fresh node
+    assert len(cache.root.children) == 1
+    live = next(iter(cache.root.children.values()))
+    assert cache.host_drop(stale_key) is None, "the stale key names nothing now"
+    assert next(iter(cache.root.children.values())) is live, "the live node survived"
+    cache.check_integrity()
+
+
+def test_what_a_refused_materialize_frees_is_handed_to_the_owner(monkeypatch):
+    cache, tier = make_cache()
+    cache.insert(tokens(8), pages(8), mamba_value=1)
+    cache.insert(tokens(16), pages(16), mamba_value=2)
+    assert [int(v) for v in cache.evict_mamba(1).mamba_slots] == [1]
+    cache.evict_full(16)                    # the child leaf spills; the parent is a tombstone
+    assert cache.host_resident_size == 8 and len(cache._host_nodes) == 1
+    monkeypatch.setattr(cache, "_materialize", lambda node: False)
+
+    assert cache.drain_host_frees() is None, "nothing pending yet"
+    # The full span is what walks THROUGH the host-resident child; a shorter one stops at the
+    # tombstone parent, which can be matched only up to a resumable snapshot.
+    assert cache.match_prefix(tokens(16)).cached_len == 0
+    freed = cache.drain_host_frees()
+    assert freed is not None, "the walk has no return value, so it parks what it reclaimed"
+    assert freed.mamba_slots == [2], "the node's own snapshot slot"
+    assert [int(v) for v in freed.kv_indices] == [0, 0, 2, 2, 4, 4, 6, 6], "the tombstone's pages"
+    assert cache.drain_host_frees() is None, "drain is not a tap"

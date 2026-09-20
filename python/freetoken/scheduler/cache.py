@@ -206,7 +206,21 @@ class CacheManager:
             if ev.kv_indices.numel():
                 self._free(ev.kv_indices)
 
+    def _drain_host_frees(self) -> None:
+        """The match path reclaims host-resident nodes a tier will not serve again, and has no
+        return value to carry what the unlink frees. Take it back here, before any pool check."""
+        cache = getattr(self, "prefix_cache", None)
+        if cache is None or not hasattr(cache, "drain_host_frees"):
+            return
+        freed = cache.drain_host_frees()
+        if freed is None:
+            return
+        self._free(freed.kv_indices)
+        if freed.mamba_slots:
+            self.linear_state_pool.free(freed.mamba_slots)
+
     def ensure_mamba_slots(self, n: int) -> None:
+        self._drain_host_frees()
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
         (evict_mamba), returning their slots + any freed KV to the pools."""
         while self.linear_state_pool.num_free_slots < n:
@@ -329,6 +343,7 @@ class CacheManager:
             self.swa_pool.free_swa(indices)
 
     def allocate_paged(self, reqs: List[Req]) -> None:
+        self._drain_host_frees()
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
@@ -584,6 +599,7 @@ class CacheManager:
     def check_integrity(self) -> None:
         if self.is_hybrid:
             pc = self.prefix_cache
+            self._drain_host_frees()
             pc.check_integrity()  # structural: every snapshot node owns a slot, refs >= 0
             cache_pages = (pc.full_evictable + pc.full_protected) // self.page_size
             # GDN-slot conservation upper bound: free slots + tree-held snapshots can never
@@ -596,6 +612,7 @@ class CacheManager:
             )
         elif self.is_swa:
             pc = self.prefix_cache
+            self._drain_host_frees()
             pc.check_integrity()  # full>=swa refs, tombstone => no swa lock
             cache_pages = (pc.full_evictable + pc.full_protected) // self.page_size
             # swa-slot conservation upper bound: free swa slots + tree-held live swa tokens can
@@ -610,6 +627,7 @@ class CacheManager:
                 f"tree({tree_swa}) != capacity({cap})"
             )
         else:
+            self._drain_host_frees()
             self.prefix_cache.check_integrity()
             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
         if len(self.free_slots) + cache_pages != self.num_pages:

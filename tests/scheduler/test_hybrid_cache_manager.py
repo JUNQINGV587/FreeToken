@@ -519,3 +519,28 @@ def test_a_tier_lru_drop_returns_what_it_reclaims(monkeypatch):
     assert cm.linear_state_pool.num_free_slots == slots_before + 1, "the snapshot slot comes back"
     assert len(cm.free_slots) == pages_before + 1, "the tombstone parent's pages come back"
     cm.check_integrity()
+
+
+def test_a_refused_materialize_on_the_match_path_returns_its_resources(monkeypatch):
+    """The walk retires a node the tier will not serve again and parks what the unlink frees;
+    the manager drains it before it touches a pool, or the next idle check finds it missing."""
+    qsa, cm = _host_cache(monkeypatch, "4")
+    cache = cm.prefix_cache
+    page = int(cm._host_alloc_pages(1)[0])
+    ids, values = _on_page(100, page)
+    slot = cm.linear_state_pool.alloc(1)[0]
+    cache.insert(ids, values, mamba_value=slot)
+    cm._free(cache.evict_full(HOST_PAGE).kv_indices)   # the node spills: pages back, bytes in tier
+    assert cache.host_resident_size == HOST_PAGE
+
+    # The bridge's method is captured by the cache at construction, so cut the seam the walk
+    # itself uses: what the refusal costs is the point here, not how the bridge words it.
+    monkeypatch.setattr(cache, "_materialize", lambda node: False)
+    slots_before, pages_before = cm.linear_state_pool.num_free_slots, len(cm.free_slots)
+    assert cache.match_prefix(ids).cached_len == 0
+    cm.ensure_mamba_slots(1)                           # the drain site is what returns it
+
+    assert cache.host_resident_size == 0
+    assert cm.linear_state_pool.num_free_slots == slots_before + 1, "the snapshot slot is back"
+    assert len(cm.free_slots) == pages_before, "the node held no pages of its own"
+    cm.check_integrity()

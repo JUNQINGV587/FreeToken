@@ -92,6 +92,9 @@ class HybridRadixCache:
         # back in the pool's free list, so counting them there would double-book the page.
         self.host_resident = 0
         self._host_nodes: dict = {}  # tier key -> node, for host_drop / integrity
+        # Reclaimed on the MATCH path, which has no channel back to the pools that own it:
+        self._host_pending_kv: List[torch.Tensor] = []
+        self._host_pending_mamba: List[int] = []
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
@@ -258,6 +261,30 @@ class HybridRadixCache:
             f"host_resident({self.host_resident}) != sum of host-resident nodes({resident})"
         )
 
+    def _retire_host_node(self, node: RadixTreeNode, kv: List[torch.Tensor],
+                          mamba: List[int]) -> None:
+        """The tier will not produce this node's pages again -- it already dropped the entry, or
+        it refused. Unlink the node so the tree never offers indices that are not in the pool,
+        and so a later insert cannot create a second child under the same key: that duplicate
+        would overwrite the tree link while this node stayed tracked, and the next host_drop
+        would then unlink the LIVE node through the stale parent. What this frees is queued for
+        the owner -- a match has no return value to carry it."""
+        if node.host_value is not None:
+            self._host_nodes.pop(node.host_value, None)
+            node.host_value = None
+            self.host_resident -= node.length
+        self._free_node_mamba(node, mamba)
+        self._cascade_tombstone_leaves(self._unlink(node), kv)
+
+    def drain_host_frees(self) -> "EvictResult | None":
+        """Everything reclaimed on the match path since the last call, for the owner of the
+        pools to take back. None when there is nothing to return."""
+        if not self._host_pending_kv and not self._host_pending_mamba:
+            return None
+        kv, mamba = self._host_pending_kv, self._host_pending_mamba
+        self._host_pending_kv, self._host_pending_mamba = [], []
+        return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
+
     def host_drop(self, host_key) -> "EvictResult | None":
         """The host tier discarded a spilled page (its own LRU). That node's KV is gone for
         good, so unlink it -- which is also what lets its prefix become evictable again.
@@ -269,15 +296,12 @@ class HybridRadixCache:
         A host-resident node is never locked: only unlocked leaves spill, and a walk materializes
         one before it can hand out a handle, so its snapshot is always free to release.
         """
-        node = self._host_nodes.pop(host_key, None)
+        node = self._host_nodes.get(host_key)
         if node is None:
             return None
-        node.host_value = None
-        self.host_resident -= node.length
         kv: List[torch.Tensor] = []
         mamba: List[int] = []
-        self._free_node_mamba(node, mamba)
-        self._cascade_tombstone_leaves(self._unlink(node), kv)
+        self._retire_host_node(node, kv, mamba)
         return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
 
     # ---------------------------------------------------------------- helpers
@@ -410,8 +434,11 @@ class HybridRadixCache:
                 return node, prefix_len
             node = child
             if node.host_value is not None and not self._materialize(node):
-                # the tier lost this page (dropped without host_drop) or refused: stop here
-                # rather than hand back indices that are not in the pool
+                # The tier will not serve these pages again. Retire the node before returning:
+                # leaving it marked host-resident both strands the node (this walk returns its
+                # PARENT) and lets a later insert take its key_fn slot, after which a host_drop
+                # on the stale tier key would unlink whichever node now owns that slot.
+                self._retire_host_node(node, self._host_pending_kv, self._host_pending_mamba)
                 return parent, prefix_len
             match_len = align_down(node.get_match_len(input_ids[prefix_len:]), self.page_size)
             prefix_len += match_len

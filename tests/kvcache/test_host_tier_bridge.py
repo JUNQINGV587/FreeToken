@@ -11,7 +11,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from freetoken.kvcache.host_tier import HostKVTier, TierGeometry, TierGeometryMismatch
+from freetoken.kvcache.host_tier import (
+    HostKVTier,
+    TierGeometry,
+    TierGeometryMismatch,
+    check_tier_geometry,
+    geometry_from_pool,
+)
 from freetoken.kvcache.host_tier_bridge import (
     HOST_TIER_PAGES_ENV,
     PoolHostBridge,
@@ -357,3 +363,24 @@ def test_materialize_refuses_a_node_shape_the_tier_cannot_satisfy():
     key = _spilled(br, pool, Node("w4", PAGE, first_page=1))
     assert br.materialize(Node("w4", 2 * PAGE, first_page=1), key) is None
     assert tier.entry_slots(key) is None
+
+
+def test_check_tier_geometry_refuses_a_ratio_that_leaves_no_index_rows():
+    """Pinned on the check itself: through `maybe_build_bridge` this refusal is indistinguishable
+    from an OSError it now swallows, so that route cannot show the rule is there at all."""
+    pool = FakeQSAPool()
+    pool._index_ratio = PAGE * 2
+    with pytest.raises(TierGeometryMismatch):
+        check_tier_geometry(geometry_from_pool(pool, PAGE), pool, page_size=PAGE)
+
+    pool._index_ratio = PAGE                      # one row per page is still a usable bank
+    check_tier_geometry(geometry_from_pool(pool, PAGE), pool, page_size=PAGE)
+
+
+def test_a_page_size_ratio_mismatch_disables_the_tier_instead_of_breaking_it():
+    """index_ratio > page_size leaves the shadow bank with no rows per page, and a bank that
+    cannot be built must turn the optional feature off -- not raise through the engine."""
+    pool = FakeQSAPool()
+    pool._index_ratio = PAGE * 2
+    assert maybe_build_bridge(pool, PAGE, alloc_pages=Alloc(),
+                              env={HOST_TIER_PAGES_ENV: "4"}) is None

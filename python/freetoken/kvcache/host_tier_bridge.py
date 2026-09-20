@@ -93,7 +93,9 @@ def maybe_build_bridge(
         tier = HostKVTier(geometry, pages, backing=backing, on_drop=on_drop)
         bridge = PoolHostBridge(pool, tier, page_size, alloc_pages=alloc_pages,
                                 key_prefix=key_prefix)
-    except TierGeometryMismatch as exc:
+    except (TierGeometryMismatch, OSError) as exc:
+        # OSError: a degenerate bank (e.g. zero rows) makes its backing file unusable. The tier is
+        # an optional hit-rate layer, so refusing to build it must never take the engine down.
         logger.warning("KV host tier stays off: %s", exc)
         return None
     logger.info("KV host tier: %d pages (%.2f GiB) behind %s",

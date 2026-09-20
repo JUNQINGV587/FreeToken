@@ -175,6 +175,9 @@ class HybridRadixCache:
 
         With ``host_spill`` set, a leaf that owns a LIVE snapshot is SPILLED instead: its pages
         are returned (the caller frees them) while the node stays in the tree, host-resident."""
+        # Host-resident nodes are excluded here AND re-checked in the loop below: either clause
+        # alone is enough to protect them, so only removing both is observable -- which is what
+        # the guard test in tests/scheduler/test_hybrid_cache_manager.py pins.
         leaves = [n for n in self._leaves()
                   if n.ref_count == 0 and n.host_value is None]
         heapq.heapify(leaves)
@@ -203,6 +206,8 @@ class HybridRadixCache:
         too. Internal node -> TOMBSTONE (free the slot, keep KV + children). Leaf node -> free
         both KV and slot and unlink, then cascade-delete any KV-only tombstone leaves it exposes
         upward (so a leaf always carries a live snapshot -- mirrors sglang)."""
+        # Same deliberate redundancy as evict_full: this filter and the in-loop re-check each
+        # protect a host-resident node on their own, so a single clause looks removable.
         cands = [n for n in self._snapshot_nodes()
                  if n.mamba_ref_count == 0 and n.host_value is None]
         heapq.heapify(cands)

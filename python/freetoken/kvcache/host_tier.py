@@ -147,6 +147,11 @@ def check_tier_geometry(geometry: TierGeometry, pool, *, page_size: int) -> None
     by ``_check_kv`` on the first call, while a missing index or rope bank is never read back
     by anything.
     """
+    if geometry.index_layers and page_size % max(geometry.index_ratio, 1):
+        raise TierGeometryMismatch(
+            f"page_size={page_size} is not a multiple of index_ratio={geometry.index_ratio}: "
+            "the index shadow bank would have no rows per page"
+        )
     layers, pool_page_size, kv_heads, head_dim, dtype = _pool_slab_shape(pool)
     for name, want, got in (
         ("num_layers", geometry.num_layers, layers),

@@ -311,3 +311,49 @@ def test_the_manager_allocator_hands_out_page_indices_and_never_evicts():
     short = CacheManager._host_alloc_pages(fake, 3)
     assert short.numel() == 0, "a short free list is a refusal, not an eviction"
     assert [int(v) for v in fake.free_slots] == [2 * PAGE, 3 * PAGE], "nothing consumed"
+
+
+def _spilled(br, pool, node, seed=31):
+    fill_page(pool, 1, seed)
+    key = br.spill(node)
+    assert key is not None
+    return key
+
+
+def test_materialize_refuses_a_page_its_own_pool_does_not_have():
+    """The allocator is injected, so its answer is a claim the bridge must bound: a page index
+    past the pool would write into whatever the next allocation owns."""
+    pool = FakeQSAPool()
+    br, tier = bridge(pool, alloc=Alloc(PAGES))          # page PAGES does not exist
+    key = _spilled(br, pool, Node("w1", PAGE, first_page=1))
+    before = snapshot(pool, 1)
+
+    assert br.materialize(Node("w1", PAGE, first_page=1), key) is None
+    assert tier.entry_slots(key) is None, "dropped rather than left half-restorable"
+    assert all(torch.equal(a, b) for a, b in zip(snapshot(pool, 1), before)), "no write happened"
+
+
+def test_materialize_refuses_two_tokens_pointing_at_one_fresh_page():
+    pool = FakeQSAPool()
+    br, tier = bridge(pool, alloc=Alloc(5, 5))           # two pages asked, one page given twice
+    node = Node("w2", 2 * PAGE, first_page=1)
+    key = _spilled(br, pool, node)
+
+    assert br.materialize(node, key) is None
+    assert tier.entry_slots(key) is None
+
+
+def test_materialize_refuses_a_node_shape_the_tier_cannot_satisfy():
+    pool = FakeQSAPool()
+    br, tier = bridge(pool, alloc=Alloc(5, 6))
+    node = Node("w3", PAGE, first_page=1)
+    key = _spilled(br, pool, node)
+
+    node.length = PAGE + 1                               # not a whole page
+    assert br.materialize(node, key) is None
+    assert tier.entry_slots(key) is None
+
+    node.length = 2 * PAGE                               # whole pages, but the entry is shorter
+    key = _spilled(br, pool, Node("w4", PAGE, first_page=1))
+    assert br.materialize(Node("w4", 2 * PAGE, first_page=1), key) is None
+    assert tier.entry_slots(key) is None

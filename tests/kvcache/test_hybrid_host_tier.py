@@ -230,3 +230,24 @@ def test_spill_refuses_a_tier_key_that_already_names_another_node():
     assert cache.host_resident_size == 8, "the refused spill must move no accounting"
     assert accounts(cache) == 16
     cache.check_integrity()
+
+
+def test_node_value_holds_pool_slot_ids_not_page_numbers():
+    """``node.value`` carries one pool SLOT id per token, so a page index is ``slot // PAGE``.
+
+    A slot id is ``page * page_size + offset`` (CacheManager.free_slots is built that way), which
+    makes ``value[::page_size]`` the page's FIRST SLOT, not its number. Reading a slot id as a
+    page number silently addresses another page -- or runs off the end of the pool -- and the pool
+    recycles ids, so the mistake stays quiet until the wrong KV is read.
+    """
+    cache, _ = make_cache(with_tier=False)
+    cache.insert(tokens(8), pages(8) + 2 * PAGE, mamba_value=3)
+    node = cache.root
+    while node.children:
+        node = next(iter(node.children.values()))
+    assert node.length == 8
+    # Stored as slot ids: page 2's first slot is 4, page 5's is 10.
+    assert [int(v) for v in node.value[::PAGE]] == [4, 6, 8, 10]
+    assert int(node.value[0]) != 2, "value[0] is a slot id, never a page number"
+    # The conversion every consumer needs (the read side does the same: fa.py, qsa_sparse.py).
+    assert [int(v) // PAGE for v in node.value[::PAGE]] == [2, 3, 4, 5]

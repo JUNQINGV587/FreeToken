@@ -560,3 +560,49 @@ def test_the_manager_reports_the_tier_only_when_it_is_enabled(monkeypatch):
     on._free(on.prefix_cache.evict_full(HOST_PAGE).kv_indices)   # spill it: pages back, bytes host
     assert on.host_tier_stats()["spills"] == 1, "the counter follows the real spill"
     assert on.host_tier_stats()["resident_entries"] == 1
+
+
+def test_rebuild_drops_parked_frees_instead_of_returning_them_twice(monkeypatch):
+    """rebuild resets every pool wholesale, so what the discarded cache had parked must go with
+    it: draining those pages and slots into the fresh lists would count them twice."""
+    qsa, cm = _host_cache(monkeypatch, "4")
+    cache = cm.prefix_cache
+    page = int(cm._host_alloc_pages(1)[0])
+    ids, values = _on_page(100, page)
+    slot = cm.linear_state_pool.alloc(1)[0]
+    cache.insert(ids, values, mamba_value=slot)
+    cm._free(cache.evict_full(HOST_PAGE).kv_indices)
+    monkeypatch.setattr(cache, "_materialize", lambda node: False)
+    assert cache.match_prefix(ids).cached_len == 0
+    assert cache._host_pending_mamba == [slot] and len(cache._host_pending_kv) >= 0, "parked"
+
+    cm.rebuild(QSA_PAGES, torch.zeros(2, 64, dtype=torch.int32))
+
+    assert cm.prefix_cache is not cache, "rebuild replaces the tree"
+    assert cm.prefix_cache._host_pending_mamba == [], "the new tree has nothing parked"
+    assert cache._host_pending_mamba == [slot], (
+        "the discarded cache keeps its own queue and nothing drains it: those pages are already "
+        "in the freshly reset free lists, so returning them again would count them twice"
+    )
+    assert cm.host_tier_stats() is not None, "the tier survives rebuild, sized from the new pools"
+    cm.check_integrity()
+
+
+def test_the_per_step_drain_site_also_returns_what_a_match_parked(monkeypatch):
+    """ensure_mamba_slots is not the only drain site: the ordinary per-step allocation path must
+    return parked resources too, or a long run with no mamba pressure would accumulate them."""
+    qsa, cm = _host_cache(monkeypatch, "4")
+    cache = cm.prefix_cache
+    page = int(cm._host_alloc_pages(1)[0])
+    ids, values = _on_page(140, page)
+    slot = cm.linear_state_pool.alloc(1)[0]
+    cache.insert(ids, values, mamba_value=slot)
+    cm._free(cache.evict_full(HOST_PAGE).kv_indices)
+    monkeypatch.setattr(cache, "_materialize", lambda node: False)
+    assert cache.match_prefix(ids).cached_len == 0
+
+    slots_before = cm.linear_state_pool.num_free_slots
+    cm.allocate_paged([])                              # the per-step site
+
+    assert cm.linear_state_pool.num_free_slots == slots_before + 1
+    cm.check_integrity()

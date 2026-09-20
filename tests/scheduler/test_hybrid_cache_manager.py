@@ -243,3 +243,131 @@ def test_pool_sizing_covers_4mr_floor():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+# ---------------------------------------------------------------- host KV tier
+
+HOST_PAGE = 4
+QSA_LAYERS, QSA_TOTAL_LAYERS, QSA_IDX_LAYERS, QSA_IDX_DIM, QSA_RATIO = 2, 4, 2, 6, 2
+QSA_ROWS = HOST_PAGE // QSA_RATIO
+QSA_PAGES = 8
+
+
+def _tp(monkeypatch):
+    """MHAKVCache reads the TP size when it sizes the local K/V slab."""
+    from freetoken.distributed.info import DistributedInfo
+
+    monkeypatch.setattr("freetoken.kvcache.mha_pool.get_tp_info",
+                        lambda: DistributedInfo(rank=0, size=1))
+
+
+def _qsa_pool():
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+    return QSAKVCache(
+        num_kv_heads=1, num_layers=QSA_TOTAL_LAYERS, head_dim=4, num_pages=QSA_PAGES,
+        page_size=HOST_PAGE, dtype=torch.bfloat16, device=torch.device("cpu"),
+        index_head_dim=QSA_IDX_DIM, num_index_layers=QSA_IDX_LAYERS, index_ratio=QSA_RATIO,
+        num_req_slots=2, layer_ids=(1, 3),
+    )
+
+
+def _fill(qsa, page, seed):
+    kv = qsa.page_kv_view(page)
+    kv[0].fill_(seed)
+    kv[1].fill_(-seed)
+    for layer in range(QSA_IDX_LAYERS):
+        qsa.cmp_k_cache(layer)[page * QSA_ROWS:(page + 1) * QSA_ROWS].fill_(seed * 10 + layer)
+
+
+def _snapshot(qsa, page):
+    return (
+        qsa.page_kv_view(page).clone(),
+        torch.stack([qsa.cmp_k_cache(l)[page * QSA_ROWS:(page + 1) * QSA_ROWS]
+                     for l in range(QSA_IDX_LAYERS)]).clone(),
+    )
+
+
+def _walk_leaf(cache):
+    node = cache.root
+    while node.children:
+        node = next(iter(node.children.values()))
+    return node
+
+
+def test_host_tier_restores_a_real_qsa_prefix_bit_exactly(monkeypatch):
+    """The whole seam: spill on evict, match, restore into DIFFERENT pages, same bytes."""
+    _tp(monkeypatch)
+    monkeypatch.setenv("FREETOKEN_KV_HOST_TIER_PAGES", "4")
+    qsa, lsp = _qsa_pool(), _pool()
+    cm = CacheManager(QSA_PAGES, HOST_PAGE, torch.zeros(2, 64, dtype=torch.int32),
+                      "hybrid_radix", linear_state_pool=lsp, swa_pool=qsa)
+
+    assert cm._host_bridge is not None, "the opt-in variable must build the bridge"
+    assert cm._host_tier.geometry.index_layers == QSA_IDX_LAYERS
+    assert cm._host_tier.geometry.rope_pos is False
+    assert cm._host_tier.geometry.num_layers == QSA_LAYERS
+
+    for page, seed in ((0, 11), (1, 22)):
+        _fill(qsa, page, seed)
+    before = {page: _snapshot(qsa, page) for page in (0, 1)}
+
+    ids = torch.arange(2 * HOST_PAGE, dtype=torch.int32)
+    values = (torch.arange(2 * HOST_PAGE, dtype=torch.int32) // HOST_PAGE) * HOST_PAGE
+    cache = cm.prefix_cache
+    cache.insert(ids, values, mamba_value=1)
+    cache.evict_full(2 * HOST_PAGE)
+
+    assert cache.host_resident_size == 2 * HOST_PAGE, "the leaf is spilled, not dropped"
+    assert cm._host_tier.resident_entries == 1
+    held = cm._host_alloc_pages(2)                     # another request now owns pages 0, 1
+    assert [int(v) for v in held] == [0, 1]
+
+    m = cache.match_prefix(ids)
+
+    assert m.cached_len == 2 * HOST_PAGE and m.mamba_value == 1
+    assert cache.host_resident_size == 0
+    restored = [int(v) // HOST_PAGE for v in _walk_leaf(cache).value[::HOST_PAGE]]
+    assert restored == [2, 3], "restored into the pages that were actually free"
+    for got, src in zip(restored, (0, 1)):
+        kv, idx = _snapshot(qsa, got)
+        assert torch.equal(kv, before[src][0]), "K/V byte-for-byte"
+        assert torch.equal(idx, before[src][1]), "index shadow byte-for-byte"
+
+
+def test_an_off_deployment_builds_no_tier_and_keeps_the_old_eviction(monkeypatch):
+    _tp(monkeypatch)
+    monkeypatch.delenv("FREETOKEN_KV_HOST_TIER_PAGES", raising=False)
+    qsa, lsp = _qsa_pool(), _pool()
+    cm = CacheManager(QSA_PAGES, HOST_PAGE, torch.zeros(2, 64, dtype=torch.int32),
+                      "hybrid_radix", linear_state_pool=lsp, swa_pool=qsa)
+
+    assert cm._host_bridge is None and cm._host_tier is None
+    assert cm.prefix_cache.host_spill is None
+    assert cm.prefix_cache.host_materialize is None
+
+    ids = torch.arange(2 * HOST_PAGE, dtype=torch.int32)
+    values = (torch.arange(2 * HOST_PAGE, dtype=torch.int32) // HOST_PAGE) * HOST_PAGE
+    cm.prefix_cache.insert(ids, values, mamba_value=1)
+    er = cm.prefix_cache.evict_full(2 * HOST_PAGE)
+
+    assert cm.prefix_cache.host_resident_size == 0
+    assert torch.equal(er.kv_indices, values), "the pages come back for the caller to free"
+
+
+def test_rebuild_clears_the_host_tier_before_replacing_the_tree(monkeypatch):
+    _tp(monkeypatch)
+    monkeypatch.setenv("FREETOKEN_KV_HOST_TIER_PAGES", "4")
+    qsa, lsp = _qsa_pool(), _pool()
+    cm = CacheManager(QSA_PAGES, HOST_PAGE, torch.zeros(2, 64, dtype=torch.int32),
+                      "hybrid_radix", linear_state_pool=lsp, swa_pool=qsa)
+    ids = torch.arange(2 * HOST_PAGE, dtype=torch.int32)
+    values = (torch.arange(2 * HOST_PAGE, dtype=torch.int32) // HOST_PAGE) * HOST_PAGE
+    cm.prefix_cache.insert(ids, values, mamba_value=1)
+    cm.prefix_cache.evict_full(2 * HOST_PAGE)
+    assert cm._host_tier.resident_entries == 1
+
+    cm.rebuild(QSA_PAGES, torch.zeros(2, 64, dtype=torch.int32))
+
+    assert cm._host_tier.resident_entries == 0, "entries describe the discarded tree"
+    assert cm._host_tier.resident_pages == 0
+    assert cm.prefix_cache.host_resident_size == 0

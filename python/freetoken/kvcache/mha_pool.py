@@ -117,6 +117,19 @@ class MHAKVCache(BaseKVCachePool):
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
 
+    @property
+    def num_storage_layers(self) -> int:
+        return int(self._k_buffer.shape[0])
+
+    def page_kv_view(self, page_index: int) -> torch.Tensor:
+        """``[2, num_storage_layers, page_size, local_kv_heads, head_dim]`` view of one page.
+
+        A host-tier copy wants one page's K and V across the whole depth; through
+        ``k_cache()``/``v_cache()`` that is ``2 * num_storage_layers`` copies per page, here it
+        is two.
+        """
+        return self._kv_buffer[:, :, page_index]
+
     def store_kv(
         self,
         k: torch.Tensor,

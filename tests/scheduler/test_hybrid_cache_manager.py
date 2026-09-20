@@ -458,3 +458,29 @@ def test_a_node_larger_than_the_tier_declines_instead_of_crashing(monkeypatch):
     cache.check_integrity()
     assert [int(v) for v in erased.kv_indices] == [int(v) for v in values], "pages come back"
     assert cm._host_tier.resident_entries == 0
+
+
+def test_an_unrelated_eviction_leaves_the_host_resident_node_alone(monkeypatch):
+    """Eviction must never reclaim a host-resident node: its KV is in the tier, so freeing the
+    snapshot would strand it, and the tier -- not the tree -- is what reclaims its pages. Pin it
+    because both eviction paths in this file are inherited from an upstream that moves."""
+    qsa, cm = _host_cache(monkeypatch, "4")
+    cache = cm.prefix_cache
+    host_ids, host_pages = _page_prefix(100)
+    cache.insert(host_ids, host_pages, mamba_value=1)
+    cache.evict_full(HOST_PAGE)
+    assert cache.host_resident_size == HOST_PAGE and cm._host_tier.resident_entries == 1
+
+    gpu_ids, gpu_pages = _page_prefix(200)
+    cache.insert(gpu_ids, gpu_pages, mamba_value=2)
+    # The host-resident node holds an unlocked snapshot too, so it is a candidate for this
+    # reclaim unless the eviction skips it -- and taking its snapshot would strand its KV.
+    erased = cache.evict_mamba(1)
+
+    assert [int(v) for v in erased.kv_indices] == [int(v) for v in gpu_pages]
+    assert cache.host_resident_size == HOST_PAGE, "the host-resident node kept its account"
+    assert cm._host_tier.resident_entries == 1, "and the tier kept its entry"
+    cache.check_integrity()
+    assert cache.match_prefix(gpu_ids).cached_len == 0
+    assert cache.match_prefix(host_ids).cached_len == HOST_PAGE, "still restorable"
+    assert cache.host_resident_size == 0, "materializing it is what retires the entry"

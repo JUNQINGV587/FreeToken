@@ -266,7 +266,15 @@ class PoolHostBridge:
         return (fresh.to(torch.int32) * self.page_size).repeat_interleave(self.page_size)
 
     def forget(self, key: Hashable) -> bool:
-        """Release an entry nobody will restore (the cache freed its node)."""
+        """Release an entry nobody will restore (the cache freed its node).
+
+        No in-tree caller: the cache-side contract only ever tells the tier to spill or to
+        materialize, never that a node it owns went away, and every cache path that could free a
+        node refuses to touch a host-resident one (it would strand KV the tree can still match).
+        So a resident entry is reclaimed by the tier's own LRU, or wholesale by
+        ``CacheManager.rebuild`` clearing the tier. Kept as the hook for a future cache->tier
+        discard; dropping an unknown key is a no-op, which is what makes that safe to add.
+        """
         return self.tier.drop(key)
 
 

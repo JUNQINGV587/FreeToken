@@ -558,12 +558,20 @@ class Scheduler(SchedulerIOMixin):
         FREETOKEN_KV_HOST_TIER_PAGES is set). Sampled at most once per second like its MoE and
         encoder siblings, and a failing sample must never break the reply stream."""
         cache = getattr(self, "cache_manager", None)
-        stats = None if cache is None else cache.host_tier_stats()
-        if stats is None:
+        if cache is None:
             return None
+        # Throttle before sampling, like the MoE and encoder siblings: the ledger sum is cheap,
+        # but a reply-rate call has no reason to pay it.
         now = time.monotonic()
         if now - getattr(self, "_host_tier_stats_last_at", 0.0) < 1.0:
             return None
+        try:
+            stats = cache.host_tier_stats()
+        except Exception as e:  # noqa: BLE001 -- observability must not break serving
+            logger.warning(f"host tier stats snapshot failed: {e!r}")
+            return None
+        if stats is None:
+            return None  # tier not enabled: nothing to report, and nothing to remember
         self._host_tier_stats_last_at = now
         return stats
 

@@ -484,3 +484,38 @@ def test_an_unrelated_eviction_leaves_the_host_resident_node_alone(monkeypatch):
     assert cache.match_prefix(gpu_ids).cached_len == 0
     assert cache.match_prefix(host_ids).cached_len == HOST_PAGE, "still restorable"
     assert cache.host_resident_size == 0, "materializing it is what retires the entry"
+
+
+def _on_page(first_token: int, page: int):
+    ids = torch.arange(first_token, first_token + HOST_PAGE, dtype=torch.int32)
+    return ids, torch.full((HOST_PAGE,), page * HOST_PAGE, dtype=torch.int32)
+
+
+def test_a_tier_lru_drop_returns_what_it_reclaims(monkeypatch):
+    """The tier drops entries on its own LRU. Everything the unlinking frees -- the node's GDN
+    snapshot slot and any tombstone parent's pages -- belongs to the manager's pools, or the
+    next idle integrity check finds them missing."""
+    qsa, cm = _host_cache(monkeypatch, "4")
+    cache = cm.prefix_cache
+    # Pages and state slots really come out of their pools: ids the tree invented would let the
+    # free-list assertions pass while the accounting they exercise stays wrong.
+    page_parent, page_child = (int(p) for p in cm._host_alloc_pages(2))
+    parent_ids, parent_pages = _on_page(100, page_parent)
+    child_ids, child_pages = _on_page(100 + HOST_PAGE, page_child)
+    mamba_parent, mamba_child = cm.linear_state_pool.alloc(2)
+    cache.insert(parent_ids, parent_pages, mamba_value=mamba_parent)
+    cache.insert(torch.cat([parent_ids, child_ids]),
+                 torch.cat([parent_pages, child_pages]), mamba_value=mamba_child)
+    cache.evict_mamba(1)                     # the internal parent becomes a KV-only tombstone
+    spilled = cache.evict_full(HOST_PAGE)    # ...and the child leaf spills (it holds a snapshot)
+    cm._free(spilled.kv_indices)             # its pages go back, its bytes to the tier
+    assert cache.host_resident_size == HOST_PAGE and cm._host_tier.resident_entries == 1
+
+    slots_before, pages_before = cm.linear_state_pool.num_free_slots, len(cm.free_slots)
+    key = next(iter(cache._host_nodes))
+    cm._host_tier_dropped(key)                # exactly what the tier's LRU callback does
+
+    assert cache.host_resident_size == 0
+    assert cm.linear_state_pool.num_free_slots == slots_before + 1, "the snapshot slot comes back"
+    assert len(cm.free_slots) == pages_before + 1, "the tombstone parent's pages come back"
+    cm.check_integrity()

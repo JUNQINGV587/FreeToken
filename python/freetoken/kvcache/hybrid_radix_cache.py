@@ -258,17 +258,27 @@ class HybridRadixCache:
             f"host_resident({self.host_resident}) != sum of host-resident nodes({resident})"
         )
 
-    def host_drop(self, host_key) -> bool:
+    def host_drop(self, host_key) -> "EvictResult | None":
         """The host tier discarded a spilled page (its own LRU). That node's KV is gone for
         good, so unlink it -- which is also what lets its prefix become evictable again.
-        Returns False for an unknown key."""
+
+        Returns what the unlink frees -- the node's GDN snapshot slot plus any KV-only tombstone
+        parent it exposes -- because both pools belong to the caller; dropping them here would
+        strand a state slot per tier eviction and leak the parent's pages. None = unknown key.
+
+        A host-resident node is never locked: only unlocked leaves spill, and a walk materializes
+        one before it can hand out a handle, so its snapshot is always free to release.
+        """
         node = self._host_nodes.pop(host_key, None)
         if node is None:
-            return False
+            return None
         node.host_value = None
         self.host_resident -= node.length
-        self._cascade_tombstone_leaves(self._unlink(node), [])
-        return True
+        kv: List[torch.Tensor] = []
+        mamba: List[int] = []
+        self._free_node_mamba(node, mamba)
+        self._cascade_tombstone_leaves(self._unlink(node), kv)
+        return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
 
     # ---------------------------------------------------------------- helpers
     def _spill(self, node: RadixTreeNode, kv_out: List[torch.Tensor]) -> bool:

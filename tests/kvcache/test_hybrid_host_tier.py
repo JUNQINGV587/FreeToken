@@ -129,8 +129,10 @@ def test_host_drop_unlinks_the_node_and_frees_its_prefix_to_evict():
     key = tier.spilled[-1]
     parent = next(iter(cache.root.children.values()))
 
-    assert cache.host_drop(key) is True
-    assert cache.host_drop(key) is False, "a dropped key must not be handled twice"
+    freed = cache.host_drop(key)
+    assert freed is not None, "the drop reports what it reclaimed"
+    assert freed.mamba_slots == [2], "the node's snapshot slot goes back to its pool"
+    assert cache.host_drop(key) is None, "a dropped key must not be handled twice"
 
     assert cache.host_resident_size == 0
     assert cache.full_evictable == 8

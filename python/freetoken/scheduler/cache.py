@@ -148,10 +148,17 @@ class CacheManager:
         return (took // self.page_size).to(torch.int32)
 
     def _host_tier_dropped(self, key) -> None:
-        """The tier's LRU dropped an entry: unlink the node that was pointing at it."""
+        """The tier's LRU dropped an entry: unlink the node that was pointing at it and hand what
+        that frees -- the node's GDN snapshot slot, any tombstone parent's pages -- to its pool."""
         cache = getattr(self, "prefix_cache", None)
-        if cache is not None and hasattr(cache, "host_drop"):
-            cache.host_drop(key)
+        if cache is None or not hasattr(cache, "host_drop"):
+            return
+        freed = cache.host_drop(key)
+        if freed is None:
+            return
+        self._free(freed.kv_indices)
+        if freed.mamba_slots:
+            self.linear_state_pool.free(freed.mamba_slots)
 
 
     def match_req(self, req: PendingReq) -> MatchResult:
@@ -630,7 +637,12 @@ class CacheManager:
             # Before the new tree replaces the old one: the host tier's entries describe nodes of
             # the tree being discarded, so it must not outlive them. clear() reports every key to
             # on_drop, which still resolves to the OLD cache here and unlinks those nodes.
+            # Detached for the clear: this method resets every pool wholesale right below
+            # (free_slots, then reclaim_all_slots), so recycling single entries into them here
+            # would return the same pages and state slots twice.
+            on_drop, self._host_tier.on_drop = self._host_tier.on_drop, None
             self._host_tier.clear()
+            self._host_tier.on_drop = on_drop
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).

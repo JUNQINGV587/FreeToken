@@ -215,10 +215,21 @@ class HostTierUnpinned(RuntimeError):
 
 @dataclass
 class TierStats:
+    """Counters for one tier.
+
+    ``spills``/``restores``/``hits``/``misses`` are written by the BRIDGE, which is what moves
+    bytes on the real path (it copies slab by slab, so it never calls this class's
+    ``spill``/``restore``). Those two methods keep their own counting for direct users.
+    ``refusals`` counts spans the bridge declined by design: a node longer than the tier, an
+    already-resident key, an entry whose shape no longer matches. ``dropped``/``dropped_bytes``
+    are the LRU reclaiming room.
+    """
+
     spills: int = 0
     restores: int = 0
     hits: int = 0
     misses: int = 0
+    refusals: int = 0
     dropped: int = 0
     dropped_bytes: int = 0
 
@@ -283,6 +294,24 @@ class HostKVTier:
     @property
     def capacity_bytes(self) -> int:
         return self.bytes_per_page * self.num_pages
+
+    def stats_snapshot(self) -> dict:
+        """Counters plus the ledger, for the engine's stats surface. Cheap: the ledger sums a
+        dict of slot lists, and the caller samples it at most once a second."""
+        s = self.stats
+        return {
+            "capacity_pages": self.num_pages,
+            "resident_entries": self.resident_entries,
+            "resident_pages": self.resident_pages,
+            "resident_bytes": self.resident_bytes,
+            "spills": s.spills,
+            "restores": s.restores,
+            "hits": s.hits,
+            "misses": s.misses,
+            "refusals": s.refusals,
+            "dropped": s.dropped,
+            "dropped_bytes": s.dropped_bytes,
+        }
 
     @property
     def resident_pages(self) -> int:

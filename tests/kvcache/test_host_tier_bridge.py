@@ -384,3 +384,31 @@ def test_a_page_size_ratio_mismatch_disables_the_tier_instead_of_breaking_it():
     pool._index_ratio = PAGE * 2
     assert maybe_build_bridge(pool, PAGE, alloc_pages=Alloc(),
                               env={HOST_TIER_PAGES_ENV: "4"}) is None
+
+
+def test_the_counters_move_on_the_path_that_actually_moves_bytes():
+    """The tier's own spill()/restore() are not what runs here -- the bridge copies slab by slab
+    -- so a snapshot reading only those counters would report zero forever. Pin the bridge."""
+    pool = FakeQSAPool()
+    br, tier = bridge(pool, alloc=Alloc(5))
+    node = Node("w1", PAGE, first_page=1)
+    fill_page(pool, 1, 7)
+    assert tier.stats_snapshot()["spills"] == 0
+
+    key = br.spill(node)
+    snap = tier.stats_snapshot()
+    assert snap["spills"] == 1, "a spill that happened is a spill counted"
+    assert snap["resident_entries"] == 1 and snap["resident_pages"] == 1
+    assert snap["resident_bytes"] == tier.bytes_per_page
+
+    assert br.spill(node) is None, "already resident: refused"
+    assert tier.stats_snapshot()["refusals"] == 1
+    assert br.materialize(node, "kv:not-a-key") is None, "never spilled: a miss"
+    missing = tier.stats_snapshot()
+    assert missing["misses"] == 1 and missing["refusals"] == 2
+
+    assert br.materialize(node, key) is not None
+    back = tier.stats_snapshot()
+    assert back["restores"] == 1 and back["hits"] == 1
+    assert back["resident_entries"] == 0 and back["resident_pages"] == 0
+    assert back["capacity_pages"] == tier.num_pages > 0

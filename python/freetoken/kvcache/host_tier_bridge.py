@@ -205,6 +205,16 @@ class PoolHostBridge:
 
     def spill(self, node) -> str | None:
         """Copy ``node``'s pages into the tier and return the key, or None to refuse."""
+        key = self._spill(node)
+        stats = self.tier.stats
+        if key is None:
+            stats.refusals += 1
+        else:
+            stats.spills += 1
+        return key
+
+    def _spill(self, node) -> str | None:
+        """The work behind :meth:`spill`; counting lives in the wrapper."""
         pages = self._pages(node)
         if pages is None:
             return None
@@ -237,8 +247,20 @@ class PoolHostBridge:
 
     def materialize(self, node, key: Hashable) -> torch.Tensor | None:
         """Copy the entry back into freshly allocated pages, one page index per token."""
+        value = self._materialize(node, key)
+        stats = self.tier.stats
+        if value is None:
+            stats.refusals += 1
+        else:
+            stats.restores += 1
+            stats.hits += 1
+        return value
+
+    def _materialize(self, node, key: Hashable) -> torch.Tensor | None:
+        """The work behind :meth:`materialize`; counting lives in the wrapper."""
         slots = self.tier.entry_slots(key)
         if slots is None:
+            self.tier.stats.misses += 1
             return None  # the tier's LRU dropped it; the prefix is gone, recompute
         if node.length % self.page_size:
             self.tier.drop(key)

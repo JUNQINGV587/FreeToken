@@ -211,6 +211,12 @@ class PoolHostBridge:
             # The node is already spilled. Overwriting would leave the first owner reading the
             # second one's bytes, and the cache counts one host-resident span per key.
             return None
+        if len(pages) > self.tier.num_pages:
+            # A node longer than the whole tier. Refuse it like any other shape the tier cannot
+            # carry: the cache then evicts as it did before there was a host tier. Letting this
+            # reach alloc_entry would abort the engine on the first eviction of a prefix that
+            # outgrows the configured capacity.
+            return None
         slots = self.tier.alloc_entry(key, len(pages))
         try:
             for i, page in enumerate(pages):

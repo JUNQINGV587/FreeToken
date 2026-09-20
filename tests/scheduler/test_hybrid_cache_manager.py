@@ -403,3 +403,58 @@ def test_the_rope_rows_move_with_the_page_on_a_mrope_pool(monkeypatch):
     assert restored == [2, 3]
     for got, src in zip(restored, (0, 1)):
         assert torch.equal(qsa.rope_positions[got * HOST_PAGE:(got + 1) * HOST_PAGE], before[src])
+
+
+def _host_cache(monkeypatch, pages: str):
+    _tp(monkeypatch)
+    monkeypatch.setenv("FREETOKEN_KV_HOST_TIER_PAGES", pages)
+    qsa, lsp = _qsa_pool(), _pool()
+    cm = CacheManager(QSA_PAGES, HOST_PAGE, torch.zeros(2, 64, dtype=torch.int32),
+                      "hybrid_radix", linear_state_pool=lsp, swa_pool=qsa)
+    return qsa, cm
+
+
+def _page_prefix(first_token: int, n_pages: int = 1):
+    ids = torch.arange(first_token, first_token + n_pages * HOST_PAGE, dtype=torch.int32)
+    values = (torch.arange(n_pages * HOST_PAGE, dtype=torch.int32) // HOST_PAGE) * HOST_PAGE
+    return ids, values
+
+
+def test_the_tier_s_own_lru_eviction_unlinks_the_node_it_drops(monkeypatch):
+    """The tier frees its own room. That victim's node must be unlinked, or the tree keeps a
+    host-resident leaf whose bytes are gone and every later match reads a prefix that is not
+    there."""
+    qsa, cm = _host_cache(monkeypatch, "1")
+    cache = cm.prefix_cache
+    a_ids, a_pages = _page_prefix(100)
+    cache.insert(a_ids, a_pages, mamba_value=1)
+    cache.evict_full(HOST_PAGE)
+    assert cache.host_resident_size == HOST_PAGE and cm._host_tier.resident_entries == 1
+
+    b_ids, b_pages = _page_prefix(200)
+    cache.insert(b_ids, b_pages, mamba_value=2)
+    cache.evict_full(HOST_PAGE)          # no room: the tier evicts A to take B
+
+    assert cm._host_tier.resident_entries == 1
+    assert cache.host_resident_size == HOST_PAGE, "A's length must leave the cache's account"
+    cache.check_integrity()
+    hit = cache.match_prefix(a_ids)
+    assert hit.cached_len == 0, "A's prefix is gone, not silently readable"
+    assert cache.match_prefix(b_ids).cached_len == HOST_PAGE
+
+
+def test_a_node_larger_than_the_tier_declines_instead_of_crashing(monkeypatch):
+    """Spill is a question, not an order: a tier too small for this node must answer 'no' and
+    let the cache evict as it always did. An assert here aborts the engine on the first
+    eviction of any prefix longer than the configured tier."""
+    qsa, cm = _host_cache(monkeypatch, "1")          # one page of host tier
+    cache = cm.prefix_cache
+    ids, values = _page_prefix(300, n_pages=2)       # ...against a two-page node
+    cache.insert(ids, values, mamba_value=3)
+
+    erased = cache.evict_full(2 * HOST_PAGE)
+
+    assert cache.host_resident_size == 0
+    cache.check_integrity()
+    assert [int(v) for v in erased.kv_indices] == [int(v) for v in values], "pages come back"
+    assert cm._host_tier.resident_entries == 0

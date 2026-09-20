@@ -3,6 +3,7 @@ CPU, real LinearStatePool + page_table, hand-built Reqs. Exercises the two-curre
 without the full scheduler/engine."""
 from __future__ import annotations
 
+import random
 from types import SimpleNamespace
 
 import torch
@@ -637,3 +638,108 @@ def test_a_tier_too_big_for_the_host_leaves_serving_untouched(monkeypatch):
     assert cm.host_tier_stats() is None, "the tier refused to build and the manager carried on"
     assert cm.prefix_cache is not None
     cm.check_integrity()
+
+
+def _per_token_values(pages):
+    """The pool's per-token value form: every token names its page's first slot."""
+    starts = torch.tensor([p * HOST_PAGE for p in pages], dtype=torch.int32)
+    return (starts.unsqueeze(1) + torch.arange(HOST_PAGE, dtype=torch.int32)).flatten()
+
+
+def test_a_two_page_prefix_comes_back_on_the_pages_its_slots_belong_to(monkeypatch):
+    """Multi-page entries: one page per entry cannot see a slot-order slip, and a prefix whose
+    pages are handed back in the wrong order is the quietest way to serve wrong bytes."""
+    qsa, cm = _host_cache(monkeypatch, "4")
+    cache = cm.prefix_cache
+    pages = (0, 1)
+    written = []
+    for i, page in enumerate(pages):                 # distinct bytes per page, not per entry
+        _fill(qsa, page, 5 + 3 * i)
+        written.append(_snapshot(qsa, page))
+    ids = torch.arange(200, 200 + len(pages) * HOST_PAGE, dtype=torch.int32)
+    cache.insert(ids, _per_token_values(pages), mamba_value=1)
+
+    cache.evict_full(len(pages) * HOST_PAGE)
+    assert cache.host_resident_size == len(pages) * HOST_PAGE, "spilled, not dropped"
+    cm._host_alloc_pages(len(pages))                 # the device reuses the original pages
+
+    hit = cache.match_prefix(ids)
+
+    assert hit.cached_len == len(ids)
+    served = [int(v) // HOST_PAGE for v in hit.kv_indices[::HOST_PAGE]]
+    assert len(served) == len(pages)
+    for page, want in zip(served, written):
+        got = _snapshot(qsa, page)
+        for a, b in zip(got, want):
+            assert torch.equal(a, b), f"page {page} of the restored prefix holds other bytes"
+
+
+def test_a_random_walk_of_evictions_and_matches_never_serves_the_wrong_bytes(monkeypatch):
+    """Integration fuzz: the tier on, random inserts/evictions, every served prefix checked.
+
+    The bridge tests pin the copy paths; this pins the thing the red line actually cares about --
+    a prefix that the cache answers for, after any number of spills and restores, must hand back
+    pages whose bytes are the ones that were written for it. Page supply goes through the
+    manager's own free list, so ownership stays consistent by construction (check_integrity
+    asserts free + cached == total), and the walk ends by proving the tier really was used.
+    """
+    rng = random.Random(20260922)
+    qsa, cm = _host_cache(monkeypatch, "3")
+    cache = cm.prefix_cache
+    docs: dict[int, tuple[torch.Tensor, tuple[int, ...], tuple]] = {}
+    serial = 0
+
+    def content(page: int, seed: int) -> tuple:
+        _fill(qsa, page, seed)
+        return _snapshot(qsa, page)
+
+    def check_every_doc(where: str) -> None:
+        cm.check_integrity()
+        for doc, (ids, pages_at_insert, written) in docs.items():
+            hit = cache.match_prefix(ids)
+            if hit.cached_len != len(ids):
+                continue                      # evicted for good; nothing to serve
+            served = [int(v) // HOST_PAGE for v in hit.kv_indices[::HOST_PAGE]]
+            for page, want in zip(served, written):
+                got = _snapshot(qsa, page)
+                for a, b in zip(got, want):
+                    assert torch.equal(a, b), (
+                        f"{where}: doc {doc} served page {page} with other bytes "
+                        f"(inserted on {pages_at_insert})\nwalk: {log}"
+                    )
+
+    log: list[str] = []
+    for _ in range(60):
+        cm.check_integrity()
+        roll = rng.random()
+        if roll < 0.45:
+            # Multi-page entries matter: with one page per entry a slot-order slip is invisible.
+            free = cm._host_alloc_pages(rng.choice((1, 2)))   # only taken when this step uses it
+            if not free.numel():
+                continue
+            slots = cm.linear_state_pool.alloc(1)   # a claimed GDN slot must be a real one
+            if not slots:
+                cm._free(free * HOST_PAGE)           # no slot to donate: give the pages back
+                continue
+            pages = tuple(int(p) for p in free)
+            seed = 1 + serial * 3
+            base = 10000 + 100 * serial
+            ids = torch.arange(base, base + len(pages) * HOST_PAGE, dtype=torch.int32)
+            written = tuple(content(page, seed + i) for i, page in enumerate(pages))
+            log.append(f"insert doc {serial} pages={pages}")
+            cache.insert(ids, _per_token_values(pages), mamba_value=slots[0])
+            docs[serial] = (ids, pages, written)
+            serial += 1
+        elif roll < 0.80:
+            log.append("evict")
+            erased = cache.evict_full(HOST_PAGE)
+            cm._free(erased.kv_indices)
+            if erased.mamba_slots:
+                cm.linear_state_pool.free(erased.mamba_slots)
+        check_every_doc(f"step {len(log)}")
+
+    tiers = cm._host_tier.stats_snapshot()
+    assert tiers["spills"] > 0 and tiers["restores"] > 0, (
+        f"the walk must exercise the tier to prove anything: {tiers}\n{log}"
+    )
+    check_every_doc("final")

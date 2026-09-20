@@ -606,3 +606,34 @@ def test_the_per_step_drain_site_also_returns_what_a_match_parked(monkeypatch):
 
     assert cm.linear_state_pool.num_free_slots == slots_before + 1
     cm.check_integrity()
+
+
+def test_a_spill_keeps_the_gdn_snapshot_so_the_prefix_stays_resumable(monkeypatch):
+    """A hybrid prefix resumes only from a live snapshot on its node, so moving the KV to the
+    host must not also release the GDN state that decodes it."""
+    qsa, cm = _host_cache(monkeypatch, "4")
+    cache = cm.prefix_cache
+    page = int(cm._host_alloc_pages(1)[0])
+    ids, values = _on_page(160, page)
+    slot = cm.linear_state_pool.alloc(1)[0]
+    cache.insert(ids, values, mamba_value=slot)
+    free_before = cm.linear_state_pool.num_free_slots
+
+    evicted = cache.evict_full(HOST_PAGE)              # KV pages move to the host tier
+    cm._free(evicted.kv_indices)                       # ...and the scheduler returns the pages
+
+    assert cm.host_tier_stats()["resident_entries"] == 1
+    assert cm.linear_state_pool.num_free_slots == free_before, (
+        "the GDN snapshot must stay allocated while its KV is host-resident"
+    )
+    cm.check_integrity()
+
+
+def test_a_tier_too_big_for_the_host_leaves_serving_untouched(monkeypatch):
+    """Asking for more host pages than the machine can address (or than it has) must come back as
+    "tier off", not as a startup abort: it is an optional hit-rate layer."""
+    _qsa, cm = _host_cache(monkeypatch, str(1 << 46))   # 2**46 pages: unmappable on purpose
+
+    assert cm.host_tier_stats() is None, "the tier refused to build and the manager carried on"
+    assert cm.prefix_cache is not None
+    cm.check_integrity()

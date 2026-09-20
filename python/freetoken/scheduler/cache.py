@@ -229,9 +229,9 @@ class CacheManager:
             self.linear_state_pool.free(freed.mamba_slots)
 
     def ensure_mamba_slots(self, n: int) -> None:
-        self._drain_host_frees()
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
         (evict_mamba), returning their slots + any freed KV to the pools."""
+        self._drain_host_frees()
         while self.linear_state_pool.num_free_slots < n:
             er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
             if not er.mamba_slots:
@@ -611,6 +611,9 @@ class CacheManager:
             self._drain_host_frees()
             pc.check_integrity()  # structural: every snapshot node owns a slot, refs >= 0
             cache_pages = (pc.full_evictable + pc.full_protected) // self.page_size
+            # Nothing to add for host-resident nodes: spilling returns their pages to free_slots
+            # and drops them out of full_evictable, so the exact conservation below already
+            # accounts for them (measured: free 8 + cache 0 == 8 with one page host-resident).
             # GDN-slot conservation upper bound: free slots + tree-held snapshots can never
             # exceed the (non-padding) pool capacity; the remainder is held by running requests.
             pool = self.linear_state_pool

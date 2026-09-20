@@ -274,6 +274,10 @@ class HybridRadixCache:
         would overwrite the tree link while this node stayed tracked, and the next host_drop
         would then unlink the LIVE node through the stale parent. What this frees is queued for
         the owner -- a match has no return value to carry it."""
+        # Host-resident only, and only unlocked: every spill site filters ref_count == 0, and
+        # this node is being abandoned. Assert it rather than trust it -- restoring a slot a live
+        # request still reads is silent corruption, not a leak.
+        assert node.mamba_ref_count == 0, "refusing to retire a locked snapshot node"
         if node.host_value is not None:
             self._host_nodes.pop(node.host_value, None)
             node.host_value = None
@@ -283,7 +287,12 @@ class HybridRadixCache:
 
     def drain_host_frees(self) -> "EvictResult | None":
         """Everything reclaimed on the match path since the last call, for the owner of the
-        pools to take back. None when there is nothing to return."""
+        pools to take back. None when there is nothing to return.
+
+        The queue is cleared here, so the caller must not raise between this call and putting
+        both kinds of item back: a partial return would leak the rest with nothing left to retry
+        from. Both pools implement free() as a list extend, so this is a contract, not a window
+        that exists today (see the review note D1)."""
         if not self._host_pending_kv and not self._host_pending_mamba:
             return None
         kv, mamba = self._host_pending_kv, self._host_pending_mamba

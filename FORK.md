@@ -20,6 +20,13 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   box; kept for other platforms).
 - `feat(moe)`: graph-safe decode alignment kernel for >1024-expert slot spaces (marlin path
   prerequisite, not yet wired).
+- `feat(kvcache)`: **host KV tier** — a spilled prefix stays matchable by keeping its pages in
+  host RAM instead of dropping them, with the geometry cross-checked against the pool's own
+  buffers and the QSA index shadow plus mrope positions moving with each page. Opt in with
+  `FREETOKEN_KV_HOST_TIER_PAGES=<pages>` (12,288 pages ≈ 9.8 GB of host RAM at the production
+  page size); unset or 0 keeps the tier out of the manager entirely and the tree evicting as it
+  always did. It does not free device memory -- it is host RAM buying prefix reuse, so the arm
+  that matters is hit ratio/TTFT, and the arm that must not move is output bits.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
 ## Measurement protocol

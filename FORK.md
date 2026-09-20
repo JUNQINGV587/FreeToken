@@ -47,6 +47,22 @@ output window; each rule below was learned by getting a wrong number first.
 - **Take KV occupancy from the engine log `token usage`**, not from polling `/v1/stats`:
   under saturation the stats request itself queues and the sampler under-reads (47.9%
   sampled against the 97% the engine reported for the same run).
+- **A per-call `cuda.Event` around a small op measures the Python launch gap, not the GPU.**
+  At bs=1 the QSA sparse-attend call reads 86.9 us that way while its two kernels take 8.14 us
+  and a one-element `fill_` in the same harness reads 24.6 us. Use torch profiler device time,
+  or replay the call inside a CUDA graph, to get the number production actually pays.
+
+## Measured and deliberately not changed
+
+- **QSA sparse-attention tier ladder** (`kernel/triton/qsa/attend.py`, the `(block_n,
+  target_splits, partial_warps)` table tuned on GB300). Measured on 2xL20 at production shapes
+  (1 local KV head, group_size 12, head_dim 256, selection width 2051, page 64): inside the
+  captured decode graphs the call costs 19.9-23.0 us/layer, i.e. ~2.0% of a 12.2 ms step at
+  bs<=4 and ~2.2% at bs=8, of which only 8.1-14.7 us are the two kernels. The ladder only
+  chooses block_n and the split count, so re-tuning it cannot reach the +0.5% e2e threshold in
+  force here; the visible residue is the split-K workspace, not the tiling. Numbers and method:
+  `research/runs/202609-freetoken-port-batch1/sweep-summary.md`. The QSA *indexer* chain
+  (`_qsa_mqa_paged_kernel` and the top-k kernels) was not measured and is a separate question.
 
 ## Precision contract
 

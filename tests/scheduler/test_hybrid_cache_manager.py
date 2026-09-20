@@ -261,13 +261,13 @@ def _tp(monkeypatch):
                         lambda: DistributedInfo(rank=0, size=1))
 
 
-def _qsa_pool():
+def _qsa_pool(mrope: bool = False):
     from freetoken.kvcache.qsa_pool import QSAKVCache
     return QSAKVCache(
         num_kv_heads=1, num_layers=QSA_TOTAL_LAYERS, head_dim=4, num_pages=QSA_PAGES,
         page_size=HOST_PAGE, dtype=torch.bfloat16, device=torch.device("cpu"),
         index_head_dim=QSA_IDX_DIM, num_index_layers=QSA_IDX_LAYERS, index_ratio=QSA_RATIO,
-        num_req_slots=2, layer_ids=(1, 3),
+        num_req_slots=2, layer_ids=(1, 3), mrope=mrope,
     )
 
 
@@ -371,3 +371,35 @@ def test_rebuild_clears_the_host_tier_before_replacing_the_tree(monkeypatch):
     assert cm._host_tier.resident_entries == 0, "entries describe the discarded tree"
     assert cm._host_tier.resident_pages == 0
     assert cm.prefix_cache.host_resident_size == 0
+
+
+def test_the_rope_rows_move_with_the_page_on_a_mrope_pool(monkeypatch):
+    """mrope's per-token 3-axis position is slot-addressed state: leave it behind on a restore
+    and every restored token ropes at the position of whoever owns the page now."""
+    _tp(monkeypatch)
+    monkeypatch.setenv("FREETOKEN_KV_HOST_TIER_PAGES", "4")
+    qsa, lsp = _qsa_pool(mrope=True), _pool()
+    cm = CacheManager(QSA_PAGES, HOST_PAGE, torch.zeros(2, 64, dtype=torch.int32),
+                      "hybrid_radix", linear_state_pool=lsp, swa_pool=qsa)
+    assert cm._host_tier.geometry.rope_pos is True
+
+    for page, seed in ((0, 5), (1, 9)):
+        qsa.rope_positions[page * HOST_PAGE:(page + 1) * HOST_PAGE] = torch.tensor(
+            [[seed, page, axis] for axis in range(HOST_PAGE)], dtype=torch.int32)
+    before = {page: qsa.rope_positions[page * HOST_PAGE:(page + 1) * HOST_PAGE].clone()
+              for page in (0, 1)}
+
+    ids = torch.arange(2 * HOST_PAGE, dtype=torch.int32)
+    values = (torch.arange(2 * HOST_PAGE, dtype=torch.int32) // HOST_PAGE) * HOST_PAGE
+    cache = cm.prefix_cache
+    cache.insert(ids, values, mamba_value=1)
+    cache.evict_full(2 * HOST_PAGE)
+    held = cm._host_alloc_pages(2)
+    assert [int(v) for v in held] == [0, 1]
+
+    assert cache.match_prefix(ids).cached_len == 2 * HOST_PAGE
+
+    restored = [int(v) // HOST_PAGE for v in _walk_leaf(cache).value[::HOST_PAGE]]
+    assert restored == [2, 3]
+    for got, src in zip(restored, (0, 1)):
+        assert torch.equal(qsa.rope_positions[got * HOST_PAGE:(got + 1) * HOST_PAGE], before[src])

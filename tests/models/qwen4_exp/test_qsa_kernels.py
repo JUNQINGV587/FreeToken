@@ -4,13 +4,18 @@ Only kernels FreeToken changed or wrote get unit tests: the compression kernel (
 pending ring, its own torch check) and the block top-k (original radix select, checked against
 torch.topk and, through the expansion chain, against the vLLM reference semantics). score.py
 and attend.py are vendored from vLLM and are covered by the backend and e2e tests.
+``test_profile_ladder_is_anchored`` additionally parses attend.py's tier ladder offline: every
+CUDA-gated test here skips on a CPU-only box, yet the ladder alone decides the production split
+count and the size of the split-K workspace.
 ``_qsa_mqa_paged_reference`` / ``_qsa_relative_topk_reference`` / ``_expand_qsa_indices_reference``
 are transcribed from ``vllm/tests/test_qsa_reference.py`` (Apache-2.0).
 """
 
 from __future__ import annotations
 
+import ast
 import math
+import pathlib
 
 import pytest
 import torch
@@ -484,3 +489,148 @@ def test_capture_graph_provisions_the_block_topk_scratch():
     assert backend._scratch("topk_scratch", 2, width, dtype=torch.int32).data_ptr() == (
         static.data_ptr()
     )
+
+
+# --- offline anchor for the vendored tier ladder (no CUDA, no triton import) -----------------
+#
+# attend.py is vendored and every test above is gated on CUDA, so on a CPU-only box the ladder
+# that picks the decode split count has no protection at all. Parse it out of the source instead:
+# that pins the numbers the production shapes depend on, and a future re-tune has to edit this
+# table deliberately rather than shift a boundary silently.
+
+_ATTEND_PATH = (
+    pathlib.Path(__file__).resolve().parents[3]
+    / "python"
+    / "freetoken"
+    / "kernel"
+    / "triton"
+    / "qsa"
+    / "attend.py"
+)
+
+# The ladder as vendored (attend.py:266-278), in source order.
+_TIERS = [
+    ("<=", "small_profile_limit", (16, 64, 4)),
+    ("<", 32, (16, 32, 4)),
+    ("<=", 256, (64, 8, 2)),
+    ("<=", 512, (64, 4, 2)),
+    (None, None, (64, 1, 2)),
+]
+
+# Production geometry: TP=2 shards the 2 KV heads, so one local KV head per rank, and
+# select_width = index_budget (2048) + index_ratio (4) - 1. QSA runs on 12 of the 48 layers.
+_PROD_SELECT_WIDTH = 2051
+_PROD_NUM_Q_HEADS = 12
+_PROD_HEAD_DIM = 256
+
+
+def _parse_ladder() -> tuple[list[tuple], tuple[int, int]]:
+    """Return (tiers, (small, large)) as parsed from ``qsa_sparse_paged_attention``."""
+    tree = ast.parse(_ATTEND_PATH.read_text(encoding="utf-8"))
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "qsa_sparse_paged_attention"
+    )
+    tiers: list[tuple] = []
+    limit: tuple[int, int] | None = None
+    for node in fn.body:
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "small_profile_limit":
+            assert isinstance(node.value, ast.IfExp), "small_profile_limit stopped being a ternary"
+            assert ast.unparse(node.value.test) == "block_m <= 8"
+            limit = (ast.literal_eval(node.value.body), ast.literal_eval(node.value.orelse))
+        if isinstance(node, ast.If) and "base_programs" in ast.unparse(node.test):
+            cur = node
+            while True:
+                op_node = cur.test.ops[0]
+                ops = {"Lt": "<", "LtE": "<="}
+                op = ops[type(op_node).__name__]
+                bound = cur.test.comparators[0]
+                bound = ast.unparse(bound) if isinstance(bound, ast.Name) else ast.literal_eval(bound)
+                assert [ast.unparse(t) for t in cur.body[0].targets[0].elts] == [
+                    "block_n",
+                    "target_splits",
+                    "partial_warps",
+                ]
+                tiers.append((op, bound, tuple(ast.literal_eval(v) for v in cur.body[0].value.elts)))
+                rest = cur.orelse
+                if len(rest) == 1 and isinstance(rest[0], ast.If):
+                    cur = rest[0]
+                    continue
+                assert len(rest) == 1 and isinstance(rest[0], ast.Assign)
+                tiers.append(
+                    (None, None, tuple(ast.literal_eval(v) for v in rest[0].value.elts))
+                )
+                break
+    assert limit is not None
+    return tiers, limit
+
+
+def _profile(base_programs: int, block_m: int, width: int, tiers: list[tuple], limit) -> tuple:
+    """The ladder's arithmetic, replayed from the parsed tiers."""
+    small, large = limit
+    cap = small if block_m <= 8 else large
+    block_n, target, warps = tiers[-1][2]
+    for op, bound, values in tiers:
+        if op is None:
+            break
+        rhs = cap if bound == "small_profile_limit" else bound
+        if op == "<=" and base_programs <= rhs:
+            block_n, target, warps = values
+            break
+        if op == "<" and base_programs < rhs:
+            block_n, target, warps = values
+            break
+    num_tiles = -(-width // block_n)
+    max_useful = 1 << (num_tiles.bit_length() - 1)
+    return block_n, target, warps, min(max_useful, target)
+
+
+def test_profile_ladder_is_anchored():
+    """A re-tune must edit _TIERS on purpose; this fails loudly when a boundary moves."""
+    tiers, limit = _parse_ladder()
+    assert tiers == _TIERS, "attend.py's tier ladder changed - update _TIERS and re-measure"
+    assert limit == (8, 4), "small_profile_limit changed - update the anchor and re-measure"
+
+
+def test_decode_graphs_use_the_narrow_split_tier():
+    """bs 1/2/4/8 are the captured decode graphs: all sit in the 16-tile tiers, 64 or 32 splits."""
+    tiers, limit = _parse_ladder()
+    expected = {1: (16, 64, 64), 2: (16, 64, 64), 4: (16, 64, 64), 8: (16, 32, 32)}
+    for bs, want in expected.items():
+        block_n, _target, _warps, num_splits = _profile(
+            bs, 16, _PROD_SELECT_WIDTH, tiers, limit
+        )
+        assert (block_n, num_splits) == (want[0], want[2]), f"bs={bs} profile moved"
+
+
+def test_prefill_keeps_the_direct_write_path():
+    """A 8192-token chunk lands past the last boundary: one split, no workspace, direct write."""
+    tiers, limit = _parse_ladder()
+    block_n, target, _warps, num_splits = _profile(8192, 16, _PROD_SELECT_WIDTH, tiers, limit)
+    assert (block_n, target, num_splits) == (64, 1, 1)
+
+
+def test_split_k_workspace_stays_bounded():
+    """The partial output is (num_splits, *q.shape) fp32, allocated only when num_splits > 1: large
+    splits are safe only while they stay bound to small token counts. 8192 tokens at 64 splits
+    would be 4 GiB, so assert both the current ceiling and the invariant that keeps a future
+    re-tune away from that combination."""
+    tiers, limit = _parse_ladder()
+    ceiling = 64 << 20
+    worst = 0
+    for tokens in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
+        _block_n, _target, _warps, num_splits = _profile(
+            tokens, 16, _PROD_SELECT_WIDTH, tiers, limit
+        )
+        if num_splits == 1:
+            continue  # direct write: num_splits == 1 compiles the workspace accesses out
+        if num_splits >= 8:
+            assert tokens <= 256, (
+                f"{tokens} tokens at {num_splits} splits is outside the bounded region: the fp32 "
+                f"split-K workspace would be {(num_splits * tokens * _PROD_NUM_Q_HEADS * _PROD_HEAD_DIM * 4) >> 20} MiB"
+            )
+        partial_output = num_splits * tokens * _PROD_NUM_Q_HEADS * _PROD_HEAD_DIM * 4
+        partial_lse = num_splits * tokens * _PROD_NUM_Q_HEADS * 4
+        worst = max(worst, partial_output + partial_lse)
+    assert worst <= ceiling, f"split-K workspace grew to {worst >> 20} MiB"

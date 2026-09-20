@@ -106,7 +106,7 @@ def test_restore_reports_a_miss_for_an_unknown_page():
     assert torch.all(k == 3.0)  # a miss leaves the caller's buffer untouched
 
 
-def test_drop_frees_the_slot_without_counting_a_drop():
+def test_drop_frees_the_slot_and_the_ledger_says_so():
     g = geom()
     tier = HostKVTier(g, 1)
     buf = pool_buffer(2, g)
@@ -117,7 +117,10 @@ def test_drop_frees_the_slot_without_counting_a_drop():
     tier.spill(1, *page_views(buf, 1))
 
     assert tier.resident_pages == 1
-    assert tier.stats.dropped == 0
+    # dropped/dropped_bytes explain every page that leaves without being restored; an explicit
+    # drop is one of them, or the ledger would not add up against resident_pages.
+    assert tier.stats.dropped == 1
+    assert tier.stats.dropped_bytes == tier.bytes_per_page
     assert 1 in tier
 
 

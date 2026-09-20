@@ -48,6 +48,12 @@ from .host_tier import (
 
 logger = init_logger(__name__)
 
+# Why a restore did not happen. Kept apart so a hit-ratio alarm does not have to guess.
+_OK = "ok"
+_MISS = "miss"
+_DECLINED = "declined"
+_STARVED = "starved"
+
 # Host RAM the tier may hold, as a page count. Unset or 0 keeps the tier off, which is the
 # default: spilling a prefix to host memory changes what a request reads, so it is turned on
 # deliberately and per deployment, not by a code path that a model shape happens to reach.
@@ -93,9 +99,11 @@ def maybe_build_bridge(
         tier = HostKVTier(geometry, pages, backing=backing, on_drop=on_drop)
         bridge = PoolHostBridge(pool, tier, page_size, alloc_pages=alloc_pages,
                                 key_prefix=key_prefix)
-    except (TierGeometryMismatch, OSError) as exc:
-        # OSError: a degenerate bank (e.g. zero rows) makes its backing file unusable. The tier is
-        # an optional hit-rate layer, so refusing to build it must never take the engine down.
+    except (TierGeometryMismatch, OSError, MemoryError, OverflowError, ValueError) as exc:
+        # OSError/OverflowError: a degenerate or unmappable bank (zero rows, or a size the host
+        # cannot address) leaves the backing unusable; MemoryError: the host is out of RAM. The
+        # tier is an optional hit-rate layer, so refusing to build it must never take the engine
+        # down -- asking for more host pages than the machine has must leave serving untouched.
         logger.warning("KV host tier stays off: %s", exc)
         return None
     logger.info("KV host tier: %d pages (%.2f GiB) behind %s",
@@ -246,37 +254,46 @@ class PoolHostBridge:
         return key
 
     def materialize(self, node, key: Hashable) -> torch.Tensor | None:
-        """Copy the entry back into freshly allocated pages, one page index per token."""
-        value = self._materialize(node, key)
+        """Copy the entry back into freshly allocated pages, one page index per token.
+
+        The counters keep the reasons apart (see TierStats): a miss is cache behaviour, a refusal
+        is the tier declining by design, and starvation is the allocator failing under pressure.
+        Counting every None as a refusal -- as this did -- hides the one worth paging on.
+        """
+        value, reason = self._materialize(node, key)
         stats = self.tier.stats
-        if value is None:
-            stats.refusals += 1
-        else:
+        if reason == _OK:
             stats.restores += 1
             stats.hits += 1
+        elif reason == _MISS:
+            stats.misses += 1
+        elif reason == _STARVED:
+            stats.misses += 1  # the prefix is unusable, so the hit ratio must show it...
+            stats.alloc_starved += 1  # ...and this is the part an operator acts on
+        else:
+            stats.refusals += 1
         return value
 
-    def _materialize(self, node, key: Hashable) -> torch.Tensor | None:
+    def _materialize(self, node, key: Hashable) -> tuple[torch.Tensor | None, str]:
         """The work behind :meth:`materialize`; counting lives in the wrapper."""
         slots = self.tier.entry_slots(key)
         if slots is None:
-            self.tier.stats.misses += 1
-            return None  # the tier's LRU dropped it; the prefix is gone, recompute
+            return None, _MISS  # never spilled, or the tier's LRU dropped it
         if node.length % self.page_size:
             self.tier.drop(key)
-            return None
+            return None, _DECLINED
         n_pages = node.length // self.page_size
         if len(slots) != n_pages:
             self.tier.drop(key)
-            return None
+            return None, _DECLINED
         fresh = self.alloc_pages(n_pages)
         if fresh is None or int(fresh.numel()) != n_pages:
             self.tier.drop(key)
-            return None
+            return None, _STARVED
         pages = [int(p) for p in fresh]
         if len(set(pages)) != n_pages or min(pages) < 0 or max(pages) >= self.num_pages:
             self.tier.drop(key)
-            return None
+            return None, _DECLINED
         for i, page in enumerate(pages):
             kv = self.pool.page_kv_view(page)
             kv[0].copy_(self.tier.k_page(slots[i]))
@@ -287,7 +304,7 @@ class PoolHostBridge:
                 self._rope_rows(page).copy_(self.tier.rope_page(slots[i]))
         self.tier.drop(key)
         # Same layout as node.value: each token names its page by the page's first slot id.
-        return (fresh.to(torch.int32) * self.page_size).repeat_interleave(self.page_size)
+        return (fresh.to(torch.int32) * self.page_size).repeat_interleave(self.page_size), _OK
 
     def forget(self, key: Hashable) -> bool:
         """Release an entry nobody will restore (the cache freed its node).

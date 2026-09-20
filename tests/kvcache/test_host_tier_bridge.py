@@ -405,10 +405,81 @@ def test_the_counters_move_on_the_path_that_actually_moves_bytes():
     assert tier.stats_snapshot()["refusals"] == 1
     assert br.materialize(node, "kv:not-a-key") is None, "never spilled: a miss"
     missing = tier.stats_snapshot()
-    assert missing["misses"] == 1 and missing["refusals"] == 2
+    assert missing["misses"] == 1, "an absent entry is a miss"
+    assert missing["refusals"] == 1, "and NOT also a refusal: those are separate stories"
+    assert missing["alloc_starved"] == 0
 
     assert br.materialize(node, key) is not None
     back = tier.stats_snapshot()
     assert back["restores"] == 1 and back["hits"] == 1
     assert back["resident_entries"] == 0 and back["resident_pages"] == 0
     assert back["capacity_pages"] == tier.num_pages > 0
+
+
+def test_nothing_in_the_engine_calls_the_tiers_own_copy_methods():
+    """The bridge copies slab by slab into the real banks; HostKVTier.spill()/restore() are a
+    different, unused implementation of the same idea that touches no real bank. If anything
+    wired them up, the counters (which the bridge moves) and the memory would disagree -- which
+    is exactly the bug that made every counter read zero before it was found."""
+    import re
+    from pathlib import Path
+
+    import freetoken
+
+    root = Path(freetoken.__file__).parent
+    hits = []
+    for path in sorted(root.rglob("*.py")):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if "def " in line:
+                continue
+            if re.search(r"\.spill\(|\.restore\(", line):
+                hits.append(f"{path.relative_to(root)}:{lineno}: {line.strip()}")
+    assert hits == [], (
+        "the engine must reach the banks only through PoolHostBridge; these call sites would "
+        "move no bytes while reporting that they did: " + "; ".join(hits)
+    )
+
+
+def test_a_starved_restore_is_told_apart_from_a_miss_and_a_refusal():
+    """The entry is resident and well-shaped; the allocator just has nothing to give. That is
+    memory pressure, not cache behaviour, and an operator chasing a hit-ratio drop must see it."""
+    pool = FakeQSAPool()
+    br, tier = bridge(pool, alloc=Alloc(5))
+    node = Node("w1", PAGE, first_page=1)
+    fill_page(pool, 1, 7)
+    key = br.spill(node)
+
+    br.alloc_pages = Alloc()                      # the device pool is exhausted
+    assert br.materialize(node, key) is None
+
+    snap = tier.stats_snapshot()
+    assert snap["alloc_starved"] == 1, "the actionable one"
+    assert snap["misses"] == 1, "the prefix is unusable, so the hit ratio must show it too"
+    assert snap["refusals"] == 0, "not a design refusal: we wanted to serve this"
+    assert snap["restores"] == 0
+    assert snap["resident_entries"] == 0, "a failed restore still drops the entry"
+
+
+def test_dropping_and_clearing_release_pages_the_ledger_accounts_for():
+    pool = FakeQSAPool()
+    br, tier = bridge(pool, alloc=Alloc(5, 6))
+    first = Node("w1", PAGE, first_page=1)
+    second = Node("w2", PAGE, first_page=2)
+    fill_page(pool, 1, 7)
+    fill_page(pool, 2, 9)
+    k1 = br.spill(first)
+    br.spill(second)
+    assert tier.stats_snapshot()["dropped"] == 0
+
+    assert tier.drop(k1) is True
+
+    dropped = tier.stats_snapshot()
+    assert dropped["dropped"] == 1 and dropped["dropped_bytes"] == tier.bytes_per_page
+    assert dropped["resident_entries"] == 1
+
+    tier.clear()
+
+    cleared = tier.stats_snapshot()
+    assert cleared["dropped"] == 2, "clearing releases a page too"
+    assert cleared["dropped_bytes"] == 2 * tier.bytes_per_page
+    assert cleared["resident_entries"] == 0 and cleared["resident_pages"] == 0

@@ -220,9 +220,17 @@ class TierStats:
     ``spills``/``restores``/``hits``/``misses`` are written by the BRIDGE, which is what moves
     bytes on the real path (it copies slab by slab, so it never calls this class's
     ``spill``/``restore``). Those two methods keep their own counting for direct users.
-    ``refusals`` counts spans the bridge declined by design: a node longer than the tier, an
-    already-resident key, an entry whose shape no longer matches. ``dropped``/``dropped_bytes``
-    are the LRU reclaiming room.
+
+    The reasons a restore did not happen are kept apart on purpose, because they mean different
+    things to whoever is reading a hit ratio: ``misses`` is the cache doing its job (nothing
+    resident: never spilled, or the LRU dropped it), ``refusals`` is the tier declining by design
+    (entry shape or size no longer matches, alias/out-of-range pages), and ``alloc_starved`` is
+    the allocator failing to hand back pages for an entry that WAS resident and well-shaped --
+    the one that means memory pressure rather than cache behaviour. A starved restore counts in
+    both ``misses`` and ``alloc_starved``: the prefix is unusable either way.
+
+    ``dropped``/``dropped_bytes`` count resident pages released without being restored -- LRU
+    eviction, an explicit drop, and a wholesale clear.
     """
 
     spills: int = 0
@@ -230,6 +238,7 @@ class TierStats:
     hits: int = 0
     misses: int = 0
     refusals: int = 0
+    alloc_starved: int = 0
     dropped: int = 0
     dropped_bytes: int = 0
 
@@ -309,6 +318,7 @@ class HostKVTier:
             "hits": s.hits,
             "misses": s.misses,
             "refusals": s.refusals,
+            "alloc_starved": s.alloc_starved,
             "dropped": s.dropped,
             "dropped_bytes": s.dropped_bytes,
         }
@@ -463,6 +473,8 @@ class HostKVTier:
             return False
         self._lru.pop(key, None)
         self._free.extend(slots)
+        self.stats.dropped += len(slots)
+        self.stats.dropped_bytes += self.bytes_per_page * len(slots)
         return True
 
     def clear(self) -> None:
@@ -471,7 +483,9 @@ class HostKVTier:
         The callback is what unlinks the cache's host-resident node; a silent clear would leave
         nodes pointing at a tier that no longer holds their bytes.
         """
-        for key in self._slots:
+        for key, slots in self._slots.items():
+            self.stats.dropped += len(slots)
+            self.stats.dropped_bytes += self.bytes_per_page * len(slots)
             if self.on_drop is not None:
                 self.on_drop(key)
         self._slots.clear()

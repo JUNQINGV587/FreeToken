@@ -312,7 +312,9 @@ class PoolHostBridge:
         # slot id plus the token's offset. Repeating the page start instead left a materialized
         # node's value as the only one in the tree that a token-indexed reader would mis-read.
         starts = fresh.to(torch.int32) * self.page_size
-        offsets = torch.arange(self.page_size, dtype=torch.int32)
+        # The row must be built where the allocation is: the pool hands back device tensors, so an
+        # arange on the default device mixes cuda and cpu and takes the worker down mid-match.
+        offsets = torch.arange(self.page_size, dtype=torch.int32, device=starts.device)
         return (starts.unsqueeze(1) + offsets).flatten(), _OK
 
     def forget(self, key: Hashable) -> bool:

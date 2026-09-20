@@ -170,6 +170,39 @@ def test_round_trip_into_fresh_pages_is_bit_exact_in_all_three_slabs():
             assert torch.equal(a, b), "NaN/Inf-free equality would hide a bit-pattern slip"
 
 
+def test_the_per_token_value_is_built_on_the_allocation_s_device(monkeypatch):
+    """A restore's offsets row must name the allocation's device, not take the default one.
+
+    Found on hardware, not here: the real allocator hands back CUDA tensors, so an offsets row
+    built on the default device raised ``Expected all tensors to be on the same device ...
+    cuda:0 and cpu`` inside ``match_prefix`` and took the backend worker down. The fake allocator
+    returns CPU tensors, so the default device happened to agree and this suite stayed green.
+    Below, an arange that names no device is built on ``meta`` instead, which reproduces the
+    split -- the same error class -- without a GPU. The only tensor this call path creates is
+    that row, so patching arange for the call is enough.
+    """
+    pool = FakeQSAPool()
+    for page in range(PAGES):
+        fill_page(pool, page, seed=page + 1)
+    node = Node("n5", PAGE, first_page=2)
+    br, tier = bridge(pool, alloc=Alloc(5))
+    key = br.spill(node)
+    real_arange = torch.arange
+
+    def arange_elsewhere_if_unnamed(*args, **kwargs):
+        if "device" not in kwargs:
+            kwargs = {**kwargs, "device": "meta"}
+        return real_arange(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "arange", arange_elsewhere_if_unnamed)
+        value = br.materialize(node, key)
+
+    assert value is not None
+    assert value.device.type == "cpu", "the value indexes the device pool, so it lands there"
+    assert [int(v) for v in value] == [5 * PAGE + offset for offset in range(PAGE)]
+
+
 def test_a_slot_id_is_never_read_as_a_page_number():
     """Page 3's first slot is 12; read as a page number that is off the end of an 8-page pool."""
     pool = FakeQSAPool()

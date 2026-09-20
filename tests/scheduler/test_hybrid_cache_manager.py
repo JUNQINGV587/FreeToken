@@ -544,3 +544,19 @@ def test_a_refused_materialize_on_the_match_path_returns_its_resources(monkeypat
     assert cm.linear_state_pool.num_free_slots == slots_before + 1, "the snapshot slot is back"
     assert len(cm.free_slots) == pages_before, "the node held no pages of its own"
     cm.check_integrity()
+
+
+def test_the_manager_reports_the_tier_only_when_it_is_enabled(monkeypatch):
+    """None, not zeros: an operator must be able to tell 'off' from 'on but idle'."""
+    _qsa, off = _host_cache(monkeypatch, "0")
+    assert off.host_tier_stats() is None
+
+    _qsa, on = _host_cache(monkeypatch, "4")
+    snap = on.host_tier_stats()
+    assert snap is not None and snap["spills"] == 0, "enabled, nothing spilled yet"
+    assert snap["capacity_pages"] == 4
+    ids, values = _page_prefix(100)
+    on.prefix_cache.insert(ids, values, mamba_value=on.linear_state_pool.alloc(1)[0])
+    on._free(on.prefix_cache.evict_full(HOST_PAGE).kv_indices)   # spill it: pages back, bytes host
+    assert on.host_tier_stats()["spills"] == 1, "the counter follows the real spill"
+    assert on.host_tier_stats()["resident_entries"] == 1

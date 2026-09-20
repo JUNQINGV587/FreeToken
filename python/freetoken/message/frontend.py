@@ -52,6 +52,9 @@ class UserReply(BaseFrontendMsg):
     # Encoder embedding-cache snapshot (entries / bytes), same pass-through and interval.
     # None when the process builds no encoder tower or the sample hasn't arrived yet.
     mm_stats: dict | None = None
+    # Throttled host KV-tier snapshot (spills/restores/refusals + residency, see TierStats);
+    # None until the first sample or when FREETOKEN_KV_HOST_TIER_PAGES is unset.
+    host_tier_stats: dict | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

@@ -55,6 +55,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # Throttled encoder embedding-cache snapshot (entries/bytes, see EncoderCache.stats)
     # for /v1/stats. None when this process builds no encoder tower, or between samples.
     mm_stats: dict | None = None
+    # Throttled host KV-tier snapshot; None when the deployment did not enable the tier.
+    host_tier_stats: dict | None = None
 
 
 @dataclass

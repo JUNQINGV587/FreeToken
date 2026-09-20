@@ -421,6 +421,7 @@ class Scheduler(SchedulerIOMixin):
             swa_used, swa_total = swa_tokens or (0, 0)
             moe_stats = self._moe_stats_snapshot()
             mm_stats = self._mm_stats_snapshot()
+            host_tier_stats = self._host_tier_stats_snapshot()
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -433,6 +434,8 @@ class Scheduler(SchedulerIOMixin):
                     m.moe_stats = moe_stats
                 if mm_stats is not None:
                     m.mm_stats = mm_stats
+                if host_tier_stats is not None:
+                    m.host_tier_stats = host_tier_stats
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -547,6 +550,22 @@ class Scheduler(SchedulerIOMixin):
             return None
         self._moe_stats_last_at = now
         return snap
+
+    def _host_tier_stats_snapshot(self) -> dict | None:
+        """Throttled host KV-tier snapshot for /v1/stats (spills/restores/refusals, residency).
+
+        None when this deployment did not enable the tier (the ordinary case: it is off unless
+        FREETOKEN_KV_HOST_TIER_PAGES is set). Sampled at most once per second like its MoE and
+        encoder siblings, and a failing sample must never break the reply stream."""
+        cache = getattr(self, "cache_manager", None)
+        stats = None if cache is None else cache.host_tier_stats()
+        if stats is None:
+            return None
+        now = time.monotonic()
+        if now - getattr(self, "_host_tier_stats_last_at", 0.0) < 1.0:
+            return None
+        self._host_tier_stats_last_at = now
+        return stats
 
     def _mm_stats_snapshot(self) -> dict | None:
         """Throttled encoder embedding-cache snapshot for /v1/stats (live entries/bytes).

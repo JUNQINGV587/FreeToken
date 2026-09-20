@@ -41,6 +41,10 @@ class StatsTracker:
         # Last encoder embedding-cache snapshot (entries/bytes) stamped by the scheduler; None
         # until the first sample or when the process builds no encoder tower.
         self.mm_stats: dict | None = None
+        # Last host KV-tier snapshot stamped by the scheduler (spills/restores/refusals and live
+        # residency); None until the first sample or when the tier is not enabled -- None is NOT
+        # "enabled but idle", which is why the field is absent rather than zeroed.
+        self.host_tier_stats: dict | None = None
         self.kv_used_pages = 0
         self.kv_total_pages = 0
         self.mamba_used_slots = 0
@@ -80,6 +84,8 @@ class StatsTracker:
             self.moe_stats = reply.moe_stats
         if getattr(reply, "mm_stats", None) is not None:
             self.mm_stats = reply.mm_stats
+        if getattr(reply, "host_tier_stats", None) is not None:
+            self.host_tier_stats = reply.host_tier_stats
         if getattr(reply, "kv_total_pages", 0) > 0:  # ignore 0/0 (prompt reply, owned-KV)
             self.kv_used_pages = reply.kv_used_pages
             self.kv_total_pages = reply.kv_total_pages
@@ -266,4 +272,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         },
         "moe": tr.moe_stats,
         "mm": mm,
+        # The host KV tier is a prefix-cache extension, so it sits beside that section rather
+        # than under moe/mm. None when the deployment did not enable it.
+        "kv_host_tier": tr.host_tier_stats,
     }

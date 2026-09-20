@@ -206,6 +206,15 @@ class CacheManager:
             if ev.kv_indices.numel():
                 self._free(ev.kv_indices)
 
+    def host_tier_stats(self) -> dict | None:
+        """Snapshot of the host KV tier, or None when this deployment did not enable it.
+
+        The tier is off by default, so None is the ordinary answer; a caller must not read
+        zeroed counters as "enabled but idle"."""
+        if self._host_tier is None:
+            return None
+        return self._host_tier.stats_snapshot()
+
     def _drain_host_frees(self) -> None:
         """The match path reclaims host-resident nodes a tier will not serve again, and has no
         return value to carry what the unlink frees. Take it back here, before any pool check."""

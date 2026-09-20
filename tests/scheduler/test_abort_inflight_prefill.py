@@ -69,6 +69,7 @@ def _setup():
         _gpu_mem_bytes=lambda: 0,
         _moe_stats_snapshot=lambda: None,
         _mm_stats_snapshot=lambda: None,
+        _host_tier_stats_snapshot=lambda: None,
         _match_stop_str=lambda _req: None,
         _pending_abort_acks=set(),
         _last_data=None,

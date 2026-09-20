@@ -13,7 +13,7 @@ from freetoken.server.stats import build_stats
 
 
 def _state(*, cache_pools=None, enforced=None, page_size=1, model_max=262144,
-           served_modalities=(), mm=None, mm_stats=None):
+           served_modalities=(), mm=None, mm_stats=None, host_tier_stats=None):
     pools = dict(cache_pools or {})
     state = SimpleNamespace(
         config=SimpleNamespace(
@@ -39,7 +39,7 @@ def _state(*, cache_pools=None, enforced=None, page_size=1, model_max=262144,
         kv_used_pages=10, kv_total_pages=4096, mamba_used_slots=0, mamba_total_slots=0,
         swa_used_tokens=0, swa_total_tokens=0, vram_bytes=1 << 30, active=0, completed=0,
         prompt_tokens_total=0, completion_tokens_total=0, cached_tokens_total=0,
-        moe_stats=None, mm_stats=mm_stats, decode_tps=lambda *_: 0.0, prefill_tps=lambda *_: 0.0,
+        moe_stats=None, mm_stats=mm_stats, host_tier_stats=host_tier_stats, decode_tps=lambda *_: 0.0, prefill_tps=lambda *_: 0.0,
     )
     return state
 
@@ -131,3 +131,13 @@ def test_stats_multimodal_section_survives_before_the_first_sample():
 
     assert mm["encoder_cache"] is None
     assert mm["image_tokens"]["max"] == 4096
+
+
+def test_stats_reports_the_host_tier_section_only_when_it_was_sampled():
+    """The tier is off by default, so the section must be None -- not a zeroed block that reads
+    like an enabled-but-idle tier."""
+    assert build_stats(_state(), p95_ms=0, ttft_mean_ms=0)["kv_host_tier"] is None
+
+    snap = {"capacity_pages": 12288, "spills": 3, "hits": 2, "misses": 1}
+    doc = build_stats(_state(host_tier_stats=snap), p95_ms=0, ttft_mean_ms=0)
+    assert doc["kv_host_tier"] == snap

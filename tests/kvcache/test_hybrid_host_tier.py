@@ -15,6 +15,7 @@ import torch
 
 from freetoken.kvcache.base import HostTierKeyCollision
 from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
+from freetoken.kvcache.radix_cache import RadixTreeNode
 
 PAGE = 2
 
@@ -194,6 +195,21 @@ def test_tokens_are_conserved_through_spill_and_materialize(evict: int):
     cache.match_prefix(ids)
     cache.check_integrity()
     assert accounts(cache) == 16
+
+
+def test_spill_refuses_a_node_that_is_not_page_aligned():
+    """Unreachable through insert(), which aligns every node boundary to page_size; the guard is
+    here so a future path that breaks that invariant fails loudly instead of writing a partial
+    page into the host tier."""
+    cache, _ = make_cache()
+    node = RadixTreeNode(cache.key_fn)
+    node.set_key_value(tokens(3), pages(3))
+    node.mamba_value = 1
+
+    with pytest.raises(ValueError, match="not a multiple of page_size"):
+        cache._spill(node, [])
+
+    assert cache.host_resident_size == 0
 
 
 def test_spill_refuses_a_tier_key_that_already_names_another_node():

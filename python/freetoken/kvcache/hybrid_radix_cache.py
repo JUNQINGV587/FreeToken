@@ -281,6 +281,15 @@ class HybridRadixCache:
         """
         if self.host_spill is None or node.mamba_value is None:
             return False
+        if node.length % self.page_size:
+            # Unreachable through insert(), which aligns every node boundary to page_size -- that
+            # alignment is what lets page-granular banks hold a whole node. Spilling a partial
+            # node would write KV no restore can use, so break loudly if a future path breaks the
+            # invariant rather than putting half a page in host memory.
+            raise ValueError(
+                f"node length {node.length} is not a multiple of page_size {self.page_size}: "
+                "a partial page cannot be spilled to the host tier"
+            )
         key = self.host_spill(node)
         if key is None:
             return False

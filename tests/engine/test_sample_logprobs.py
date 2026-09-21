@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.engine.sample import BatchSamplingArgs, Sampler
@@ -241,3 +242,103 @@ def test_logprob_rows_do_not_change_the_sampled_tokens() -> None:
     )
 
     assert torch.equal(plain, with_logprobs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_cuda_logprob_pass_does_not_perturb_the_sampled_tokens() -> None:
+    # The red line on the real kernels: the same seeded draw over the probability path
+    # (mixed top-k/top-p rows plus a penalty row) must return identical tokens with and
+    # without the logprob pass. Each arm gets its own penalty counters - sample()
+    # increments them for the token it drew, so sharing one tensor across arms would
+    # compare two different distributions instead of the thing under test.
+    vocab = 8192
+    torch.manual_seed(0)
+    sampler = Sampler(torch.device("cuda"), vocab_size=vocab)
+    logits = torch.randn(4, vocab, device="cuda", dtype=torch.bfloat16)
+    temperatures = torch.tensor([0.7, 1.0, 0.5, 1.3], device="cuda", dtype=torch.float32)
+    top_k = torch.tensor([vocab, 50, vocab, 200], device="cuda", dtype=torch.int32)
+    top_p = torch.tensor([1.0, 1.0, 0.9, 0.95], device="cuda", dtype=torch.float32)
+
+    def fresh_args(row_temperatures=temperatures, **extra) -> BatchSamplingArgs:
+        counts = torch.zeros(vocab, device="cuda", dtype=torch.int32)
+        counts[[10, 11, 12]] = 3
+        return BatchSamplingArgs(
+            row_temperatures, top_k=top_k, top_p=top_p, penalties=[(0, counts, 0.5, 1.0)], **extra
+        )
+
+    def draw(args: BatchSamplingArgs) -> torch.Tensor:
+        torch.manual_seed(1234)
+        return sampler.sample(sampler.apply_penalties(logits, args), args)
+
+    plain = draw(fresh_args())
+    with_logprobs = draw(
+        fresh_args(
+            logprob_rows=torch.tensor([True, False, True, False], device="cuda"),
+            max_top_logprobs=20,
+        )
+    )
+    assert torch.equal(plain, with_logprobs)
+
+    greedy_args = fresh_args(row_temperatures=None)
+    greedy = sampler.sample(sampler.apply_penalties(logits, greedy_args), greedy_args)
+    greedy_lp_args = fresh_args(row_temperatures=None)
+    greedy_lp_args.logprob_rows = torch.tensor([True, True, True, True], device="cuda")
+    greedy_lp_args.max_top_logprobs = 20
+    greedy_lp = sampler.sample(sampler.apply_penalties(logits, greedy_lp_args), greedy_lp_args)
+    assert torch.equal(greedy, greedy_lp)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_cuda_computed_logprobs_match_the_penalized_distribution() -> None:
+    vocab = 4096
+    torch.manual_seed(7)
+    sampler = Sampler(torch.device("cuda"), vocab_size=vocab)
+    logits = torch.randn(3, vocab, device="cuda", dtype=torch.bfloat16)
+    counts = torch.zeros(vocab, device="cuda", dtype=torch.int32)
+    counts[[1, 2, 3, 4]] = 2
+    args = BatchSamplingArgs(
+        temperatures=None,
+        penalties=[(1, counts, 1.0, 1.0)],
+        logprob_rows=torch.tensor([True, True, False], device="cuda"),
+        max_top_logprobs=5,
+    )
+
+    penalized = sampler.apply_penalties(logits, args)
+    tokens = torch.tensor([5, 6, 7], device="cuda", dtype=torch.int32)
+    chosen, top_ids, top_logprobs = sampler.compute_logprobs(penalized, tokens, args)
+    torch.cuda.synchronize()
+
+    reference = torch.log_softmax(penalized.float(), dim=-1)
+    for row in (0, 1):
+        assert torch.isclose(
+            chosen[row].cpu(), reference[row, tokens[row]].cpu(), atol=1e-6
+        )
+        expected = reference[row].topk(5)
+        assert torch.equal(top_ids[row].cpu(), expected.indices.cpu().to(torch.int32))
+        assert torch.allclose(top_logprobs[row].cpu(), expected.values.cpu(), atol=1e-6)
+    assert torch.isnan(chosen[2])
+    assert torch.equal(top_ids[2].cpu(), torch.full((5,), -1, dtype=torch.int32))
+
+
+def test_compute_logprobs_uses_the_distribution_before_sampling_updates_counts() -> None:
+    # sample() increments the penalty counters for the token it just drew, so the
+    # logprob pass must read the logits the sampler saw, never the counters again -
+    # otherwise a repeated token would report a logprob from a stricter distribution
+    # than the one it came from.
+    sampler = Sampler(torch.device("cpu"), vocab_size=4)
+    logits = torch.tensor([[1.0, 2.0, 0.5, -1.0]], dtype=torch.float32)
+    counts = torch.zeros(4, dtype=torch.int32)
+    args = BatchSamplingArgs(
+        temperatures=None,
+        penalties=[(0, counts, 0.0, 1.0)],
+        logprob_rows=torch.tensor([True], dtype=torch.bool),
+        max_top_logprobs=2,
+    )
+
+    sampling_logits = sampler.apply_penalties(logits, args)
+    tokens = sampler.sample(sampling_logits, args)
+    assert int(counts[int(tokens[0])]) == 1  # sample() bumped the drawn token's counter
+
+    chosen_logprobs, _, _ = sampler.compute_logprobs(sampling_logits, tokens, args)
+    expected = torch.log_softmax(sampling_logits, dim=-1)
+    assert torch.isclose(chosen_logprobs[0], expected[0, tokens[0]])

@@ -47,6 +47,7 @@ from .generation import (
     count_prompt_tokens,
     generate_events,
     generate_full,
+    _uses_qwen_semantic_protocol,
     prerender_error,
     render_messages,
     resolve_sampling,
@@ -294,6 +295,13 @@ def _chat_logprobs_conflict(req: ChatCompletionRequest, state: Any) -> str | Non
             "tool-call tokens are consumed into tool_calls, so logprob entries cannot "
             "be aligned with message content. Send tool_choice='none' or use "
             "/v1/completions for raw token logprobs."
+        )
+    if _uses_qwen_semantic_protocol(state):
+        return (
+            "logprobs on /v1/chat/completions are not supported on a server configured "
+            "for a Qwen semantic output dialect: the special-token filter can withhold "
+            "or drop generated text, so logprob entries cannot be aligned with message "
+            "content. Use /v1/completions for raw token logprobs."
         )
     return None
 

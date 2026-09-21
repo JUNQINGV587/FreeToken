@@ -16,6 +16,7 @@ from freetoken.server.openai_api import (
     handle_completion,
     register_openai_routes,
     stream_chat_completion_chunks,
+    stream_completion_chunks,
 )
 
 
@@ -868,3 +869,194 @@ def test_chat_logprobs_fail_closed_under_semantic_parsing():
     )
     assert state.sent is not None
     assert "logprobs" in ok["choices"][0]
+
+
+def logprob_entry(token_id: int, token: str, logprob: float) -> dict:
+    return {
+        "token_id": token_id,
+        "token": token,
+        "bytes": list(token.encode("utf-8")),
+        "logprob": logprob,
+        "top": [
+            {
+                "token_id": token_id,
+                "token": token,
+                "bytes": list(token.encode("utf-8")),
+                "logprob": logprob,
+            },
+            {"token_id": token_id + 1, "token": "x", "bytes": [120], "logprob": logprob - 1},
+        ],
+    }
+
+
+def lp_reply(text: str, *, finished: bool = False, logprobs: dict | None = None) -> UserReply:
+    return UserReply(
+        uid=42,
+        incremental_output=text,
+        finished=finished,
+        prompt_tokens_delta=3 if not text else 0,
+        completion_tokens_delta=1 if text else 0,
+        logprobs=logprobs,
+    )
+
+
+def test_chat_non_stream_logprobs():
+    first = logprob_entry(1, "Hello", -0.1)
+    second = logprob_entry(2, "!", -0.2)
+    result = run(
+        handle_chat_completion(
+            chat_request(tools=None, logprobs=True, top_logprobs=2),
+            None,
+            FakeState([lp_reply("Hello", logprobs=first), lp_reply("!", finished=True, logprobs=second)]),
+            {},
+        )
+    )
+
+    assert result["choices"][0]["logprobs"]["content"] == [
+        {
+            "token": "Hello",
+            "logprob": -0.1,
+            "bytes": [72, 101, 108, 108, 111],
+            "top_logprobs": [
+                {"token": "Hello", "logprob": -0.1, "bytes": [72, 101, 108, 108, 111]},
+                {"token": "x", "logprob": -1.1, "bytes": [120]},
+            ],
+        },
+        {
+            "token": "!",
+            "logprob": -0.2,
+            "bytes": [33],
+            "top_logprobs": [
+                {"token": "!", "logprob": -0.2, "bytes": [33]},
+                {"token": "x", "logprob": -1.2, "bytes": [120]},
+            ],
+        },
+    ]
+
+    without_logprobs = run(
+        handle_chat_completion(
+            chat_request(tools=None), None, FakeState([lp_reply("Hello", finished=True)]), {}
+        )
+    )
+    assert without_logprobs["choices"][0].get("logprobs") is None
+
+
+def test_chat_stream_logprobs_follow_content_deltas():
+    first = logprob_entry(1, "Hello", -0.1)
+    state = FakeState([lp_reply("Hello", logprobs=first), lp_reply(" world", finished=True)])
+    req = chat_request(tools=None, stream=True, logprobs=True, top_logprobs=2)
+
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, req, state))))
+    content_choices = [
+        event["choices"][0]
+        for event in events
+        if isinstance(event, dict)
+        and event["choices"]
+        and event["choices"][0]["delta"].get("content")
+    ]
+
+    assert content_choices[0]["logprobs"]["content"][0]["token"] == "Hello"
+    assert "logprobs" not in content_choices[1]
+
+
+def test_completion_logprobs_non_stream_and_stream():
+    first = logprob_entry(1, "Hi", -0.1)
+    second = logprob_entry(2, "!", -0.2)
+    req = CompletionRequest(model="client-model", prompt="hello", logprobs=2, max_tokens=8)
+
+    result = run(
+        handle_completion(
+            req,
+            None,
+            FakeState([lp_reply("Hi", logprobs=first), lp_reply("!", finished=True, logprobs=second)]),
+            {},
+        )
+    )
+    assert result["choices"][0]["logprobs"] == {
+        "tokens": ["Hi", "!"],
+        "token_logprobs": [-0.1, -0.2],
+        "top_logprobs": [{"Hi": -0.1, "x": -1.1}, {"!": -0.2, "x": -1.2}],
+        "text_offset": [0, 2],
+    }
+
+    events = parse_sse(
+        run(
+            _collect(
+                stream_completion_chunks(
+                    42,
+                    CompletionRequest(
+                        model="client-model", prompt="hello", logprobs=2, max_tokens=8, stream=True
+                    ),
+                    FakeState([lp_reply("Hi", finished=True, logprobs=first)]),
+                )
+            )
+        )
+    )
+    chunk = next(event for event in events if isinstance(event, dict) and event["choices"][0]["text"])
+    assert chunk["choices"][0]["logprobs"] == {
+        "tokens": ["Hi"],
+        "token_logprobs": [-0.1],
+        "top_logprobs": [{"Hi": -0.1, "x": -1.1}],
+        "text_offset": [0],
+    }
+
+
+def test_chat_logprobs_fail_closed_on_a_qwen_semantic_server():
+    # The semantic special-token filter (armed server side, independent of the request)
+    # can withhold or drop generated text, so entries could not be aligned with the
+    # visible content: reject instead of returning a quietly mismatched list.
+    state = FakeState([], tool_call_parser="qwen3_coder")
+    resp = run(handle_chat_completion(chat_request(tools=None, logprobs=True), None, state, {}))
+
+    assert resp.status_code == 400
+    assert json.loads(resp.body)["error"]["param"] == "logprobs"
+
+
+def test_reasoning_logprob_is_not_carried_to_content_delta():
+    # The generation-layer half of the contract: even when a caller bypasses request
+    # validation, a hidden reasoning token's entry is dropped, never attached to a
+    # later visible delta (where its token string would leak).
+    state = FakeState(
+        [
+            lp_reply("<think>thought</think>", logprobs=logprob_entry(1, "thought", -0.1)),
+            lp_reply("answer", finished=True),
+        ],
+        reasoning_parser="qwen3",
+    )
+    req = chat_request(tools=None, stream=True, logprobs=True, top_logprobs=2)
+
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, req, state))))
+    content_choice = next(
+        event["choices"][0]
+        for event in events
+        if isinstance(event, dict)
+        and event["choices"]
+        and event["choices"][0]["delta"].get("content") == "answer"
+    )
+
+    assert "logprobs" not in content_choice
+
+
+def test_semantic_filter_drops_entries_with_the_text_it_hides():
+    # A Qwen semantic dialect hides transport markers from content; the entry that
+    # describes such a token must not survive onto the next visible delta.
+    state = FakeState(
+        [
+            lp_reply("<|audio_pad|>", logprobs=logprob_entry(1, "<|audio_pad|>", -0.3)),
+            lp_reply("answer", finished=True),
+        ],
+        tool_call_parser="qwen3_coder",
+    )
+    req = chat_request(tools=None, stream=True, logprobs=True, top_logprobs=2)
+
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, req, state))))
+    content_choices = [
+        event["choices"][0]
+        for event in events
+        if isinstance(event, dict)
+        and event["choices"]
+        and event["choices"][0]["delta"].get("content")
+    ]
+
+    assert content_choices[-1]["delta"]["content"] == "answer"
+    assert all("logprobs" not in choice for choice in content_choices)

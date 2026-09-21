@@ -884,6 +884,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     completion_tokens = 0
     cached_tokens = 0
     pending = ""
+    pending_logprobs: list[dict] = []
     parse_tools = spec.parse_tools
     reasoning_parser = _make_reasoning_parser(spec, state)
     specials = _leaked_special_tokens(state)
@@ -896,6 +897,12 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     def _filter_content(piece: str) -> str:
         return content_special_filter.feed(strip_special_tokens(piece, specials))
 
+    def _content_delta(text: str) -> ContentDelta:
+        nonlocal pending_logprobs
+        logprobs = pending_logprobs or None
+        pending_logprobs = []
+        return ContentDelta(text, logprobs=logprobs)
+
     tool_parser: FunctionCallParser | None = None
     if parse_tools:
         try:
@@ -905,6 +912,20 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         if candidate is not None and candidate.supports_streaming():
             tool_parser = candidate
     frag_stable = tool_parser.args_fragments_prefix_stable() if tool_parser else True
+
+    # Entries ride only the passthrough path: with a reasoning parser or tool parsing
+    # active, text can be hidden, held back, or reclassified, so an entry could come to
+    # describe a token that never reaches visible content. A Qwen semantic dialect arms
+    # the special-token filter even without a per-request parser, and that filter can
+    # withhold or drop text, so it disqualifies the request too. The API layer
+    # fail-closes these combinations up front; this is the structural half of the
+    # contract - a hidden token's entry must never ride a later visible delta.
+    collect_logprobs = (
+        reasoning_parser is None
+        and tool_parser is None
+        and not parse_tools
+        and not _uses_qwen_semantic_protocol(state)
+    )
 
     # Streaming tool-call assembly: detectors emit fragments (name first, then
     # argument diffs); they accumulate here and the call is emitted complete when
@@ -922,7 +943,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         for item in items:
             if isinstance(item, str):
                 if item and not (item.strip() == "" and suppress_ws):
-                    out.append(ContentDelta(item))
+                    out.append(_content_delta(item))
                     if item.strip():
                         suppress_ws = False
             else:
@@ -1004,6 +1025,8 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if collect_logprobs and getattr(ack, "logprobs", None) is not None:
+            pending_logprobs.append(ack.logprobs)
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -1020,7 +1043,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             else:
                 stripped_content = _filter_content(content_delta)
                 if stripped_content:
-                    yield ContentDelta(stripped_content)
+                    yield _content_delta(stripped_content)
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -1043,7 +1066,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             else:
                 stripped_content = _filter_content(flush_content)
                 if stripped_content:
-                    yield ContentDelta(stripped_content)
+                    yield _content_delta(stripped_content)
 
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
@@ -1092,14 +1115,14 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             normal_text, tool_calls = parsed
             normal_text = _filter_content(normal_text)
             if normal_text:
-                yield ContentDelta(normal_text)
+                yield _content_delta(normal_text)
             yield ToolCallsDelta(tool_calls)
             if finish_reason != "length":
                 finish_reason = "tool_calls"
         elif parse_tools and pending:
             stripped_pending = _filter_content(pending)
             if stripped_pending:
-                yield ContentDelta(stripped_pending)
+                yield _content_delta(stripped_pending)
 
     trailing_reasoning = reasoning_special_filter.finish()
     if trailing_reasoning:
@@ -1110,7 +1133,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     else:
         trailing_content = content_special_filter.finish()
         if trailing_content:
-            yield ContentDelta(trailing_content)
+            yield _content_delta(trailing_content)
 
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
@@ -1122,6 +1145,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     """Protocol-neutral non-streaming generation: accumulate, split reasoning, parse
     tool calls, strip special tokens. The adapters format the GenResult into their wire."""
     full_content = ""
+    logprob_entries: list[dict] = []
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
@@ -1134,6 +1158,8 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
         full_content += ack.incremental_output
+        if getattr(ack, "logprobs", None) is not None:
+            logprob_entries.append(ack.logprobs)
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -1165,4 +1191,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        logprobs=logprob_entries,
     )

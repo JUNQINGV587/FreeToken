@@ -449,7 +449,10 @@ async def anthropic_event_stream(
         block_open = "thinking"
         return _event(AnthropicStreamEvent(
             type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(type="thinking", thinking=""),
+            # The SDK validates the opening block before any signature_delta arrives, and
+            # local reasoning is unsigned -- but the field must still be present on the
+            # first event of the block, or the client rejects the rest of the stream.
+            content_block=AnthropicContentBlock(type="thinking", thinking="", signature=""),
         ))
 
     def _stop_block() -> list[str]:

@@ -375,6 +375,9 @@ def test_stream_reasoning_as_thinking_block():
     blocks = [e[1] for e in collected if e[0] == "content_block_start"]
     assert blocks[0]["content_block"]["type"] == "thinking"
     assert blocks[0]["index"] == 0
+    # The SDK validates the opening block before the empty signature_delta arrives:
+    # a missing signature field fails the whole stream on real clients.
+    assert blocks[0]["content_block"]["signature"] == ""
     assert blocks[1]["content_block"]["type"] == "text"
     assert blocks[1]["index"] == 1
     deltas = [e[1] for e in collected if e[0] == "content_block_delta"]

@@ -129,6 +129,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         h_row.append(boh[i] + c)
         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
         boundary_rows.append(off + c * CHUNK_SIZE)
+        # Prep mutations (L stamp + flip) imply a launched forward: nothing may fail between prep and launch.
         r.mamba_last_track_seqlen = boundary
         r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
     if not dst:

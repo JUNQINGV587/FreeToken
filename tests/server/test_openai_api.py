@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken.message import TokenizeMsg, UserReply
+from freetoken.server.anthropic_api import register_anthropic_routes
 from freetoken.server.openai_api import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -772,3 +773,32 @@ def test_chat_completion_accepts_sampling_boundaries(sampling):
 
     assert response.status_code == 200
     assert state.sent is not None
+
+
+def test_validation_error_with_non_finite_value_stays_json_safe():
+    """`1e999` parses to inf; the 422 body must not carry it as a raw float.
+
+    The default handler serializes the offending `input` verbatim, and
+    json.dumps refuses inf, so a correctly rejected request still died as a
+    500 with an empty body.
+    """
+    state = FakeState([])
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+    register_anthropic_routes(app, lambda: state, lambda: {})
+
+    body = (
+        '{"model":"unit-model","messages":[{"role":"user","content":"hi"}],'
+        '"presence_penalty":1e999}'
+    )
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "presence_penalty"]
+    assert detail[0]["input"] == "inf"
+    assert state.sent is None

@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
@@ -25,6 +26,7 @@ from .api_models import (
 )
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
+from .validation_errors import validation_error_response
 from .admission import AdmissionThrottledError
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -120,6 +122,10 @@ def register_openai_routes(
     get_state: Callable[[], Any],
     get_model_sampling: Callable[[], dict[str, Any]],
 ) -> None:
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError):
+        return validation_error_response(exc)
+
     @app.api_route("/v1", methods=["GET", "POST", "HEAD", "OPTIONS"])
     async def v1_root():
         return {"status": "ok"}

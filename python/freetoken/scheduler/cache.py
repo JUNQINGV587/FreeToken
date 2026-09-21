@@ -463,6 +463,7 @@ class CacheManager:
             # _free_req_slots so nothing double-frees.
             free_upto = old_handle.cached_len
             L = req.mamba_last_track_seqlen
+            # Invariant: unaligned L cannot occur in production (see the commit-site note); the gate is defensive, never a donate.
             if (
                 L is not None
                 and 0 < L <= req.cached_len
@@ -510,6 +511,7 @@ class CacheManager:
             # page_size>1 only: insert would align the key down, attaching a state that encodes
             # L tokens to a SHORTER node -- a future hit would COW-restore an over-advanced
             # state. Skip; the next aligned boundary (or the finish-donate) commits instead.
+            # Invariant: unreachable in production (page-aligned chunk starts, CHUNK_SIZE % page_size == 0); do not turn the skip into a donation.
             req.mamba_last_track_seqlen = None
             return
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote

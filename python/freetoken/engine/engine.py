@@ -1856,6 +1856,10 @@ def _adjust_config(config: EngineConfig):
             override("cache_type", "swa_radix")
 
     if has_linear_attention:
+        if config.linear_state_cache_ratio <= 0:
+            raise ValueError(
+                f"linear_state_cache_ratio must be > 0, got {config.linear_state_cache_ratio}"
+            )
         override(
             "cache_type",
             _resolve_cache_type(True, getattr(config, "cache_type", "radix")),

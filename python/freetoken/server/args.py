@@ -351,6 +351,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=float,
+        default=ServerArgs.linear_state_cache_ratio,
+        help=(
+            "Hybrid GDN snapshot cache: extra = max(4, ceil(ratio * max_running_req)) "
+            "slots; pool = 4 * max_running_req + extra + 1 (one padding slot)."
+        ),
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",

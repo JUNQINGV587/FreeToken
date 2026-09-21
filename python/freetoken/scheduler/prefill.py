@@ -236,6 +236,16 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
+            # Hybrid per-chunk boundary donation: commit the prior chunk's tracked xCHUNK
+            # snapshot BEFORE the continuation inherits its state. Committing at the drain
+            # would double-free: under overlap the continuation has already copied the
+            # pre-commit handle and ping-pong tuple, so its own later commit frees the
+            # donated snapshot slot (still listed in its stale tuple) and the tree-adopted
+            # pages (the stale handle's cached_len) a second time. Here the commit runs
+            # first, so the inheritance is post-commit; a no-op when the chunk crossed no
+            # boundary (L is None) and idempotent across budget-bounced retries.
+            if self.cache_manager.is_hybrid:
+                self.cache_manager.cache_req(chunked_req, finished=False)
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,

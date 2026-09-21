@@ -106,6 +106,10 @@ class HybridRadixCache:
         cur, end_len = node, self._path_len(node)
         while not cur.is_root():
             if cur.mamba_value is not None:
+                # A use must out-age the walk's one shared tic: both the KV-LRU key
+                # (timestamp) and the evict_mamba key (snapshot_lru) re-stamp here.
+                cur.timestamp = time.monotonic_ns()
+                cur.snapshot_lru = time.monotonic_ns()
                 return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur)
             end_len -= cur.length
             cur = cur.parent
@@ -129,8 +133,13 @@ class HybridRadixCache:
         if node.is_root():
             return prefix_len, True   # root can't hold a snapshot; report exist so caller frees it
         if node.mamba_value is not None:
+            # A dedup hit is the only proof the boundary is still a live reuse point: both
+            # the KV-LRU key (timestamp) and the evict_mamba key (snapshot_lru) re-stamp here.
+            node.timestamp = time.monotonic_ns()
+            node.snapshot_lru = time.monotonic_ns()
             return prefix_len, True                 # dedup: caller frees its donated slot
         node.mamba_value = mamba_value              # fills a fresh node or a tombstone
+        node.snapshot_lru = time.monotonic_ns()     # acquisition stamps the snapshot currency
         if node.mamba_ref_count == 0:
             self.mamba_evictable += 1
         return prefix_len, False
@@ -206,14 +215,16 @@ class HybridRadixCache:
         too. Internal node -> TOMBSTONE (free the slot, keep KV + children). Leaf node -> free
         both KV and slot and unlink, then cascade-delete any KV-only tombstone leaves it exposes
         upward (so a leaf always carries a live snapshot -- mirrors sglang)."""
-        # Same deliberate redundancy as evict_full: this filter and the in-loop re-check each
-        # protect a host-resident node on their own, so a single clause looks removable.
-        cands = [n for n in self._snapshot_nodes()
+        # Victim heap keys on (snapshot_lru, timestamp): FIFO by last validation with the
+        # walk tic as tiebreak. __lt__ (timestamp) stays the KV-LRU key for evict_full.
+        # Same deliberate redundancy as evict_full: the host_value filter here and the
+        # in-loop re-check each protect a host-resident node on their own.
+        cands = [((n.snapshot_lru, n.timestamp), n) for n in self._snapshot_nodes()
                  if n.mamba_ref_count == 0 and n.host_value is None]
         heapq.heapify(cands)
         kv, mamba, freed = [], [], 0
         while freed < num and cands:
-            node = heapq.heappop(cands)
+            node = heapq.heappop(cands)[1]
             if node.mamba_value is None or node.mamba_ref_count != 0 or node.is_root():
                 continue
             if node.host_value is not None:
@@ -254,6 +265,8 @@ class HybridRadixCache:
         # (KV/page conservation is checked by CacheManager.check_integrity.)
         for n in self._snapshot_nodes():
             assert n.mamba_value is not None and n.mamba_ref_count >= 0 and n.ref_count >= 0
+            # a forgotten attach stamp would make the node the always-evicted-first victim
+            assert n.snapshot_lru >= 0
         resident = 0
         for key, n in self._host_nodes.items():
             assert n.host_value == key and len(n.value) == 0, "host-resident node still has pages"

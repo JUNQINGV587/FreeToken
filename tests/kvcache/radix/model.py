@@ -84,7 +84,7 @@ class MGroup:
     node's end boundary; ``slots`` holds ``page_size`` slot ids per page, flattened."""
 
     __slots__ = ("paths", "slots", "stamp", "ref", "tomb", "swa_ref", "swa_uuid",
-                 "mamba", "mamba_ref")
+                 "mamba", "mamba_ref", "snap")
 
     def __init__(self, paths: Sequence[Path], slots: Sequence[int], stamp: int):
         self.paths: List[Path] = list(paths)
@@ -96,6 +96,7 @@ class MGroup:
         self.swa_uuid: Optional[int] = None
         self.mamba: Optional[int] = None
         self.mamba_ref = 0
+        self.snap = -1                      # snapshot_lru mirror: the snapshot's own LRU stamp
 
     length = property(lambda self: len(self.slots))
     n_pages = property(lambda self: len(self.paths))
@@ -190,6 +191,7 @@ class PageTrie:
         assert 0 < n_pages < g.n_pages, f"bad split {n_pages} of {g.n_pages}"
         pre = MGroup(g.paths[:n_pages], g.slots[: n_pages * self.P], g.stamp)
         pre.ref, pre.tomb, pre.swa_ref, pre.swa_uuid = g.ref, g.tomb, g.swa_ref, g.swa_uuid
+        pre.snap = g.snap                    # split_at copies snapshot_lru to the fresh half
         g.swa_uuid = None
         g.paths = g.paths[n_pages:]
         g.slots = g.slots[n_pages * self.P:]
@@ -352,19 +354,21 @@ class RefModel:
         raise _fail(tag, f"cache freed slot {slot} which the model does not own "
                          f"(already freed, or never handed out)")
 
-    def _pick_victim(self, cands: List[MGroup], victim: MGroup, tag: str) -> None:
+    def _pick_victim(self, cands: List[MGroup], victim: MGroup, tag: str,
+                     key=lambda g: g.stamp) -> None:
         """Assert the observed victim is a legal LRU choice.
 
         ``_tree_walk`` stamps every node it touches with ONE clock read, so several nodes can be
         exactly equally old and the heap breaks that tie arbitrarily.  We therefore demand not a
-        *specific* victim but one whose stamp is minimal among the live candidates -- which still
-        fails loudly on any real LRU regression (a fresher node evicted first)."""
+        *specific* victim but one whose key is minimal among the live candidates -- which still
+        fails loudly on any real LRU regression (a fresher node evicted first).  The hybrid
+        mamba pass keys on (snap, stamp): FIFO by last validation, timestamp as tiebreak."""
         if victim not in cands:
             raise _fail(tag, f"evicted node end={victim.end} was not an eligible candidate "
                              f"(eligible: {[g.end for g in cands]})")
-        if victim.stamp != min(g.stamp for g in cands):
-            older = [(g.end, g.stamp) for g in cands if g.stamp < victim.stamp]
-            raise _fail(tag, f"non-LRU victim end={victim.end} stamp={victim.stamp}; strictly "
+        if key(victim) != min(key(g) for g in cands):
+            older = [(g.end, key(g)) for g in cands if key(g) < key(victim)]
+            raise _fail(tag, f"non-LRU victim end={victim.end} key={key(victim)}; strictly "
                              f"older candidates existed: {older}")
 
     def _take(self, obs: Sequence[int], pos: int, g: MGroup, tag: str, what: str) -> int:
@@ -675,6 +679,10 @@ class HybridModel(RefModel):
             if g.mamba is not None:
                 if i:
                     self.events["match.snapshot_truncation"] += 1
+                # Fix-3: returning a snapshot is a use of the reuse point; the tree
+                # re-validates it one tick past the walk tic before building the match.
+                g.stamp = self._tic()
+                g.snap = self._tic()
                 return ExpMatch(self.trie.path_len(g), self.trie.path_slots(g), g, g.mamba)
         self.events["match.no_snapshot"] += 1
         return ExpMatch(0, [], None, None)
@@ -685,9 +693,15 @@ class HybridModel(RefModel):
         exp.second_exists = node is None or node.mamba is not None
         if exp.second_exists:
             self.events["insert.snapshot_dedup"] += 1
+            if node is not None:
+                # Fix-3: a dedup hit is the only proof the boundary is still a live
+                # reuse point; the tree re-validates it one tick past the walk tic.
+                node.stamp = self._tic()
+                node.snap = self._tic()
         else:
             self.events["insert.snapshot_attach"] += 1
             node.mamba = mamba
+            node.snap = self._tic()          # acquisition stamps the snapshot currency
         return exp
 
     def inc_lock(self, g: Optional[MGroup], uuid: Optional[int] = None) -> ExpLock:
@@ -729,7 +743,7 @@ class HybridModel(RefModel):
                 raise _fail(tag, f"evict_mamba freed snapshot slot {obs_mamba[pm]} which the model "
                                  f"does not consider an eligible snapshot")
             victim = owners[0]
-            self._pick_victim(cands, victim, tag)
+            self._pick_victim(cands, victim, tag, key=lambda g: (g.snap, g.stamp))
             cands.remove(victim)
             freed += 1
             if self.trie.is_leaf(victim) and victim.ref == 0:

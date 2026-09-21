@@ -25,6 +25,7 @@ from typing import Sequence, Tuple
 import pytest
 import torch
 
+from .adapters import iter_nodes, node_end_path
 from .driver import CacheSpec, Session
 
 PAGE = 4
@@ -350,4 +351,127 @@ def test_lock_pins_the_snapshot_and_the_whole_kv_path(hyb):
     hyb.do_evict_full(2 * PAGE)                # Y is evictable again; X cascades behind it
     assert events(hyb)["evict_full.cascade"] == 1
     assert hyb.kv.in_use() == set() and hyb.second.in_use() == set()
+    hyb.check()
+
+
+# --------------------------------------------------------------------------- validate-refresh
+def _live_boundaries(s: Session) -> set:
+    """Boundary lengths (end-path token counts) of every node holding a live snapshot."""
+    return {len(node_end_path(n)) for n, _ in iter_nodes(s.ad.root)
+            if n.mamba_value is not None}
+
+
+def test_dedup_refresh_pins_survival_at_forced_eviction(hyb):
+    """Amended Fix-3, insert dedup branch: a dedup hit re-stamps the snapshot's OWN LRU
+    (snapshot_lru), which no later walk can erase, so the just-validated boundary outlives
+    a peer that is newer by the walk tic but was last validated earlier. Pre-fix
+    evict_mamba ranks by timestamp alone and the walked-later peer looks younger, so K is
+    the stalest candidate and dies (fails-before)."""
+    hyb.do_insert(ids(1, 2))                   # X=[p1,p2], mx
+    hyb.do_request(ids(1, 2, 3), prompt_pages=2)   # Y=[p3], my -- K
+    my = donated(hyb)
+    hyb.do_evict_second(1)                     # tombstone X: its fresh walk tic must not shield K
+    hyb.do_request(ids(9), prompt_pages=1)     # off-path P=[p9], mp (stale-validated decoy)
+    mp = donated(hyb)
+    hyb.do_insert(ids(1, 2, 3))                # dedup at K: re-validated NOW
+    hyb.do_insert(ids(9, 10))                  # walks P late; Q=[p10], mq (newest of all)
+    hyb.check()
+
+    hyb.do_evict_second(1)                     # pool pressure: one snapshot must go
+    hyb.check()
+    assert mp in hyb.second.free and my not in hyb.second.free   # the decoy died, K survived
+    m, _ = hyb.do_match(ids(1, 2, 3))
+    assert m.second == my                      # K is still restorable
+    hyb.check()
+
+
+def test_match_use_refresh_pins_survival_at_forced_eviction(hyb):
+    """Amended Fix-3, match_prefix: returning a live snapshot is a use of the reuse point;
+    the returned node's snapshot_lru re-stamp out-ages a peer that is newer by the walk tic
+    but stale by validation. Pre-fix the walked-later peer ranks younger by timestamp and
+    K dies (fails-before)."""
+    hyb.do_insert(ids(1, 2))                   # X, mx
+    hyb.do_request(ids(1, 2, 3), prompt_pages=2)   # Y=[p3], my -- K
+    my = donated(hyb)
+    hyb.do_evict_second(1)                     # tombstone X
+    hyb.do_request(ids(9), prompt_pages=1)     # off-path P=[p9], mp
+    mp = donated(hyb)
+    m, _ = hyb.do_match(ids(1, 2, 3))          # match-use of K: re-validated NOW
+    assert m.second == my
+    hyb.do_insert(ids(9, 10))                  # walks P AFTER K's refresh (stale-ts decoy)
+    hyb.check()
+
+    hyb.do_evict_second(1)
+    hyb.check()
+    assert mp in hyb.second.free and my not in hyb.second.free   # the decoy died, K survived
+    m, _ = hyb.do_match(ids(1, 2, 3))
+    assert m.second == my
+    hyb.check()
+
+
+def test_steady_state_churn_pins_reuse_to_live_boundaries(hyb):
+    """Amended Fix-3 steady state: 6 cycles of (exact-prefix dedup request + one-unique-finish
+    extend + match) with an off-path branch P born mid-run and never re-walked, plus one
+    forced eviction at the end of cycles 4-6. Post-fix the victims leave FIFO by last
+    validation: B0, then P (validated once, at its birth), then B1 -- deterministic by
+    boundary key. Pre-fix P's stale walk-tic timestamp makes IT the first victim and B0
+    dies in its place (fails-before). Reuse degrades to the deepest surviving boundary
+    and never to 0."""
+    chain = ids(1, 2)
+    hyb.do_insert(chain)                       # B0 (2 pages)
+    slot_of = {2 * PAGE: donated(hyb)}
+    victims = []
+    for k in range(3, 9):                      # 6 cycles, one fresh boundary each
+        hyb.do_request(chain, prompt_pages=len(chain) // PAGE)   # match + boundary dedup
+        chain = chain + ids(k)
+        hyb.do_request(chain, prompt_pages=len(chain) // PAGE)   # match + unique finish insert
+        slot_of[len(chain)] = donated(hyb)
+        if k == 3:
+            hyb.do_request(ids(9), prompt_pages=1)   # off-path P: validated once, never re-walked
+            slot_of[1 * PAGE] = donated(hyb)
+        if 4 <= k <= 6:
+            before = set(hyb.second.free)
+            hyb.do_evict_second(1)             # pool pressure: one snapshot must go
+            slot_owner = {v: length for length, v in slot_of.items()}
+            victims.append(slot_owner[(hyb.second.free - before).pop()])
+    hyb.check()
+
+    assert victims == [2 * PAGE, 1 * PAGE, 3 * PAGE]   # FIFO by last validation: B0, P, B1
+    hyb.do_request(chain, prompt_pages=len(chain) // PAGE)       # the final re-validation
+    m, _ = hyb.do_match(chain)
+    assert m.cached_len == len(chain) and m.second is not None   # reuse never drops to 0
+    assert _live_boundaries(hyb) == {4 * PAGE, 5 * PAGE, 6 * PAGE, 7 * PAGE, 8 * PAGE}
+    hyb.check()
+
+
+def test_exhaustion_leaves_the_deepest_validated_boundary(hyb):
+    """Brief-required exhaustion pin: keep forcing evictions until exactly one live snapshot
+    remains. Post-fix the victims leave FIFO by last validation (B0, B1, B2, then the
+    never-re-walked decoy P) and the survivor is the DEEPEST boundary -- the just-validated
+    tip is never a victim and the final match keeps length > 0. Pre-fix the decoy's stale
+    walk-tic timestamp makes it the FIRST victim (fails-before)."""
+    chain = ids(1, 2)
+    hyb.do_insert(chain)                       # B0
+    slot_of = {2 * PAGE: donated(hyb)}
+    for k in range(3, 6):                      # 3 cycles -> B1, B2, B3
+        hyb.do_request(chain, prompt_pages=len(chain) // PAGE)
+        chain = chain + ids(k)
+        hyb.do_request(chain, prompt_pages=len(chain) // PAGE)
+        slot_of[len(chain)] = donated(hyb)
+    hyb.do_request(ids(9), prompt_pages=1)     # off-path P, validated once, never re-walked
+    slot_of[1 * PAGE] = donated(hyb)
+    hyb.do_request(chain, prompt_pages=len(chain) // PAGE)       # final re-validation of B3
+    hyb.check()
+
+    victims = []
+    while live_snapshots(hyb) > 1:
+        before = set(hyb.second.free)
+        hyb.do_evict_second(1)
+        hyb.check()
+        slot_owner = {v: length for length, v in slot_of.items()}
+        victims.append(slot_owner[(hyb.second.free - before).pop()])
+    assert victims == [2 * PAGE, 3 * PAGE, 4 * PAGE, 1 * PAGE]   # B0, B1, B2, then P
+    m, _ = hyb.do_match(chain)
+    assert m.cached_len == len(chain) > 0                       # reuse never 0 at the floor
+    assert m.second == slot_of[5 * PAGE]                        # the deepest tip survived
     hyb.check()

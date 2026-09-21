@@ -6,6 +6,7 @@ gears match (or improve on) what the deleted ``think_spec`` registry hardcoded.
 from __future__ import annotations
 
 from freetoken.server.model_meta import derive_think_gears
+from freetoken.server.openai_api import ChatCompletionRequest, chat_request_to_genspec
 from freetoken.tokenizer.effort import (
     EffortProfile,
     probe_effort_profile,
@@ -105,3 +106,126 @@ def test_dsv4_style_toggle_plus_efforts():
     assert gears == ("off", "low", "high", "max") and default == "off"
     assert kwargs["max"]["reasoning_effort"] == "max"
     assert kwargs["max"]["enable_thinking"] is True
+
+
+# --------------------------------------------------------------------------- #
+# The reported default follows --default-thinking-mode, so /v1/cache/status
+# cannot advertise a gear the request path no longer uses.
+# --------------------------------------------------------------------------- #
+def _qwen38_profile():
+    """The deployed Qwen3.8 template shape: an off toggle, graded efforts."""
+    def render(kwargs, tools):
+        if kwargs.get("enable_thinking") is False or kwargs.get("thinking_mode") == "disabled":
+            return "qwen38|off"
+        effort = kwargs.get("reasoning_effort") or "xhigh"
+        assert effort in ("xhigh", "medium", "low"), effort
+        return f"qwen38|{effort}"
+
+    return profile_for(render)
+
+
+def test_server_default_overrides_the_reported_gear():
+    profile = _qwen38_profile()
+    for mode, expected in (("auto", "xhigh"), ("chat", "off"), ("thinking", "xhigh")):
+        gears, default, kwargs = derive_think_gears(
+            profile, parser_configured=True, server_default=mode
+        )
+        assert default == expected, mode
+        # The offered gears and their kwargs are the checkpoint's; unchanged.
+        assert gears == ("off", "low", "medium", "xhigh"), mode
+        assert kwargs["off"]["enable_thinking"] is False, mode
+
+
+def test_server_default_is_ignored_when_the_checkpoint_offers_no_such_gear():
+    # An always-thinking family with no knob to turn: "chat" has no gear to move
+    # to, so the report keeps telling the truth about the checkpoint.
+    def render(kwargs, tools=None):
+        return "always-on"
+
+    gears, default, _ = derive_think_gears(
+        profile_for(render), parser_configured=True, server_default="chat"
+    )
+    assert gears == ("on",) and default == "on"
+
+
+def test_server_default_alone_never_changes_auto():
+    profile = _qwen38_profile()
+    assert derive_think_gears(profile, parser_configured=True) == derive_think_gears(
+        profile, parser_configured=True, server_default=None
+    ) == derive_think_gears(profile, parser_configured=True, server_default="auto")
+
+
+class _FakeManager:
+    """Stands in for the frontend TokenizeManager: /v1/cache/status only peeks."""
+
+    def __init__(self, profile):
+        self._profile = profile
+
+    def thinking_profile(self):
+        return self._profile
+
+
+def _geometry_for(mode):
+    from types import SimpleNamespace
+
+    from freetoken.server.api_server import _reasoning_geometry
+
+    profile = _qwen38_profile()
+    state = SimpleNamespace(
+        config=SimpleNamespace(default_thinking_mode=mode),
+        _frontend_tokenizer=_FakeManager(profile),
+    )
+    return _reasoning_geometry(state)
+
+
+def test_server_default_alone_never_changes_auto():
+    profile = _qwen38_profile()
+    assert derive_think_gears(profile, parser_configured=True) == derive_think_gears(
+        profile, parser_configured=True, server_default=None
+    ) == derive_think_gears(profile, parser_configured=True, server_default="auto")
+
+
+def test_reasoning_geometry_reports_the_injected_default():
+    for mode, expected in (("auto", "xhigh"), ("chat", "off"), ("thinking", "xhigh")):
+        assert _geometry_for(mode)["default"] == expected, mode
+
+    from types import SimpleNamespace
+
+    from freetoken.server.api_server import _reasoning_geometry
+
+    # A config without the flag (any caller older than it) keeps today's answer.
+    state = SimpleNamespace(
+        config=SimpleNamespace(), _frontend_tokenizer=_FakeManager(_qwen38_profile())
+    )
+    assert _reasoning_geometry(state)["default"] == "xhigh"
+
+
+def test_reported_default_gear_matches_what_the_request_path_injects():
+    # The invariant the flag row exists for: /v1/cache/status names the gear an
+    # uncontrolled request renders. With the flag forcing a state it names that
+    # state's gear -- the checkpoint's own default effort when "on" is implicit.
+    request = ChatCompletionRequest(
+        model="unit-model", messages=[{"role": "user", "content": "hi"}]
+    )
+    _, profile_default, kwargs = derive_think_gears(_qwen38_profile(), parser_configured=True)
+    for mode, expected_gear in (
+        ("auto", profile_default),
+        ("chat", "off"),
+        ("thinking", profile_default),
+    ):
+        block = _geometry_for(mode)
+        assert block["default"] == expected_gear, mode
+        got = chat_request_to_genspec(request, {}, default_thinking_mode=mode)
+        if mode == "auto":
+            # Nothing is injected: the bare render IS the profile's default gear.
+            assert got.chat_template_kwargs == {}, mode
+        elif mode == "chat":
+            assert got.chat_template_kwargs == kwargs["off"], mode
+        else:
+            # Broadcasting "on" and letting the template grade the effort itself:
+            # this deployment's template defaults an absent effort to the same
+            # gear it probed as its default, so both render the reported gear.
+            assert got.chat_template_kwargs == {
+                k: v for k, v in kwargs[profile_default].items() if k != "reasoning_effort"
+            }, mode
+            assert "reasoning_effort" not in got.chat_template_kwargs, mode

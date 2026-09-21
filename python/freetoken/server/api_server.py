@@ -757,7 +757,11 @@ def _reasoning_geometry(state: Any) -> dict | None:
     """The ``geometry.reasoning`` block, from the frontend tokenizer's probed
     thinking profile. Peeks rather than builds: a cold tokenizer only kicks the
     warmup thread (the profile itself is a handful of microsecond renders once
-    the tokenizer exists, safe to run inline)."""
+    the tokenizer exists, safe to run inline).
+
+    ``--default-thinking-mode`` moves the reported ``default``: the client reads
+    this block to pick a gear, and a server default it does not mention would be
+    metadata that disagrees with what an uncontrolled request actually renders."""
     manager = getattr(state, "_frontend_tokenizer", None)
     if manager is None:
         state.warm_frontend_tokenizer()
@@ -767,6 +771,7 @@ def _reasoning_geometry(state: Any) -> dict | None:
     derived = derive_think_gears(
         manager.thinking_profile(),
         parser_configured=bool(getattr(state.config, "reasoning_parser", None)),
+        server_default=getattr(state.config, "default_thinking_mode", "auto"),
     )
     if derived is None:
         return None

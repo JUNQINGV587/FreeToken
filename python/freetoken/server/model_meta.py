@@ -31,12 +31,20 @@ def thinking_toggle_kwargs(enabled: bool) -> dict:
 
 
 def derive_think_gears(
-    profile: ThinkingProfile, parser_configured: bool
+    profile: ThinkingProfile,
+    parser_configured: bool,
+    server_default: str | None = None,
 ) -> Tuple[Tuple[str, ...], str | None, dict] | None:
     """``(gears, default_gear, kwargs_per_gear)`` for the /v1/cache/status
     ``geometry.reasoning`` block, derived from the checkpoint's probed thinking
     controls -- the checkpoint owns this knowledge; nothing here is keyed by
     model family. ``None`` when there is nothing controllable to offer.
+
+    ``server_default`` is ``--default-thinking-mode``: "chat"/"thinking" make the
+    server inject that state for a request carrying no thinking control of its
+    own, so the reported default has to follow it -- otherwise the published
+    metadata would contradict what the request path does. Only ``default`` moves;
+    the offered gears and their kwargs stay the checkpoint's own.
 
     A template that grades effort without validating it gets the graded ladder
     (its trained levels; never-advertised dialects quantize onto it); an always-on
@@ -83,6 +91,14 @@ def derive_think_gears(
         )
     else:
         default = "on" if "on" in gears else gears[-1]
+
+    # A server default the checkpoint cannot honor (no off gear to turn to) is
+    # not a state this model has, so the report keeps naming the real one.
+    server_gear = {"chat": "off", "thinking": "on"}.get(
+        (server_default or "").strip().lower()
+    )
+    if server_gear in gears:
+        default = server_gear
     return tuple(gears), default, kwargs
 
 

@@ -99,6 +99,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+| `--default-thinking-mode` | auto | Server-wide thinking default for reasoning-capable models: `chat` turns thinking off for a request that carries no thinking control of its own, `thinking` turns it on the same way, `auto` injects nothing. Any request setting `enable_thinking`, `thinking`, `thinking_mode`, `reasoning_effort` or `thinking.type` wins over it. `/v1/cache/status` reports the resulting default gear |
 
 ### Image input
 

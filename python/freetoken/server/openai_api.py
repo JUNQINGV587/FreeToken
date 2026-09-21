@@ -71,19 +71,64 @@ def _thinking_type(req: Any) -> str | None:
     return None
 
 
+def apply_default_thinking_mode(
+    ctk: dict[str, Any] | None,
+    default_mode: str | None,
+) -> dict[str, Any] | None:
+    """Fill in the server's --default-thinking-mode when the request resolved no
+    thinking control of its own.
+
+    Must run AFTER every client channel has been folded into ``ctk``:
+    effort_toggle_kwargs returns the template kwargs unchanged as soon as any
+    thinking key is present, so injecting first would make the injected key the
+    thing that short-circuits the client's reasoning_effort / thinking.type.
+    An explicit per-request value therefore always wins, whatever channel
+    carried it. "auto" (the default) is a no-op.
+    """
+    from .model_meta import _THINKING_KWARG_KEYS, thinking_toggle_kwargs
+
+    # Only the two documented forced states; an absent or unrecognised mode is a
+    # no-op rather than a second, undocumented default.
+    if default_mode not in ("chat", "thinking"):
+        return ctk
+    if ctk is None:
+        ctk = {}
+    else:
+        ctk = dict(ctk)
+    if any(key in ctk for key in _THINKING_KWARG_KEYS):
+        return ctk
+    # Broadcast every spelling, like every other thinking toggle in the server:
+    # a template picks the knob it knows and ignores the rest.
+    ctk.update(thinking_toggle_kwargs(default_mode == "thinking"))
+    return ctk
+
+
+def _thinking_kwargs(
+    req: ChatCompletionRequest,
+    default_thinking_mode: str | None,
+) -> dict[str, Any] | None:
+    """The chat_template_kwargs the OpenAI request path renders."""
+    from .model_meta import effort_toggle_kwargs
+
+    ctk = req.chat_template_kwargs
+    thinking_type = _thinking_type(req)
+    # Load-bearing falsiness: an empty or whitespace-only effort and a foreign
+    # thinking shape must keep rendering no thinking control at all.
+    if req.reasoning_effort or thinking_type:
+        ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    # Last, so every client control is already resolved into ctk and the server
+    # default can only fill what the request left unset.
+    return apply_default_thinking_mode(ctk, default_thinking_mode)
+
 
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    default_thinking_mode: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
-    from .model_meta import effort_toggle_kwargs
-
-    ctk = req.chat_template_kwargs
-    thinking_type = _thinking_type(req)
-    if req.reasoning_effort or thinking_type:
-        ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    ctk = _thinking_kwargs(req, default_thinking_mode)
     sampling_params = resolve_sampling(
         temperature=req.temperature,
         top_k=req.top_k,
@@ -350,7 +395,12 @@ async def handle_chat_completion(
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
         )
-        spec = chat_request_to_genspec(req, model_sampling, default_max_tokens=default_max_tokens)
+        spec = chat_request_to_genspec(
+            req,
+            model_sampling,
+            default_max_tokens=default_max_tokens,
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
+        )
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -418,7 +468,11 @@ async def stream_chat_completion_chunks(
 ) -> AsyncIterator[bytes]:
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
-        spec = chat_request_to_genspec(req, {})
+        spec = chat_request_to_genspec(
+            req,
+            {},
+            default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
+        )
     yield _sse(
         _chat_chunk(
             req,

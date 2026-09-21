@@ -29,7 +29,6 @@ class FakeState:
         self.config = SimpleNamespace(
             model_path="/models/unit-model",
             served_model_name="unit-model",
-            default_thinking_mode="auto",
             maintenance_state="serving",
         )
 

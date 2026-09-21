@@ -242,3 +242,150 @@ def test_v1_models_omits_efforts_for_models_without_the_knob():
     card = _models_payload(state)
     assert card["supported_reasoning_efforts"] is None
     assert card["default_reasoning_effort"] is None
+
+
+# --------------------------------------------------------------------------- #
+# --default-thinking-mode: the server-wide default the request path folds in.
+# --------------------------------------------------------------------------- #
+def _server_kwargs(req, mode):
+    """The kwargs the OpenAI handler would render: the client's thinking controls,
+    then the server default. Built from the real request path so a test cannot
+    agree with the injector while disagreeing with the handler."""
+    from freetoken.server.openai_api import chat_request_to_genspec
+
+    return chat_request_to_genspec(req, {}, default_thinking_mode=mode).chat_template_kwargs
+
+
+#: One client channel per row: nothing, the OpenAI top-level effort, the DeepSeek
+#: thinking toggle, the template kwargs themselves, and a template kwarg plus a
+#: disagreeing effort.
+_MATRIX_ROWS = (
+    ("nothing", {}),
+    ("reasoning_effort=high", {"reasoning_effort": "high"}),
+    ("reasoning_effort=none", {"reasoning_effort": "none"}),
+    ("reasoning_effort=low", {"reasoning_effort": "low"}),
+    ("thinking.type=enabled", {"thinking": {"type": "enabled"}}),
+    ("thinking.type=disabled", {"thinking": {"type": "disabled"}}),
+    ("ctk={'enable_thinking': True}", {"chat_template_kwargs": {"enable_thinking": True}}),
+    ("ctk={'enable_thinking': False}", {"chat_template_kwargs": {"enable_thinking": False}}),
+    (
+        "ctk={'thinking': True} + effort=high",
+        {"chat_template_kwargs": {"thinking": True}, "reasoning_effort": "high"},
+    ),
+    (
+        "ctk={'reasoning_effort': 'medium'}",
+        {"chat_template_kwargs": {"reasoning_effort": "medium"}},
+    ),
+)
+
+
+def _client_channels(payload):
+    """True when the request expressed a thinking control through any channel."""
+    return bool(
+        payload.get("reasoning_effort")
+        or payload.get("thinking")
+        or payload.get("chat_template_kwargs")
+    )
+
+
+def test_default_never_overrides_an_explicit_reasoning_effort():
+    # The OpenAI top-level effort and the DeepSeek toggle are client controls even
+    # though they never reach chat_template_kwargs; an injected server default must
+    # not swallow either one, in either direction.
+    high = {**ON, "reasoning_effort": "high"}
+    for label, payload, mode, expected in (
+        ("effort=high, chat", {"reasoning_effort": "high"}, "chat", high),
+        ("effort=high, thinking", {"reasoning_effort": "high"}, "thinking", high),
+        ("effort=none, chat", {"reasoning_effort": "none"}, "chat", dict(OFF)),
+        ("effort=none, thinking", {"reasoning_effort": "none"}, "thinking", dict(OFF)),
+        ("thinking=enabled, chat", {"thinking": {"type": "enabled"}}, "chat", dict(ON)),
+        ("thinking=disabled, thinking", {"thinking": {"type": "disabled"}}, "thinking", dict(OFF)),
+    ):
+        got = _server_kwargs(chat_request(**payload), mode)
+        assert got == expected, (label, got)
+
+
+def test_default_mode_matrix_respects_every_client_channel():
+    for label, payload in _MATRIX_ROWS:
+        baseline = _server_kwargs(chat_request(**payload), "auto")
+        for mode in ("chat", "thinking"):
+            got = _server_kwargs(chat_request(**payload), mode)
+            if _client_channels(payload):
+                # An explicit control, whatever channel carried it, survives the
+                # server default verbatim.
+                assert got == baseline, (label, mode, got)
+                # ... and for template kwargs that means nothing is added.
+                assert set(got) == set(payload.get("chat_template_kwargs") or baseline), (
+                    label,
+                    mode,
+                    got,
+                )
+            else:
+                # A request with no control of its own gets the broadcast default.
+                assert got == (OFF if mode == "chat" else ON), (label, mode, got)
+        # An absent/unknown default must stay a no-op whatever the request said.
+        assert _server_kwargs(chat_request(**payload), None) == baseline, label
+        assert _server_kwargs(chat_request(**payload), "bogus") == baseline, label
+
+
+def test_default_auto_is_byte_identical_to_todays_kwargs():
+    # Regression red line: with the flag left at its default the produced kwargs
+    # are exactly today's -- same keys, same insertion order, same values.
+    today = (
+        ((), {}),
+        (
+            (("reasoning_effort", "high"),),
+            {"enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"},
+        ),
+        ((("reasoning_effort", "none"),), dict(OFF)),
+        ((("thinking", {"type": "enabled"}),), dict(ON)),
+        ((("thinking", {"type": "disabled"}),), dict(OFF)),
+        ((("chat_template_kwargs", {"enable_thinking": True}),), {"enable_thinking": True}),
+        (
+            (("chat_template_kwargs", {"reasoning_effort": "medium"}),),
+            {"reasoning_effort": "medium"},
+        ),
+    )
+    for items, expected in today:
+        got = _server_kwargs(chat_request(**dict(items)), "auto")
+        assert got == expected, items
+        assert list(got) == list(expected), items
+
+
+def test_default_injection_broadcasts_both_spellings():
+    # The fork's invariant: one broadcast, every spelling, template picks.
+    assert _server_kwargs(chat_request(), "chat") == dict(OFF)
+    assert _server_kwargs(chat_request(), "thinking") == dict(ON)
+
+
+def test_apply_default_thinking_mode_never_mutates_the_callers_dict():
+    from freetoken.server.openai_api import apply_default_thinking_mode
+
+    original = {"other": 1}
+    merged = apply_default_thinking_mode(original, "chat")
+    assert merged == {**OFF, "other": 1}
+    assert original == {"other": 1}
+
+
+def test_anthropic_and_responses_frontends_honor_the_default():
+    from freetoken.server.anthropic_api import convert_anthropic_to_genspec
+    from freetoken.server.anthropic_models import AnthropicMessagesRequest
+    from freetoken.server.responses_api import ResponsesRequest, convert_responses_to_genspec
+
+    anthropic_req = AnthropicMessagesRequest.model_validate(
+        {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert convert_anthropic_to_genspec(
+        anthropic_req, {}, default_thinking_mode="chat"
+    ).chat_template_kwargs == dict(OFF)
+    assert convert_anthropic_to_genspec(
+        anthropic_req, {}, default_thinking_mode="auto"
+    ).chat_template_kwargs == {}
+
+    responses_req = ResponsesRequest.model_validate({"model": "x", "input": "hi"})
+    assert convert_responses_to_genspec(
+        responses_req, {}, default_thinking_mode="thinking"
+    ).chat_template_kwargs == dict(ON)
+    assert convert_responses_to_genspec(
+        responses_req, {}, default_thinking_mode="auto"
+    ).chat_template_kwargs == {}

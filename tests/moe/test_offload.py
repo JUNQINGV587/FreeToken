@@ -2271,3 +2271,9 @@ def test_decode_routing_stats_oracle_curve_matches_hand_computed():
     # the pre-existing single-point stats stay consistent with the curve
     assert stats["oracle_hit_at_slots"] == round((12 / 16 + 16 / 16) / 2, 6)
     assert stats["oracle_hit_global"] == round(28 / 32, 6)
+    # the fixed-set spelling carries the same numbers; "oracle" implied a ceiling that a
+    # dynamic cache can beat on temporal locality
+    assert stats["static_topk_hit_at_slots"] == stats["oracle_hit_at_slots"]
+    assert stats["static_topk_hit_global"] == stats["oracle_hit_global"]
+    assert stats["static_topk_hit_by_pool_size"] == pool
+    assert stats["static_topk_hit_by_layer_even_split"] == lay

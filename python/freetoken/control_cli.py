@@ -250,7 +250,7 @@ def _format_stats(doc: dict[str, Any]) -> str:
             lines.append(
                 f"moe routing working_set={routing.get('working_set_mean', 0):.1f} "
                 f"experts_for_90pct={routing.get('experts_for_90pct', 0):.1f} "
-                f"oracle_hit={routing.get('oracle_hit_global', 0) * 100:.1f}%"
+                f"static_topk_hit={routing.get('static_topk_hit_global', routing.get('oracle_hit_global', 0)) * 100:.1f}%"
             )
     return "\n".join(lines)
 

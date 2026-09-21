@@ -1066,15 +1066,20 @@ class OffloadMoeCache:
     def decode_routing_stats(self, curve_caps: list[int] | tuple[int, ...] | None = None) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
 
-        Uses the histogram from ``collect_decode_freq``. The ``oracle_hit`` is the best a
-        per-layer LRU holding ``cache_size/num_layers`` slots could achieve on the observed
-        (stationary) routing distribution -- i.e. an upper bound on hit rate that depends
-        purely on how skewed routing is, independent of any LRU/LFU dynamics.
+        Uses the histogram from ``collect_decode_freq``. ``static_topk_hit_at_slots`` is the
+        hit rate of the best *fixed* expert set: each layer's ``cache_size/num_layers``
+        (rounded) most frequent experts over the whole histogram. It measures routing skew
+        only -- it is NOT an upper bound on a dynamic cache, because LRU exploits temporal
+        locality and can beat it.
 
-        ``oracle_hit_by_pool_size`` / ``oracle_hit_by_layer_even_split`` extend this to a
-        sizing curve: the oracle hit rate at each candidate pool size in ``curve_caps``
+        ``static_topk_hit_by_pool_size`` / ``..._by_layer_even_split`` extend this to a sizing
+        curve: the same fixed-set hit rate at each candidate pool size in ``curve_caps``
         (default a ladder bracketing realistic cache sizes), so a smaller pool can be
         evaluated without a restart. All read-only; two device syncs total.
+
+        The ``oracle_hit_*`` keys are the pre-rename spellings of the four values above,
+        kept so existing stats consumers keep working; new code should read the
+        ``static_topk_hit_*`` keys.
         """
         freq = self.decode_freq.float()
         total = freq.sum(dim=1)
@@ -1084,14 +1089,15 @@ class OffloadMoeCache:
         slots_per_layer = self.cache_size / self.num_layers
         C = max(1, int(round(slots_per_layer)))
         sorted_f, _ = torch.sort(freq, dim=1, descending=True)
-        oracle_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()
+        static_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()
         # The realized cache is ONE unified LRU slot pool shared across layers, so the
-        # tight per-row bound is the top-cache_size rows of the flattened (layer, expert)
-        # activation distribution -- how often a perfect policy would find the expert
-        # already resident. The per-layer figure above assumes an even per-layer split.
+        # tightest static figure is the top-cache_size rows of the flattened (layer, expert)
+        # activation distribution. Still a fixed-set number: how often a cache that had
+        # pinned exactly those rows would hit. The per-layer figure above assumes an even
+        # per-layer split.
         flat = freq.reshape(-1)
         top = torch.sort(flat, descending=True).values[: self.cache_size]
-        oracle_hit_global = (top.sum() / flat.sum().clamp(min=1)).item()
+        static_hit_global = (top.sum() / flat.sum().clamp(min=1)).item()
         ws = (freq > 0).sum(dim=1).float()
         cdf = torch.cumsum(sorted_f, dim=1) / total.clamp(min=1).unsqueeze(1)
         cover90 = ((cdf < 0.9).sum(dim=1).float() + 1)[valid]
@@ -1103,8 +1109,10 @@ class OffloadMoeCache:
             "working_set_mean": ws[valid].mean().item(),
             "working_set_max": int(ws[valid].max().item()),
             "experts_for_90pct": cover90.mean().item(),
-            "oracle_hit_at_slots": oracle_hit,
-            "oracle_hit_global": oracle_hit_global,
+            "static_topk_hit_at_slots": static_hit,
+            "static_topk_hit_global": static_hit_global,
+            "oracle_hit_at_slots": static_hit,
+            "oracle_hit_global": static_hit_global,
             "norm_entropy": norm_ent,
         }
         if curve_caps is None:
@@ -1123,12 +1131,12 @@ class OffloadMoeCache:
                 dtype=torch.long, device=freq.device,
             )
             layer_hits = cdf[valid].index_select(1, layer_idx).mean(dim=0).tolist()
-            out["oracle_hit_by_pool_size"] = {
-                str(c): round(h, 6) for c, h in zip(caps, pool_hits)
-            }
-            out["oracle_hit_by_layer_even_split"] = {
-                str(c): round(h, 6) for c, h in zip(caps, layer_hits)
-            }
+            by_pool = {str(c): round(h, 6) for c, h in zip(caps, pool_hits)}
+            by_layer = {str(c): round(h, 6) for c, h in zip(caps, layer_hits)}
+            out["static_topk_hit_by_pool_size"] = by_pool
+            out["static_topk_hit_by_layer_even_split"] = by_layer
+            out["oracle_hit_by_pool_size"] = by_pool
+            out["oracle_hit_by_layer_even_split"] = by_layer
         return out
 
     def stats_snapshot(self) -> dict:

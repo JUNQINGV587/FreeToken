@@ -52,7 +52,7 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
-    # Per-(layer, expert) decode routing histogram (working-set / oracle-hit analysis).
+    # Per-(layer, expert) decode routing histogram (working-set / fixed-set-hit analysis).
     # Accumulated on the DEVICE by a ``scatter_add_`` at the raw-ids point, so a captured
     # decode graph replays it with every step -- this flag is CUDA-graph safe and does not
     # require disabling graphs.

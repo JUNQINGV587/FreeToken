@@ -843,8 +843,9 @@ def parse_args(
         help=(
             "Also collect the per-(layer, expert) decode routing histogram, giving "
             "/v1/stats 'moe.routing' (working-set size, experts-to-90%%-of-activations, "
-            "oracle hit rate at the current cache size). Answers 'is it always the "
-            "same experts firing?'. Only accurate with CUDA graphs off "
+            "and the hit rate of the best fixed expert set at the current cache size -- "
+            "a routing-skew figure, not a ceiling on a dynamic cache). Answers 'is it "
+            "always the same experts firing?'. Only accurate with CUDA graphs off "
             "(--cuda-graph-max-bs 0): a captured graph replays without the host-side "
             "histogram scatter. Implies --moe-collect-stats is NOT required, set both "
             "for the full picture."

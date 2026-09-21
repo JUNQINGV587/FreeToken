@@ -33,6 +33,9 @@ class RadixTreeNode:
         # whose end boundary is unchanged. Forward-compat seam for SWA.
         self.mamba_value: int | None = None
         self.mamba_ref_count: int = 0
+        # Hybrid snapshot currency's own LRU stamp: evict_mamba orders by it and walks never
+        # touch it; -1 = no snapshot anchored yet (candidates always carry a live stamp).
+        self.snapshot_lru: int = -1
 
         # SWA second currency (SWARadixCache). Unlike the GDN snapshot above, SWA stores NO
         # separate slot: ``value`` (full-pool page indices) is canonical and the swa KV is
@@ -113,6 +116,9 @@ class RadixTreeNode:
         new_node.swa_tombstone = self.swa_tombstone
         new_node.swa_uuid = self.swa_uuid
         self.swa_uuid = None
+        # defensive: snapshot_lru belongs to the snapshot, not the node -- the snapshot stays
+        # on this same suffix object, so this copy only guards a future split that moves it.
+        new_node.snapshot_lru = self.snapshot_lru
 
         self.set_key_value(self._key[pos:], self._value[pos:])
         self.set_parent(new_node)

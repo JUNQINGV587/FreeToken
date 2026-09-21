@@ -1060,3 +1060,26 @@ def test_semantic_filter_drops_entries_with_the_text_it_hides():
 
     assert content_choices[-1]["delta"]["content"] == "answer"
     assert all("logprobs" not in choice for choice in content_choices)
+
+
+def test_completion_logprobs_keep_one_entry_per_sampled_token_including_eos():
+    # Upstream semantics, pinned on purpose: entries are one per sampled token, and a
+    # sampled end-of-text token carries an entry (its logprob is the stop probability)
+    # even though it contributes no text. A client zipping tokens to text must expect a
+    # possibly-trailing non-text token; flip this test if the contract is ever changed.
+    eos = logprob_entry(151643, "<|endoftext|>", -1.0)
+    result = run(
+        handle_completion(
+            CompletionRequest(model="client-model", prompt="hello", logprobs=5, max_tokens=8),
+            None,
+            FakeState([lp_reply("hi", logprobs=logprob_entry(1, "hi", -0.1)),
+                       lp_reply("", finished=True, logprobs=eos)]),
+            {},
+        )
+    )
+
+    choice = result["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["text"] == "hi"
+    assert choice["logprobs"]["tokens"] == ["hi", "<|endoftext|>"]
+    assert choice["logprobs"]["text_offset"] == [0, 2]

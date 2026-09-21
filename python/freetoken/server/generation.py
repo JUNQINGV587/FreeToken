@@ -318,6 +318,10 @@ class ReasoningDelta:
 @dataclass
 class ContentDelta:
     text: str
+    # Neutral sampled-token logprob entries riding this delta (see UserReply.logprobs);
+    # None when the request did not ask. Parser buffering can attach several entries
+    # to one delta.
+    logprobs: list[dict] | None = None
 
 
 @dataclass
@@ -374,6 +378,9 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    # Neutral sampled-token logprob entries, one per sampled token (empty when the
+    # request did not ask).
+    logprobs: list[dict] = field(default_factory=list)
 
 
 @dataclass

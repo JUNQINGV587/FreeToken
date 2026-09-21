@@ -802,3 +802,69 @@ def test_validation_error_with_non_finite_value_stays_json_safe():
     assert detail[0]["loc"] == ["body", "presence_penalty"]
     assert detail[0]["input"] == "inf"
     assert state.sent is None
+
+
+def test_logprobs_validation_errors():
+    chat_top_out_of_range = run(
+        handle_chat_completion(
+            chat_request(tools=None, logprobs=True, top_logprobs=25), None, FakeState([]), {}
+        )
+    )
+    assert chat_top_out_of_range.status_code == 400
+
+    chat_missing_flag = run(
+        handle_chat_completion(chat_request(tools=None, top_logprobs=1), None, FakeState([]), {})
+    )
+    assert chat_missing_flag.status_code == 400
+
+    completion_out_of_range = run(
+        handle_completion(
+            CompletionRequest(model="client-model", prompt="hello", logprobs=7),
+            None,
+            FakeState([]),
+            {},
+        )
+    )
+    assert completion_out_of_range.status_code == 400
+
+    completion_echo = run(
+        handle_completion(
+            CompletionRequest(model="client-model", prompt="hello", echo=True, logprobs=1),
+            None,
+            FakeState([]),
+            {},
+        )
+    )
+    assert completion_echo.status_code == 400
+
+
+def test_chat_logprobs_fail_closed_under_semantic_parsing():
+    # A server-side reasoning parser hides reasoning tokens from message content, so
+    # logprob entries cannot be aligned with it: reject up front, stream and
+    # non-stream alike, before any engine work is submitted.
+    with_parser = FakeState([], reasoning_parser="qwen3")
+    for stream in (False, True):
+        resp = run(
+            handle_chat_completion(
+                chat_request(tools=None, logprobs=True, stream=stream), None, with_parser, {}
+            )
+        )
+        assert resp.status_code == 400
+        assert json.loads(resp.body)["error"]["param"] == "logprobs"
+
+    # Tool parsing consumes tokens into tool_calls -- same conflict.
+    tools_resp = run(
+        handle_chat_completion(chat_request(logprobs=True), None, FakeState([]), {})
+    )
+    assert tools_resp.status_code == 400
+    assert json.loads(tools_resp.body)["error"]["param"] == "logprobs"
+
+    # tool_choice="none" disables parsing, so logprobs stay available.
+    state = FakeState([UserReply(uid=42, incremental_output="Hi", finished=True)])
+    ok = run(
+        handle_chat_completion(
+            chat_request(logprobs=True, tool_choice="none"), None, state, {}
+        )
+    )
+    assert state.sent is not None
+    assert "logprobs" in ok["choices"][0]

@@ -850,6 +850,17 @@ class Engine:
             size, pages, overlap = self._resolve_auto_moe_cache_size(
                 config, banks, method, ownership=ownership
             )
+            if config.moe_prefill_overlap and not overlap:
+                local_experts = (
+                    ownership.local_num_experts
+                    if ownership is not None
+                    else config.model_config.num_experts
+                )
+                logger.info_rank0(
+                    f"--moe-cache-auto: prefill overlap disabled, its "
+                    f"{PREFILL_PREFETCH_DEPTH * local_experts} slot floor does not fit "
+                    "beside the KV reserve"
+                )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:

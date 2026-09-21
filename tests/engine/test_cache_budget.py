@@ -80,6 +80,21 @@ def test_budget_too_small_for_min_moe_plus_reserve_raises():
         )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
 
 
+def test_overlap_floor_that_does_not_fit_falls_back_to_num_experts():
+    # The overlap floor (depth*num_experts = 8 slots = 800 B) plus the KV reserve does not fit
+    # the 700 B budget, but num_experts slots do. Plan without overlap instead of refusing to
+    # start. Holds for any PREFILL_PREFETCH_DEPTH >= 2 (both 8 and 12 slots exceed the budget).
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=700, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=50,
+    )
+    assert overlap is False
+    assert size == 6  # (700 - 100) // 100, above the num_experts floor
+    assert pages == 10
+    assert size * 100 + pages * 10 <= 700
+
+
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(

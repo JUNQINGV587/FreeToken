@@ -925,6 +925,7 @@ class OffloadMoeCache:
                             E,
                             lengths if miss.size else (),
                             _SMALL_BANK_FEAT_BYTES,
+                            _SMALL_BANK_GATHER,
                         )
                         if self._prof.enabled
                         else None

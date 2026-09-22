@@ -423,6 +423,7 @@ def test_batch_reports_the_source_breakdown_and_resets_per_chunk():
     assert "small" not in next_line, next_line
 
 
+
 def test_hit_batch_reports_gather_volume_and_resets_per_chunk():
     # The gather volume is the other half of the staging trade, and it must be per chunk
     # like every other counter here -- a stale value would silently grow with uptime.
@@ -442,3 +443,11 @@ def test_hit_batch_is_ignored_when_disabled():
     prof = prefill_profile.PrefillProfiler(False)
     prof.hit_batch(30, 3000)
     assert prof.end_chunk(layers=1) is None
+
+def test_bank_byte_split_follows_the_small_gather_gate():
+    # With the gather covering the small banks they stage by miss run, so the whole-layer
+    # small bucket must disappear or the account contradicts the batch it describes.
+    feats = [64 * 1024, 4 * 1024 * 1024]
+    split = prefill_profile.bank_byte_split(feats, 8, [5], 256 * 1024, small_gather=True)
+    assert split["small"] == (0, 0)
+    assert split["miss"] == (2, 5 * (64 * 1024 + 4 * 1024 * 1024))

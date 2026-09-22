@@ -42,6 +42,19 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   hundred). `FREETOKEN_PREFILL_RELAUNCH=1` additionally relaunches the idempotent hit-compaction
   kernel back to back and times the second launch: that separates "this launch is slow" from "the
   host was slow around it". All of it stays off unless `FREETOKEN_PREFILL_PROFILE=1` is also set.
+- `feat(moe)`: **opt-in per-layer device timeline** for the same chunk (`FREETOKEN_PREFILL_TIMELINE=1`,
+  again only with the profile on). The host phases above say which region the time showed up in, and
+  that region moves between staging configurations (the same attention code costs 13.7 ms/layer in
+  the ring configuration and 1.06 ms/layer in the active-only one), so they cannot name the
+  bottleneck. This records four reused CUDA events per layer plus the host clock over the same span -
+  `copy_begin`/`copy_end` on the copy stream, `wait_done`/`gemm_end` on the compute stream - and
+  writes one CSV row per layer per chunk (`FREETOKEN_PREFILL_TIMELINE_OUT`). The compute stream is
+  FIFO, so `wait_done[i] - gemm_end[i-1]` is the device time spent blocked on layer *i*'s staging;
+  comparing it against the host gap over the same span separates "the device waited for the copy"
+  from "the device was idle because the host had not enqueued the work yet". The dump is deferred and
+  never blocks (`Event.query`, one chunk of lag) so the chunk's `host` number stays comparable with
+  every other arm. The same flag adds a per-layer `attn_core`/`moe_total` series and a `batch=`
+  section (entry count, bytes, size histogram, driver-call wall time) to the profile line.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
 ## Measurement protocol

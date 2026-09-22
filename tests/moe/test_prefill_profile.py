@@ -176,3 +176,210 @@ def test_relaunch_control_needs_both_flags():
     assert not prefill_profile._relaunch_enabled(True, "0")
     assert not prefill_profile._relaunch_enabled(True, "")
     assert prefill_profile._relaunch_enabled(True, "on")
+
+
+class _FakeEvent:
+    """Event stand-in: records which stream it was armed on, and a settable timestamp."""
+
+    def __init__(self) -> None:
+        self.streams = []
+        self.done = False
+        self.ms = 0.0
+
+    def record(self, stream=None) -> None:
+        # A freshly recorded event is NOT complete: the device completes it later, which
+        # is what makes the deferred dump non-blocking.
+        self.streams.append(stream)
+        self.done = False
+
+    def query(self) -> bool:
+        return self.done
+
+    def elapsed_time(self, other) -> float:
+        return other.ms - self.ms
+
+
+class _FakeOrigin:
+    """Origin event whose elapsed_time reads the recorded timestamp off the peer."""
+
+    def __init__(self) -> None:
+        self.ms = 0.0
+
+    def record(self, stream=None) -> None:
+        pass
+
+    def query(self) -> bool:
+        return True
+
+    def elapsed_time(self, other) -> float:
+        return other.ms - self.ms
+
+
+def _timeline_with_fakes():
+    pool = []
+    origin = _FakeOrigin()
+
+    def factory():
+        ev = origin if not pool else _FakeEvent()
+        pool.append(ev)
+        return ev
+
+    return prefill_profile.LayerTimeline(event_factory=factory), pool
+
+
+class _FakeTimeline:
+    """Stand-in for LayerTimeline in tests that only care about the profiler facade."""
+
+    def begin_chunk(self) -> None:
+        pass
+
+    def record(self, kind, layer, stream=None) -> None:
+        pass
+
+    def finish_chunk(self) -> None:
+        pass
+
+
+def test_batch_bucket_edges():
+    assert prefill_profile.batch_bucket(1) == 0
+    assert prefill_profile.batch_bucket(64 * 1024 - 1) == 0
+    assert prefill_profile.batch_bucket(64 * 1024) == 1
+    assert prefill_profile.batch_bucket(1024 * 1024 - 1) == 1
+    assert prefill_profile.batch_bucket(1024 * 1024) == 2
+
+
+def test_analyze_timeline_separates_device_stall_from_host_time():
+    # Two layers, copy lands late for both: the device gap equals the copy's lateness.
+    rows = [
+        {"chunk_begin": 0.0, "wait_done": 1.0, "gemm_end": 3.0,
+         "copy_begin": 0.5, "copy_end": 1.0, "h_wait_done": 0.001, "h_gemm_end": 0.003},
+        {"chunk_begin": 0.0, "wait_done": 8.0, "gemm_end": 10.0,
+         "copy_begin": 3.5, "copy_end": 8.0, "h_wait_done": 0.004, "h_gemm_end": 0.010},
+    ]
+    out = prefill_profile.analyze_timeline(rows)
+    assert out["layers"] == 2
+    # Layer 0 waits from the chunk origin, layer 1 from layer 0's gemm_end.
+    assert out["stall_sum_ms"] == pytest.approx(1.0 + 5.0)
+    assert out["copy_sum_ms"] == pytest.approx(0.5 + 4.5)
+    assert out["late_p50_ms"] == pytest.approx(5.0)
+    # Only layer 1 has a previous gemm_end, so exactly one host gap is measured.
+    assert out["host_gap_sum_ms"] == pytest.approx(1.0)
+    assert out["stall_frac_of_host"] == pytest.approx(6.0)
+
+
+def test_analyze_timeline_reports_device_idle_as_a_small_stall():
+    # The device was already drained: wait_done fires just after the previous gemm_end,
+    # while the host took 10 ms to get there -> the host, not the copy, is the limit.
+    rows = [
+        {"chunk_begin": 0.0, "wait_done": 0.1, "gemm_end": 0.2,
+         "copy_begin": 0.05, "copy_end": 0.1, "h_wait_done": 0.0001, "h_gemm_end": 0.0002},
+        {"chunk_begin": 0.0, "wait_done": 0.21, "gemm_end": 0.3,
+         "copy_begin": 0.15, "copy_end": 0.2, "h_wait_done": 0.0102, "h_gemm_end": 0.0104},
+    ]
+    out = prefill_profile.analyze_timeline(rows)
+    assert out["stall_sum_ms"] == pytest.approx(0.11)
+    assert out["stall_frac_of_host"] < 0.03
+
+
+def test_analyze_timeline_is_empty_safe():
+    out = prefill_profile.analyze_timeline([])
+    assert out["layers"] == 0
+    assert out["stall_sum_ms"] == 0.0
+    assert out["stall_frac_of_host"] == 0.0
+
+
+def test_timeline_requires_the_profile_gate():
+    # Like the relaunch control: the timeline must not arm on its own env var alone.
+    assert not prefill_profile._relaunch_enabled(False, "1")
+    assert prefill_profile._relaunch_enabled(True, "on")
+
+
+def test_timeline_records_every_kind_for_every_layer():
+    tl, _ = _timeline_with_fakes()
+    tl.begin_chunk()
+    for layer in range(3):
+        for kind in prefill_profile.LayerTimeline.KINDS:
+            tl.record(kind, layer, stream=f"copy" if kind.startswith("copy") else None)
+    rows = tl._rows
+    assert len(rows) == 3
+    for row in rows:
+        for kind in prefill_profile.LayerTimeline.KINDS:
+            assert kind in row
+
+
+def test_timeline_rejects_unknown_kinds():
+    tl, _ = _timeline_with_fakes()
+    tl.begin_chunk()
+    with pytest.raises(ValueError):
+        tl.record("nope", 0)
+
+
+def test_timeline_defers_the_dump_until_the_events_complete(clock, monkeypatch):
+    monkeypatch.setattr(prefill_profile, "TIMELINE_OUT", "")
+    tl, pool = _timeline_with_fakes()
+    tl.begin_chunk()
+    for layer in range(2):
+        for kind in prefill_profile.LayerTimeline.KINDS:
+            tl.record(kind, layer)
+    tl.finish_chunk()
+    assert len(tl._queue) == 1
+    # The parked chunk's last event is still in flight -> nothing is dumped (no blocking).
+    assert tl.flush() == 0
+    assert len(tl._queue) == 1
+    pool[-1].done = True
+    assert tl.flush() == 1
+    assert tl._queue == []
+    assert len(tl.summaries) == 1
+
+
+def test_timeline_queue_is_bounded():
+    tl, _ = _timeline_with_fakes()
+    for _ in range(6):
+        tl.begin_chunk()
+        for kind in prefill_profile.LayerTimeline.KINDS:
+            tl.record(kind, 0)
+        tl.finish_chunk()
+    assert len(tl._queue) <= 4
+    assert tl.dropped >= 2
+
+
+def test_batch_stats_are_reported_and_reset(clock):
+    prof = PrefillProfiler(True)
+    prof.begin_chunk()
+    prof.batch([1024, 2048])
+    prof.batch([2 * 1024 * 1024], driver_ms=0.4)
+    first = prof.end_chunk(layers=1)
+    assert "batch=entries:3,bytes:" in first
+    assert "lt64k:2,to1m:0,gt1m:1" in first
+    assert "drv_max:0.40ms" in first
+    prof.begin_chunk()
+    assert "batch=" not in prof.end_chunk(layers=1)
+
+
+def test_series_only_records_while_the_timeline_is_on(clock, monkeypatch):
+    monkeypatch.setattr(prefill_profile, "LayerTimeline", _FakeTimeline)
+    plain = PrefillProfiler(True)
+    plain.begin_chunk()
+    with plain.phase("attn_core", series=True):
+        pass
+    assert plain._series == {}
+    timed = PrefillProfiler(True, timeline_enabled=True)
+    timed.begin_chunk()
+    timed.set_layer(7)
+    with timed.phase("attn_core", series=True):
+        pass
+    assert [layer for layer, _ in timed._series["attn_core"]] == [7]
+
+
+def test_disabled_profiler_touches_no_event_or_series(monkeypatch):
+    prof = PrefillProfiler(False, timeline_enabled=True)
+    def _boom(*_a, **_k):
+        raise AssertionError("must not create CUDA events while disabled")
+    monkeypatch.setattr(prefill_profile, "LayerTimeline", _boom)
+    prof.begin_chunk()
+    prof.set_layer(0)
+    prof.evt("wait_done", 0)
+    prof.batch([1])
+    with prof.phase("attn_core", series=True):
+        pass
+    assert prof.end_chunk(layers=1) is None

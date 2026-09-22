@@ -77,6 +77,8 @@ class Qwen4ExpDecoderLayer(BaseOP):
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         prof = prefill_profile.get_profiler()
+        # Names the layer for the per-layer timeline / series; no-op unless enabled.
+        prof.set_layer(self._layer_id)
         # Expert-prefetch enqueue point (env-gated; no-op by default). Runs before
         # attention so the next layer's H2D window covers the whole layer.
         with prof.phase("entry"):
@@ -86,7 +88,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
                 hidden = hidden + self.ple.forward(hidden, batch)
         with prof.phase("attn_mix"):
             block_input, inject = self.attn_hyper_connection.mix(hidden)
-        with prof.phase("attn_core"):
+        # series=True keeps the per-layer samples: a chunk total hides whether the cost
+        # grows towards the end of the chunk (a device queue filling up) or is flat.
+        with prof.phase("attn_core", series=True):
             if self._is_linear:
                 with prof.phase("attn_linear"):
                     block_output = self.linear_attn.forward(block_input)
@@ -96,7 +100,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
             hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
         with prof.phase("mlp_mix"):
             block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        with prof.phase("moe_total"):
+        with prof.phase("moe_total", series=True):
             mlp_output = self.mlp.forward(block_input)
         with prof.phase("mlp_combine"):
             return self.mlp_hyper_connection.combine(hidden, mlp_output, inject)

@@ -557,6 +557,10 @@ class OffloadMoELayer(MoELayer):
             views = owner.bank_views(owner.num_experts)
         local_ids, owned = owner.geometry.global_to_local(topk_ids)
         prof = prefill_profile.get_profiler()
+        # Device-side right edge of this layer's staging wait: the compute stream is FIFO, so
+        # the gap from the previous layer's GEMM end to this event is the time the device
+        # spent blocked on this layer's copies rather than executing.
+        prof.evt("wait_done", self.layer_id)
         with prof.phase("route_mask"):
             safe_ids = torch.where(owned, local_ids, torch.zeros_like(local_ids)).contiguous()
 
@@ -576,6 +580,9 @@ class OffloadMoELayer(MoELayer):
             alphas=owner.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        # Recorded before release_prefill_layer: that call closes the chunk on the last
+        # layer, and the row must carry its own right edge before the chunk is parked.
+        prof.evt("gemm_end", self.layer_id)
         if owner.geometry.prefill_overlap:
             owner.release_prefill_layer(self.layer_id)
         return out

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass, replace
 from typing import Iterator
 
@@ -915,6 +916,10 @@ class OffloadMoeCache:
                         self._prof.bump("stage_plan_tensor", 3)
                     self._prof.bump("stage_plan")
                 if dst:
+                    # Both timeline events are recorded even for an empty batch, so a stale
+                    # timestamp from an earlier layer can never be read back as this one's.
+                    self._prof.evt("copy_begin", layer_id, self.prefill_copy_stream)
+                    t_drv = time.perf_counter()
                     with self._prof.phase("stage_driver"):
                         self._batch_memcpy(
                             dst_t,
@@ -923,6 +928,13 @@ class OffloadMoeCache:
                             torch.cuda.current_stream(self.device).cuda_stream,
                         )
                     self._prof.bump("stage_driver")
+                    self._prof.batch(
+                        nbytes, driver_ms=(time.perf_counter() - t_drv) * 1000.0
+                    )
+                    self._prof.evt("copy_end", layer_id, self.prefill_copy_stream)
+                else:
+                    self._prof.evt("copy_begin", layer_id, self.prefill_copy_stream)
+                    self._prof.evt("copy_end", layer_id, self.prefill_copy_stream)
                 with self._prof.phase("stage_record"):
                     self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 

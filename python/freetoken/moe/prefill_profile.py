@@ -114,7 +114,9 @@ def batch_bucket(nbytes: int) -> int:
     return 2
 
 
-def bank_byte_split(feats, num_experts: int, miss_runs, small_threshold: int) -> Dict[str, tuple]:
+def bank_byte_split(
+    feats, num_experts: int, miss_runs, small_threshold: int, small_gather: bool = False
+) -> Dict[str, tuple]:
     """``(entries, bytes)`` per staging origin for one layer (pure, unit-tested).
 
     Mirrors the copy plan in ``OffloadMoeCache._prefetch_split``: a bank whose per-expert
@@ -122,11 +124,15 @@ def bank_byte_split(feats, num_experts: int, miss_runs, small_threshold: int) ->
     other bank stages only the miss runs. The two together are the PCIe batch, so telling
     them apart is what decides whether the whole-layer small banks are worth removing
     (they cost bytes even at full cache residency, where all their rows are hits).
+
+    ``small_gather`` mirrors the prototype flag of the same name: with the gather covering
+    the small banks they stage by miss run like everything else, and reporting them as
+    whole-layer there would have made the account contradict the batch it describes.
     """
     small = [0, 0]
     miss = [0, 0]
     for feat in feats:
-        if feat < small_threshold:
+        if feat < small_threshold and not small_gather:
             small[0] += 1
             small[1] += num_experts * feat
         elif len(miss_runs):

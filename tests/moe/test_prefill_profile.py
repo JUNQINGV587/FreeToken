@@ -421,3 +421,12 @@ def test_batch_reports_the_source_breakdown_and_resets_per_chunk():
     next_line = prof.end_chunk(layers=1)
     assert "src=miss:1/10" in next_line, next_line
     assert "small" not in next_line, next_line
+
+
+def test_bank_byte_split_follows_the_small_gather_gate():
+    # With the gather covering the small banks they stage by miss run, so the whole-layer
+    # small bucket must disappear or the account contradicts the batch it describes.
+    feats = [64 * 1024, 4 * 1024 * 1024]
+    split = prefill_profile.bank_byte_split(feats, 8, [5], 256 * 1024, small_gather=True)
+    assert split["small"] == (0, 0)
+    assert split["miss"] == (2, 5 * (64 * 1024 + 4 * 1024 * 1024))

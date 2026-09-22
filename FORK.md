@@ -63,6 +63,10 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   bank's bytes are therefore pure overhead at steady state, and this split is the only way to price
   them before changing the copy plan. Both counters come from `bank_byte_split`, the same rule the plan
   loop applies.
+- The profile line also reports `| hit=<rows>/<bytes>`: the volume the hit-D2D gather moves from the cache to
+  the layer buffer. It prints outside the `batch=` section on purpose, because a fully resident layer stages
+  nothing yet still gathers. Measured at steady state it is larger than the PCIe batch (19.7 GB vs 14.3 GB per
+  chunk), which is the point: the gather trades link bytes for HBM bytes, and only the link is saturated.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
 ## Measurement protocol

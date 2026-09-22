@@ -67,6 +67,13 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   the layer buffer. It prints outside the `batch=` section on purpose, because a fully resident layer stages
   nothing yet still gathers. Measured at steady state it is larger than the PCIe batch (19.7 GB vs 14.3 GB per
   chunk), which is the point: the gather trades link bytes for HBM bytes, and only the link is saturated.
+- `feat(moe)`: `FREETOKEN_PREFILL_SMALL_GATHER=1` (default off) lets the hit-D2D gather cover the small banks
+  too, so they stage only their miss runs instead of the whole layer. The accounting above prices those
+  whole-layer copies at ~24% of the prefill PCIe bytes, paid even at full cache residency where every row is
+  a hit; the gather moves the same bytes over HBM instead of PCIe. At matched cache state that is 16.41 -> 14.20
+  GB per chunk and TTFT 1.49 -> 1.30 s (-13%, 4.3K prompt 1.83 -> 1.64 s), with bit-identical outputs. Every row
+  still arrives exactly once (hit -> gather, miss -> copy run), which is what the GPU test checks; the flag is
+  read at cache construction so a test can flip it.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
 ## Measurement protocol

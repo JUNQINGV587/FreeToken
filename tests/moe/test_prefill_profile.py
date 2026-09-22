@@ -421,3 +421,24 @@ def test_batch_reports_the_source_breakdown_and_resets_per_chunk():
     next_line = prof.end_chunk(layers=1)
     assert "src=miss:1/10" in next_line, next_line
     assert "small" not in next_line, next_line
+
+
+def test_hit_batch_reports_gather_volume_and_resets_per_chunk():
+    # The gather volume is the other half of the staging trade, and it must be per chunk
+    # like every other counter here -- a stale value would silently grow with uptime.
+    prof = prefill_profile.PrefillProfiler(True)
+    prof.begin_chunk()
+    prof.hit_batch(30, 3000)
+    prof.hit_batch(2, 200)
+    line = prof.end_chunk(layers=1)
+    assert "hit=32/3200" in line, line
+    prof.begin_chunk()
+    prof.batch([10], sources={"miss": (1, 10)})
+    next_line = prof.end_chunk(layers=1)
+    assert "hit=" not in next_line, next_line
+
+
+def test_hit_batch_is_ignored_when_disabled():
+    prof = prefill_profile.PrefillProfiler(False)
+    prof.hit_batch(30, 3000)
+    assert prof.end_chunk(layers=1) is None

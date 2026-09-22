@@ -866,7 +866,8 @@ class OffloadMoeCache:
         with self._prof.phase("stage_classify"):
             snap = self._prefill_snapshot_np[layer_id]
             hit_mask = snap >= self._prefill_depth * E
-            self.prefill_hit_rows += int(hit_mask.sum())
+            hits = int(hit_mask.sum())
+            self.prefill_hit_rows += hits
             self.prefill_total_rows += E
         if self._gather_dst_ptrs is not None:
             with self._prof.phase("stage_compact"):
@@ -883,6 +884,10 @@ class OffloadMoeCache:
                     self._prefill_hit_num,
                     blocks_per_bank=64,
                 )
+            if self._prof.enabled:
+                # one gathered row per bank in the gather set, so the volume is the row
+                # count times that set's bytes per expert
+                self._prof.hit_batch(hits, hits * int(self._gather_feat_bytes.sum()))
         with self._prof.phase("stage_memcpy"):
             with self._prof.phase("stage_miss_list"):
                 miss = np.nonzero(~hit_mask)[0]

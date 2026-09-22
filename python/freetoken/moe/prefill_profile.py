@@ -346,6 +346,8 @@ class PrefillProfiler:
         self._batch_buckets = [0, 0, 0]
         self._batch_driver_ms: list = []
         self._batch_sources: dict = {}
+        self._hit_rows = 0
+        self._hit_bytes = 0
         self._layer = -1
         self._chunk_start = 0.0
         self._chunks = 0
@@ -368,6 +370,8 @@ class PrefillProfiler:
         self._batch_buckets = [0, 0, 0]
         self._batch_driver_ms = []
         self._batch_sources = {}
+        self._hit_rows = 0
+        self._hit_bytes = 0
         if self.timeline_enabled:
             if self._timeline is None:
                 self._timeline = LayerTimeline()
@@ -385,6 +389,18 @@ class PrefillProfiler:
             return
         assert self._timeline is not None
         self._timeline.record(kind, self._layer if layer is None else layer, stream)
+
+    def hit_batch(self, rows: int, nbytes: int) -> None:
+        """D2D gather volume for this chunk: the rows served from the cache.
+
+        These bytes never cross PCIe, so they are the other half of the trade the
+        staging plan makes -- gathering a row instead of staging it only pays off when
+        the link is the bottleneck, and this is what the gather costs instead.
+        """
+        if not self.enabled:
+            return
+        self._hit_rows += rows
+        self._hit_bytes += nbytes
 
     def batch(self, nbytes_seq, driver_ms: Optional[float] = None, sources=None) -> None:
         """Account one staging batch: entry count, bytes, size histogram, driver time.
@@ -479,6 +495,8 @@ class PrefillProfiler:
                     for name, (entries, nbytes) in sorted(self._batch_sources.items())
                 )
                 line += f",src={parts}"
+        if self._hit_rows:
+            line += f" | hit={self._hit_rows}/{self._hit_bytes}"
         if self.timeline_enabled and self._timeline is not None:
             self._timeline.finish_chunk()
             line += (

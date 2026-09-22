@@ -414,7 +414,10 @@ def test_batch_reports_the_source_breakdown_and_resets_per_chunk():
     prof.batch([50], sources={"miss": (1, 50), "small": (1, 40)})
     line = prof.end_chunk(layers=1)
     assert "src=miss:3/350,small:2/80" in line, line
-    # The next chunk must not inherit this chunk's sources.
+    # The next chunk reports its own sources only: a stale dict would otherwise show up as
+    # a cumulative total that grows with uptime rather than with this chunk's copies.
     prof.begin_chunk()
+    prof.batch([10], sources={"miss": (1, 10)})
     next_line = prof.end_chunk(layers=1)
-    assert next_line is not None and "src=" not in next_line, next_line
+    assert "src=miss:1/10" in next_line, next_line
+    assert "small" not in next_line, next_line

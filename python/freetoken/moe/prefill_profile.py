@@ -367,6 +367,7 @@ class PrefillProfiler:
         self._batch_bytes = 0
         self._batch_buckets = [0, 0, 0]
         self._batch_driver_ms = []
+        self._batch_sources = {}
         if self.timeline_enabled:
             if self._timeline is None:
                 self._timeline = LayerTimeline()

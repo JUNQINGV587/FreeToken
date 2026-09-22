@@ -34,6 +34,14 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   attribute the ~1.2 s host-CPU TTFT floor of a prefill batch on this box, which is flat in prompt
   length (7 -> 4343 prompt tokens: rank-0 CPU 1200 -> 1210 ms) and charged per batch, not per
   request. Method and numbers: `research/notes/freetoken/202609-freetoken-speed-report.md` §6.
+- `feat(moe)`: the same profile, one level deeper. Attention splits into proj / norm+rope /
+  indexer / QSA / o_proj; the batch memcpy splits into miss list / plan+tensors / driver call /
+  event record; buffer invalidation and the route-mask elementwise pair get their own phases, and
+  an `ops=` counter section reports how many host operations each region ran (a region that costs
+  milliseconds for three calls is a different problem from one that costs the same for three
+  hundred). `FREETOKEN_PREFILL_RELAUNCH=1` additionally relaunches the idempotent hit-compaction
+  kernel back to back and times the second launch: that separates "this launch is slow" from "the
+  host was slow around it". All of it stays off unless `FREETOKEN_PREFILL_PROFILE=1` is also set.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
 ## Measurement protocol

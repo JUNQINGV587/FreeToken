@@ -720,9 +720,11 @@ class OffloadMoeCache:
 
         from freetoken.kernel.triton.moe import invalidate_prefill_slots
 
-        invalidate_prefill_slots(
-            self.id_of_slot, self.slot_for_id, self.usage, slot_start, self.num_experts
-        )
+        with self._prof.phase("stage_invalidate"):
+            invalidate_prefill_slots(
+                self.id_of_slot, self.slot_for_id, self.usage, slot_start, self.num_experts
+            )
+        self._prof.bump("stage_invalidate")
 
     def begin_prefill(self) -> None:
         if not self.prefill_overlap or self._prefill_chunk_open:
@@ -881,36 +883,48 @@ class OffloadMoeCache:
                     blocks_per_bank=64,
                 )
         with self._prof.phase("stage_memcpy"):
-            miss = np.nonzero(~hit_mask)[0]
+            with self._prof.phase("stage_miss_list"):
+                miss = np.nonzero(~hit_mask)[0]
+            self._prof.bump("stage_miss_list")
             with torch.cuda.stream(self.prefill_copy_stream):
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
                 self._invalidate_prefill_buffer(buffer_id)
-                if miss.size:
-                    run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
-                    starts = miss[run_starts]
-                    lengths = np.diff(np.concatenate((run_starts, [miss.size])))
-                dst, src, nbytes = [], [], []
-                for b, feat in enumerate(self._copy_feat_bytes_host):
-                    if feat < _SMALL_BANK_FEAT_BYTES:
-                        # Whole layer as one entry, EVEN with zero misses: it keeps every
-                        # batch entry above the driver's async floor and covers the hit
-                        # rows the gather skips for these banks.
-                        dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
-                        src.append(self._copy_src_ptrs_host[layer_id][b])
-                        nbytes.append(E * feat)
-                    elif miss.size:
-                        dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
-                        src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
-                        nbytes.extend(lengths * feat)
+                with self._prof.phase("stage_plan"):
+                    if miss.size:
+                        run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
+                        starts = miss[run_starts]
+                        lengths = np.diff(np.concatenate((run_starts, [miss.size])))
+                    dst, src, nbytes = [], [], []
+                    for b, feat in enumerate(self._copy_feat_bytes_host):
+                        if feat < _SMALL_BANK_FEAT_BYTES:
+                            # Whole layer as one entry, EVEN with zero misses: it keeps every
+                            # batch entry above the driver's async floor and covers the hit
+                            # rows the gather skips for these banks.
+                            dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
+                            src.append(self._copy_src_ptrs_host[layer_id][b])
+                            nbytes.append(E * feat)
+                        elif miss.size:
+                            dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
+                            src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
+                            nbytes.extend(lengths * feat)
+                    if dst:
+                        dst_t = torch.tensor(dst, dtype=torch.int64)
+                        src_t = torch.tensor(src, dtype=torch.int64)
+                        nbytes_t = torch.tensor(nbytes, dtype=torch.int64)
+                        self._prof.bump("stage_plan_tensor", 3)
+                    self._prof.bump("stage_plan")
                 if dst:
-                    self._batch_memcpy(
-                        torch.tensor(dst, dtype=torch.int64),
-                        torch.tensor(src, dtype=torch.int64),
-                        torch.tensor(nbytes, dtype=torch.int64),
-                        torch.cuda.current_stream(self.device).cuda_stream,
-                    )
-                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+                    with self._prof.phase("stage_driver"):
+                        self._batch_memcpy(
+                            dst_t,
+                            src_t,
+                            nbytes_t,
+                            torch.cuda.current_stream(self.device).cuda_stream,
+                        )
+                    self._prof.bump("stage_driver")
+                with self._prof.phase("stage_record"):
+                    self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per

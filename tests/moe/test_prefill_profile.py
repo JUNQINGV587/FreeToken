@@ -123,3 +123,56 @@ def test_get_profiler_follows_the_module_flag(monkeypatch):
     assert prefill_profile.get_profiler().enabled is False
     monkeypatch.setattr(prefill_profile, "PROFILE_ENABLED", True)
     assert prefill_profile.get_profiler().enabled is True
+
+
+def test_disabled_bump_records_nothing():
+    prof = PrefillProfiler(False)
+    prof.begin_chunk()
+    prof.bump("stage_driver", 3)
+    assert prof._ops == {}
+
+
+def test_bump_counts_accumulate_and_are_reported(clock):
+    prof = PrefillProfiler(True)
+    prof.begin_chunk()
+    prof.bump("compact_launch")
+    prof.bump("compact_launch", 2)
+    prof.bump("stage_plan_tensor", 3)
+    line = prof.end_chunk(layers=48)
+    assert line is not None
+    assert "ops=compact_launch:3,stage_plan_tensor:3" in line
+
+
+def test_bump_counts_do_not_disturb_the_phase_partition(clock):
+    prof = PrefillProfiler(True)
+    prof.begin_chunk()
+    with prof.phase("attn_core"):
+        clock.now += 0.25
+    prof.bump("attn_core_calls", 48)
+    line = prof.end_chunk(layers=48)
+    assert line is not None
+    # counters are a separate segment: the phase segment still carries the timing partition
+    assert "host=250.0ms unaccounted=0.0ms" in line
+    head = line.split("|")[1]
+    assert "attn_core=250.0/1" in head
+    assert "ops=" not in head
+
+
+def test_ops_are_reset_per_chunk(clock):
+    prof = PrefillProfiler(True)
+    prof.begin_chunk()
+    prof.bump("stage_driver", 5)
+    first = prof.end_chunk(layers=48)
+    prof.begin_chunk()
+    second = prof.end_chunk(layers=48)
+    assert first is not None and second is not None
+    assert "ops=" in first
+    assert "ops=" not in second
+
+
+def test_relaunch_control_needs_both_flags():
+    # The relaunch is a measurement control and must not arm on its own env var alone.
+    assert not prefill_profile._relaunch_enabled(False, "1")
+    assert not prefill_profile._relaunch_enabled(True, "0")
+    assert not prefill_profile._relaunch_enabled(True, "")
+    assert prefill_profile._relaunch_enabled(True, "on")

@@ -25,6 +25,7 @@ from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerge
 from freetoken.models.qwen4_exp.config import qwen4_exp_tp_geometry
 from freetoken.models.qwen4_exp.gemv_concat import f2_enabled
 from freetoken.layers.rotary import get_rope
+from freetoken.moe import prefill_profile
 from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -217,31 +218,37 @@ class Qwen4ExpAttention(BaseOP):
 
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
-        if self.qkv_index_proj is not None:
-            qkv, index_qk = self.qkv_index_proj.forward(x)
-        else:
-            qkv = self.qkv_proj.forward(x)
-        qg, k, v = qkv.split(self._qkv_split, dim=-1)
-        qg = qg.view(-1, self.num_q, self.head_dim * 2)
-        q = qg[..., : self.head_dim].contiguous()
-        gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
-        k = k.contiguous().view(-1, self.num_kv, self.head_dim)
-        v = v.contiguous()
-        self.q_norm.forward_inplace(q)
-        self.k_norm.forward_inplace(k)
-        q, k = self.rotary.forward(
-            batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
-        )
-        index = (
-            self.indexer.forward_qk(index_qk)
-            if self.qkv_index_proj is not None
-            else self.indexer.forward(x)
-        )
-        o = get_global_ctx().attn_backend.qsa_forward(
-            q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
-        )
-        gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
-        return self.o_proj.forward(gated)
+        prof = prefill_profile.get_profiler()
+        with prof.phase("attn_proj"):
+            if self.qkv_index_proj is not None:
+                qkv, index_qk = self.qkv_index_proj.forward(x)
+            else:
+                qkv = self.qkv_proj.forward(x)
+            qg, k, v = qkv.split(self._qkv_split, dim=-1)
+            qg = qg.view(-1, self.num_q, self.head_dim * 2)
+            q = qg[..., : self.head_dim].contiguous()
+            gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
+            k = k.contiguous().view(-1, self.num_kv, self.head_dim)
+            v = v.contiguous()
+        with prof.phase("attn_norm_rope"):
+            self.q_norm.forward_inplace(q)
+            self.k_norm.forward_inplace(k)
+            q, k = self.rotary.forward(
+                batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            )
+        with prof.phase("attn_index"):
+            index = (
+                self.indexer.forward_qk(index_qk)
+                if self.qkv_index_proj is not None
+                else self.indexer.forward(x)
+            )
+        with prof.phase("attn_qsa"):
+            o = get_global_ctx().attn_backend.qsa_forward(
+                q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
+            )
+        with prof.phase("attn_oproj"):
+            gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
+            return self.o_proj.forward(gated)
 
 
 class TorchDenseQSAReference:

@@ -88,7 +88,8 @@ class Qwen4ExpDecoderLayer(BaseOP):
             block_input, inject = self.attn_hyper_connection.mix(hidden)
         with prof.phase("attn_core"):
             if self._is_linear:
-                block_output = self.linear_attn.forward(block_input)
+                with prof.phase("attn_linear"):
+                    block_output = self.linear_attn.forward(block_input)
             else:
                 block_output = self.self_attn.forward(block_input, batch)
         with prof.phase("attn_combine"):

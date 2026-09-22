@@ -556,10 +556,16 @@ class OffloadMoELayer(MoELayer):
             owner.materialize_layer(self.layer_id, buffer_id=0)
             views = owner.bank_views(owner.num_experts)
         local_ids, owned = owner.geometry.global_to_local(topk_ids)
-        safe_ids = torch.where(owned, local_ids, torch.zeros_like(local_ids)).contiguous()
-        safe_weights = torch.where(
-            owned, topk_weights, torch.zeros_like(topk_weights)
-        ).contiguous()
+        prof = prefill_profile.get_profiler()
+        with prof.phase("route_mask"):
+            safe_ids = torch.where(owned, local_ids, torch.zeros_like(local_ids)).contiguous()
+
+            safe_weights = torch.where(
+                owned, topk_weights, torch.zeros_like(topk_weights)
+            ).contiguous()
+        # Four elementwise ops over [rows, topk] plus two allocations; the profile needs the
+        # count to tell "few expensive calls" from "many cheap ones".
+        prof.bump("route_mask", 6)
         out = self._expert_gemm(
             owner,
             hidden_states,

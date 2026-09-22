@@ -7,6 +7,9 @@ import triton
 import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
 
+from freetoken.moe import prefill_profile
+from freetoken.moe.prefill_profile import get_profiler
+
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
 # (LRU on the expert -> prioritizes recurring misses, lowering the steady miss rate);
@@ -60,6 +63,19 @@ def ensure_experts_hybrid(
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
 
 
+def _launch_hit_compact(slot_ids, cache, buffer_id: int, num_experts: int) -> None:
+    _prefill_hit_compact_kernel[(1,)](
+        slot_ids,
+        cache._prefill_hit_dst,
+        cache._prefill_hit_src,
+        cache._prefill_hit_num,
+        buffer_id * num_experts,
+        2 * num_experts,
+        num_experts,
+        BLOCK=triton.next_power_of_2(num_experts),
+    )
+
+
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 
@@ -70,16 +86,16 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     current stream, no host sync. Safe against the concurrent buffer invalidation
     on the copy stream: that only rewrites entries already below the threshold."""
     num_experts = cache.num_experts
-    _prefill_hit_compact_kernel[(1,)](
-        cache.slot_for_id[layer_id],
-        cache._prefill_hit_dst,
-        cache._prefill_hit_src,
-        cache._prefill_hit_num,
-        buffer_id * num_experts,
-        2 * num_experts,
-        num_experts,
-        BLOCK=triton.next_power_of_2(num_experts),
-    )
+    slot_ids = cache.slot_for_id[layer_id]
+    prof = get_profiler()
+    with prof.phase("compact_launch"):
+        _launch_hit_compact(slot_ids, cache, buffer_id, num_experts)
+    prof.bump("compact_launch")
+    if prefill_profile.RELAUNCH_ENABLED:
+        # Measurement-only control (see prefill_profile.RELAUNCH_ENABLED): the kernel is
+        # idempotent, so the second launch costs the launch path alone.
+        with prof.phase("compact_relaunch"):
+            _launch_hit_compact(slot_ids, cache, buffer_id, num_experts)
 
 
 def materialize_layer(cache, layer_id: int) -> None:

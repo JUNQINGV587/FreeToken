@@ -39,7 +39,19 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in _TRUTHY
 
 
+def _relaunch_enabled(profile: bool, raw: str) -> bool:
+    return profile and _truthy(raw)
+
+
 PROFILE_ENABLED = _truthy(os.getenv("FREETOKEN_PREFILL_PROFILE", "0"))
+
+# Measurement-only control inside the hit compaction: launch the same kernel a second time
+# back to back. The kernel is idempotent (fixed-shape writes derived from the same inputs),
+# so the second launch costs the launch path alone -- which separates "this launch is slow"
+# from "the host was slow around it". Off unless the profile itself is on.
+RELAUNCH_ENABLED = _relaunch_enabled(
+    PROFILE_ENABLED, os.getenv("FREETOKEN_PREFILL_RELAUNCH", "0")
+)
 
 
 class _NullPhase:
@@ -64,6 +76,7 @@ class PrefillProfiler:
         self.enabled = enabled
         self._totals: Dict[str, float] = {}
         self._counts: Dict[str, int] = {}
+        self._ops: Dict[str, int] = {}
         self._chunk_start = 0.0
         self._chunks = 0
 
@@ -72,6 +85,7 @@ class PrefillProfiler:
             return
         self._totals.clear()
         self._counts.clear()
+        self._ops.clear()
         self._chunk_start = time.perf_counter()
 
     def phase(self, name: str):
@@ -79,6 +93,17 @@ class PrefillProfiler:
         if not self.enabled:
             return _NULL_PHASE
         return self._timed(name)
+
+    def bump(self, name: str, n: int = 1) -> None:
+        """Count host operations that are too cheap to time individually.
+
+        A phase total answers "how long", this answers "how many": a region that costs
+        milliseconds for three calls and one that costs the same for three hundred are
+        different problems, and only the counter tells them apart.
+        """
+        if not self.enabled:
+            return
+        self._ops[name] = self._ops.get(name, 0) + n
 
     @contextmanager
     def _timed(self, name: str) -> Iterator[None]:
@@ -109,6 +134,10 @@ class PrefillProfiler:
             f"host={host * 1000:.1f}ms unaccounted={unaccounted * 1000:.1f}ms | "
             + " ".join(parts)
         )
+        if self._ops:
+            line += " | ops=" + ",".join(
+                f"{name}:{value}" for name, value in sorted(self._ops.items())
+            )
         if extra:
             line += f" | {extra}"
         return line

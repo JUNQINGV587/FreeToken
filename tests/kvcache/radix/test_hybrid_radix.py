@@ -475,3 +475,79 @@ def test_exhaustion_leaves_the_deepest_validated_boundary(hyb):
     assert m.cached_len == len(chain) > 0                       # reuse never 0 at the floor
     assert m.second == slot_of[5 * PAGE]                        # the deepest tip survived
     hyb.check()
+
+
+# ------------------------------------------------- interleave: two disjoint conversations
+def test_interleaved_conversations_wash_out_the_older_trace(hyb):
+    """Two disjoint conversations under pool pressure -- the orchestrator/subagent interleave.
+
+    Production shape (2026-09 report): conversation A finishes a turn (its tip + grid donate
+    snapshots), conversation B then commits one snapshot per prefill chunk, and each commit
+    needing a slot forces ensure_mamba_slots -> evict_mamba, which is FIFO by snapshot_lru
+    with no notion of a recently finished conversation. A's whole trace is strictly older
+    than every B boundary, so B's commits evict A's boundaries first (tip included), and A's
+    leaf eviction cascades its tombstoned ancestors' KV away too. A's next match collapses
+    to cached_len 0 -- a full re-prefill despite both contexts fitting the KV pool, because
+    the binding currency is GDN snapshot slots, not KV tokens.
+
+    This test PINS THE CURRENT POLICY as the measured baseline. A future protection policy
+    (pin the tip of a recently finished conversation, or evict intermediate grid nodes
+    first) must flip the A-resume assertion to retention; the victim order below is what it
+    has to change.
+    """
+    # Conversation A: two boundaries, tip at 4 pages.
+    hyb.do_insert(ids(1, 2))                                     # A0
+    slot_names = {donated(hyb): "A0"}
+    hyb.do_request(ids(1, 2, 3, 4), prompt_pages=2)              # A tip (A1)
+    slot_names[donated(hyb)] = "A1"
+
+    # Conversation B: disjoint prefix (the root is the only shared node), three boundaries,
+    # one forced eviction after each commit -- what the scheduler does whenever the free-slot
+    # count drops below what the next commit needs.
+    victims = []
+    b_chain: Tuple[int, ...] = ()
+    for k, lab in enumerate((9, 10, 11)):
+        b_chain = b_chain + ids(lab)
+        hyb.do_insert(b_chain)
+        slot_names[donated(hyb)] = f"B{k}"
+        before = set(hyb.second.free)
+        hyb.do_evict_second(1)                                   # pool pressure: a slot must go
+        victims.append(slot_names[(hyb.second.free - before).pop()])
+    hyb.check()
+
+    # Victims leave FIFO by last validation across conversations: A's older trace dies first,
+    # tip included, before B's oldest boundary.
+    assert victims == ["A0", "A1", "B0"]
+
+    # A resumes: no live snapshot anywhere on its path -> full re-prefill.
+    m, _ = hyb.do_match(ids(1, 2, 3, 4))
+    assert (m.cached_len, m.second) == (0, None)
+
+    # B resumes fine, and A's KV is gone too (its leaf eviction cascaded the tombstones up):
+    # the only evictable KV left is B's three 1-page nodes (B0 tombstoned, KV kept).
+    assert full_size(hyb) == 3 * PAGE
+    m, _ = hyb.do_match(b_chain)
+    assert m.cached_len == 3 * PAGE and m.second == [s for s, n in slot_names.items() if n == "B2"][0]
+    hyb.check()
+
+
+def test_interleave_with_enough_snapshot_pool_keeps_both_traces(hyb):
+    """Contrast pin: the same interleave with NO slot pressure (a fundable snapshot cache --
+    the --linear-state-cache-ratio lever). Both traces keep their tips and both conversations
+    resume from their deepest boundary; the wash-out above is a pool-size effect, not a match
+    or insert defect."""
+    hyb.do_insert(ids(1, 2))                                     # A0
+    hyb.do_request(ids(1, 2, 3, 4), prompt_pages=2)              # A tip (A1)
+    a_tip = donated(hyb)
+    b_chain: Tuple[int, ...] = ()
+    for lab in (9, 10, 11):
+        b_chain = b_chain + ids(lab)
+        hyb.do_insert(b_chain)
+    b_tip = donated(hyb)
+    hyb.check()
+
+    m, _ = hyb.do_match(ids(1, 2, 3, 4))
+    assert (m.cached_len, m.second) == (4 * PAGE, a_tip)
+    m, _ = hyb.do_match(b_chain)
+    assert (m.cached_len, m.second) == (3 * PAGE, b_tip)
+    hyb.check()

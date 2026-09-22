@@ -390,3 +390,31 @@ def test_timeline_path_is_per_process():
     assert prefill_profile.timeline_path("/tmp/t.csv", 123) == "/tmp/t.pid123.csv"
     assert prefill_profile.timeline_path("/tmp/t", 7) == "/tmp/t.pid7"
     assert prefill_profile.timeline_path("", 7) == ""
+
+
+def test_bank_byte_split_separates_whole_layer_small_banks_from_misses():
+    # Two small banks (whole layer, miss-independent) + one big bank with two runs.
+    feats = [64 * 1024, 128 * 1024, 4 * 1024 * 1024]
+    split = prefill_profile.bank_byte_split(feats, 8, [3, 2], 256 * 1024)
+    assert split["small"] == (2, 8 * (64 * 1024 + 128 * 1024))
+    assert split["miss"] == (2, 5 * 4 * 1024 * 1024)
+
+
+def test_bank_byte_split_is_zero_when_every_row_is_resident():
+    # Fully resident layer: the only bytes that remain are the whole-layer small banks.
+    split = prefill_profile.bank_byte_split([64 * 1024, 4 * 1024 * 1024], 8, [], 256 * 1024)
+    assert split["small"] == (1, 8 * 64 * 1024)
+    assert split["miss"] == (0, 0)
+
+
+def test_batch_reports_the_source_breakdown_and_resets_per_chunk():
+    prof = prefill_profile.PrefillProfiler(True)
+    prof.begin_chunk()
+    prof.batch([100, 200], sources={"miss": (2, 300), "small": (1, 40)})
+    prof.batch([50], sources={"miss": (1, 50), "small": (1, 40)})
+    line = prof.end_chunk(layers=1)
+    assert "src=miss:3/350,small:2/80" in line, line
+    # The next chunk must not inherit this chunk's sources.
+    prof.begin_chunk()
+    next_line = prof.end_chunk(layers=1)
+    assert next_line is not None and "src=" not in next_line, next_line

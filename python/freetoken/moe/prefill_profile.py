@@ -114,6 +114,27 @@ def batch_bucket(nbytes: int) -> int:
     return 2
 
 
+def bank_byte_split(feats, num_experts: int, miss_runs, small_threshold: int) -> Dict[str, tuple]:
+    """``(entries, bytes)`` per staging origin for one layer (pure, unit-tested).
+
+    Mirrors the copy plan in ``OffloadMoeCache._prefetch_split``: a bank whose per-expert
+    row is below ``small_threshold`` is copied whole-layer even with zero misses, every
+    other bank stages only the miss runs. The two together are the PCIe batch, so telling
+    them apart is what decides whether the whole-layer small banks are worth removing
+    (they cost bytes even at full cache residency, where all their rows are hits).
+    """
+    small = [0, 0]
+    miss = [0, 0]
+    for feat in feats:
+        if feat < small_threshold:
+            small[0] += 1
+            small[1] += num_experts * feat
+        elif len(miss_runs):
+            miss[0] += len(miss_runs)
+            miss[1] += int(sum(miss_runs)) * feat
+    return {"small": (small[0], small[1]), "miss": (miss[0], miss[1])}
+
+
 def _percentile(values, q: float) -> float:
     """Nearest-rank percentile; 0.0 for an empty sample."""
     if not values:
@@ -324,6 +345,7 @@ class PrefillProfiler:
         self._batch_bytes = 0
         self._batch_buckets = [0, 0, 0]
         self._batch_driver_ms: list = []
+        self._batch_sources: dict = {}
         self._layer = -1
         self._chunk_start = 0.0
         self._chunks = 0
@@ -363,8 +385,13 @@ class PrefillProfiler:
         assert self._timeline is not None
         self._timeline.record(kind, self._layer if layer is None else layer, stream)
 
-    def batch(self, nbytes_seq, driver_ms: Optional[float] = None) -> None:
-        """Account one staging batch: entry count, bytes, size histogram, driver time."""
+    def batch(self, nbytes_seq, driver_ms: Optional[float] = None, sources=None) -> None:
+        """Account one staging batch: entry count, bytes, size histogram, driver time.
+
+        ``sources`` optionally maps an origin name (see ``bank_byte_split``) to its own
+        ``(entries, bytes)``, which is what separates bytes nobody can avoid (a real miss)
+        from bytes a fully resident cache still pays (a whole-layer small bank).
+        """
         if not self.enabled:
             return
         n = len(nbytes_seq)
@@ -374,6 +401,11 @@ class PrefillProfiler:
             self._batch_buckets[batch_bucket(int(value))] += 1
         if driver_ms is not None:
             self._batch_driver_ms.append(driver_ms)
+        if sources:
+            for name, (entries, nbytes) in sources.items():
+                slot = self._batch_sources.setdefault(name, [0, 0])
+                slot[0] += int(entries)
+                slot[1] += int(nbytes)
 
     def phase(self, name: str, series: bool = False):
         """Context manager that accumulates wall time under ``name``.
@@ -440,6 +472,12 @@ class PrefillProfiler:
                 f",lt64k:{lo},to1m:{mid},gt1m:{hi}"
                 f",drv_p50:{_percentile(drv, 0.5):.2f}ms,drv_max:{max(drv) if drv else 0.0:.2f}ms"
             )
+            if self._batch_sources:
+                parts = ",".join(
+                    f"{name}:{entries}/{nbytes}"
+                    for name, (entries, nbytes) in sorted(self._batch_sources.items())
+                )
+                line += f",src={parts}"
         if self.timeline_enabled and self._timeline is not None:
             self._timeline.finish_chunk()
             line += (

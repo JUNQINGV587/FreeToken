@@ -55,6 +55,14 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   never blocks (`Event.query`, one chunk of lag) so the chunk's `host` number stays comparable with
   every other arm. The same flag adds a per-layer `attn_core`/`moe_total` series and a `batch=`
   section (entry count, bytes, size histogram, driver-call wall time) to the profile line.
+- `feat(moe)`: the `batch=` section carries a **byte breakdown by staging origin** (`src=`), because
+  the total alone cannot say whether the PCIe bytes are avoidable. `src=miss:<entries>/<bytes>` counts
+  the coalesced miss runs of the large banks, `src=small:<entries>/<bytes>` counts the banks below
+  `_SMALL_BANK_FEAT_BYTES`, which are copied whole-layer **even at 100% residency** to keep every batch
+  entry above the driver's async floor and to cover the hit rows the D2D gather skips for them. A small
+  bank's bytes are therefore pure overhead at steady state, and this split is the only way to price
+  them before changing the copy plan. Both counters come from `bank_byte_split`, the same rule the plan
+  loop applies.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
 ## Measurement protocol

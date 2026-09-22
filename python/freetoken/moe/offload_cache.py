@@ -896,6 +896,18 @@ class OffloadMoeCache:
                         run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
                         starts = miss[run_starts]
                         lengths = np.diff(np.concatenate((run_starts, [miss.size])))
+                    # Byte accounting by origin. Computed only when the profile gate is on,
+                    # so the hot path stays byte-for-byte what it was with the gate off.
+                    split = (
+                        prefill_profile.bank_byte_split(
+                            self._copy_feat_bytes_host,
+                            E,
+                            lengths if miss.size else (),
+                            _SMALL_BANK_FEAT_BYTES,
+                        )
+                        if self._prof.enabled
+                        else None
+                    )
                     dst, src, nbytes = [], [], []
                     for b, feat in enumerate(self._copy_feat_bytes_host):
                         if feat < _SMALL_BANK_FEAT_BYTES:
@@ -929,7 +941,9 @@ class OffloadMoeCache:
                         )
                     self._prof.bump("stage_driver")
                     self._prof.batch(
-                        nbytes, driver_ms=(time.perf_counter() - t_drv) * 1000.0
+                        nbytes,
+                        driver_ms=(time.perf_counter() - t_drv) * 1000.0,
+                        sources=split,
                     )
                     self._prof.evt("copy_end", layer_id, self.prefill_copy_stream)
                 else:

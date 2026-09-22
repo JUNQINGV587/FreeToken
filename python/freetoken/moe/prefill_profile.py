@@ -90,6 +90,21 @@ _NULL_PHASE = _NullPhase()
 BATCH_EDGES = (64 * 1024, 1024 * 1024)
 
 
+def timeline_path(base: str, pid: int) -> str:
+    """Per-process timeline file: every TP rank records its own layers.
+
+    Two ranks share the layer ids and the chunk counter, so one shared file interleaves
+    rows from both processes and cannot be attributed afterwards -- learned when a first
+    run produced a file with two headers and an unusable row order.
+    """
+    if not base:
+        return ""
+    stem, dot, ext = base.rpartition(".")
+    if dot and ext and "/" not in ext:
+        return f"{stem}.pid{pid}.{ext}"
+    return f"{base}.pid{pid}"
+
+
 def batch_bucket(nbytes: int) -> int:
     """Bucket index for one batch entry: 0 = <64 KiB, 1 = <1 MiB, 2 = larger."""
     if nbytes < BATCH_EDGES[0]:
@@ -272,6 +287,7 @@ class LayerTimeline:
             return
         import csv
 
+        path = timeline_path(TIMELINE_OUT, os.getpid())
         # Every field a reader needs to recompute the stall analysis from the CSV alone:
         # the device timeline (ms from the chunk origin) plus the host wall clock over the
         # same span.
@@ -280,8 +296,8 @@ class LayerTimeline:
             "gemm_end", "h_copy_begin", "h_copy_end", "h_wait_done", "h_gemm_end",
         ]
         try:
-            new = not os.path.exists(TIMELINE_OUT)
-            with open(TIMELINE_OUT, "a", newline="") as handle:
+            new = not os.path.exists(path) or os.path.getsize(path) == 0
+            with open(path, "a", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
                 if new:
                     writer.writeheader()
@@ -426,7 +442,10 @@ class PrefillProfiler:
             )
         if self.timeline_enabled and self._timeline is not None:
             self._timeline.finish_chunk()
-            line += f" | timeline=parked:{len(self._timeline._queue)},dropped:{self._timeline.dropped}"
+            line += (
+                f" | timeline=pid:{os.getpid()}"
+                f",parked:{len(self._timeline._queue)},dropped:{self._timeline.dropped}"
+            )
             if self._series:
                 line += " series=" + ",".join(
                     f"{name}:{len(samples)}" for name, samples in sorted(self._series.items())

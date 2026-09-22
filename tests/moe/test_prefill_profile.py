@@ -383,3 +383,10 @@ def test_disabled_profiler_touches_no_event_or_series(monkeypatch):
     with prof.phase("attn_core", series=True):
         pass
     assert prof.end_chunk(layers=1) is None
+
+
+def test_timeline_path_is_per_process():
+    # Two TP ranks share layer ids and the chunk counter, so a shared file is unreadable.
+    assert prefill_profile.timeline_path("/tmp/t.csv", 123) == "/tmp/t.pid123.csv"
+    assert prefill_profile.timeline_path("/tmp/t", 7) == "/tmp/t.pid7"
+    assert prefill_profile.timeline_path("", 7) == ""

@@ -37,6 +37,14 @@ PREFILL_PREFETCH_EARLY = os.getenv("FREETOKEN_PREFILL_PREFETCH_EARLY", "0").stri
     "1", "true", "yes", "on",
 }
 
+# Prototype (default off): let the hit-D2D gather cover the small banks as well, so they
+# stage only their miss runs instead of the whole layer. The small banks are ~24% of the
+# prefill PCIe bytes and pay that even at full cache residency, where all their rows are
+# hits; see FORK.md.
+_SMALL_BANK_GATHER = os.getenv("FREETOKEN_PREFILL_SMALL_GATHER", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 from freetoken.utils import init_logger
 
 from . import ownership as _ownership
@@ -493,7 +501,15 @@ class OffloadMoeCache:
         self._copy_feat_bytes_host = feats
         # hit-D2D gather serves only the big banks; small banks are whole-layer
         # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
-        self._gather_bank_ids = [i for i, f in enumerate(feats) if f >= _SMALL_BANK_FEAT_BYTES]
+        if _SMALL_BANK_GATHER:
+            # Prototype: cover every bank, which is what lets the plan below stage a small
+            # bank by miss run instead of whole layer. Read at construction so a test can
+            # flip the module flag before building the cache.
+            self._gather_bank_ids = list(range(len(feats)))
+        else:
+            self._gather_bank_ids = [
+                i for i, f in enumerate(feats) if f >= _SMALL_BANK_FEAT_BYTES
+            ]
         if len(self._gather_bank_ids) == len(feats):
             self._gather_dst_ptrs = self._copy_dst_ptrs
             self._gather_feat_bytes = self._copy_feat_bytes
@@ -910,7 +926,7 @@ class OffloadMoeCache:
                     )
                     dst, src, nbytes = [], [], []
                     for b, feat in enumerate(self._copy_feat_bytes_host):
-                        if feat < _SMALL_BANK_FEAT_BYTES:
+                        if feat < _SMALL_BANK_FEAT_BYTES and not _SMALL_BANK_GATHER:
                             # Whole layer as one entry, EVEN with zero misses: it keeps every
                             # batch entry above the driver's async floor and covers the hit
                             # rows the gather skips for these banks.

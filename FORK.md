@@ -63,6 +63,12 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   bank's bytes are therefore pure overhead at steady state, and this split is the only way to price
   them before changing the copy plan. Both counters come from `bank_byte_split`, the same rule the plan
   loop applies.
+- `exp(prefill)`: **prototype, default off** - `FREETOKEN_PREFILL_SMALL_GATHER=1` lets the hit-D2D gather
+  cover the small banks too, so they stage only their miss runs instead of the whole layer. The
+  accounting above prices those whole-layer copies at ~24% of the prefill PCIe bytes, paid even at
+  full cache residency where every row is a hit; the gather moves the same bytes over HBM instead of
+  PCIe. Every row still arrives exactly once (hit -> gather, miss -> copy run), which is what the
+  GPU test checks, and the flag is read at cache construction so a test can flip it.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
 ## Measurement protocol

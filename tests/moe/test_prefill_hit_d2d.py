@@ -10,6 +10,7 @@ import os
 import pytest
 import torch
 
+from freetoken.moe import offload_cache
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -151,3 +152,36 @@ def test_prefill_hit_d2d_noop_without_spare_slots():
     torch.cuda.synchronize()
     for view, (name, per_layer) in zip(views, sources.items()):
         assert torch.equal(view.cpu(), per_layer[0]), name
+
+
+def test_small_bank_gather_is_off_by_default():
+    # The prototype changes which rows cross PCIe, so it must never be on by accident.
+    assert offload_cache._SMALL_BANK_GATHER is False
+
+
+@CUDA
+@JIT
+@BATCH_API
+def test_small_bank_gather_fills_the_layer_buffer(monkeypatch):
+    # With the gather covering the small banks too, a layer must still end up complete:
+    # hit rows come from the gather, miss rows from the copy run. Any row the plan drops
+    # shows up here as a mismatch against the sources -- the red line for the prototype.
+    monkeypatch.setattr(offload_cache, "_SMALL_BANK_GATHER", True)
+    cache, sources = _make_cache()
+    assert len(cache._gather_bank_ids) == len(sources), "every bank must be gatherable"
+    _seed_resident(cache, sources, layer_id=1, expert_id=1, slot=17)
+    _seed_resident(cache, sources, layer_id=1, expert_id=3, slot=20)
+    _seed_resident(cache, sources, layer_id=1, expert_id=0, slot=2)  # buffer slot -> miss
+    for name in sources:
+        cache.bank_caches[name][2].fill_(float("nan"))
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(1)
+    for layer_id in (0, 1):
+        views = cache.wait_prefill_layer(layer_id)
+        torch.cuda.synchronize()
+        for view, (name, per_layer) in zip(views, sources.items()):
+            assert torch.equal(view.cpu(), per_layer[layer_id]), (layer_id, name)
+        cache.release_prefill_layer(layer_id)
+    assert cache.prefill_hit_rows == 2

@@ -8,6 +8,8 @@ from typing import Iterator
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
 
+from . import prefill_profile
+
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
 # (kept for A/B profiling). Falls back to per-bank automatically if a bank's row bytes or
@@ -334,6 +336,10 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Host-time attribution for the per-chunk prefill staging (default off).
+        self._prof = prefill_profile.get_profiler()
+        self._prof_hit_rows_start = 0
+        self._prof_total_rows_start = 0
 
     @property
     def prefill_depth(self) -> int:
@@ -578,6 +584,8 @@ class OffloadMoeCache:
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self._prof_hit_rows_start = 0
+        self._prof_total_rows_start = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < self._prefill_depth * self.num_experts:
@@ -725,6 +733,9 @@ class OffloadMoeCache:
         self._prefill_chunk_open = True
         self._prefill_buffer_layer = [None] * self._prefill_depth
         self._prefill_buffer_released = [True] * self._prefill_depth
+        self._prof.begin_chunk()
+        self._prof_hit_rows_start = self.prefill_hit_rows
+        self._prof_total_rows_start = self.prefill_total_rows
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
@@ -741,7 +752,8 @@ class OffloadMoeCache:
             # classification is pure host math.
             with torch.cuda.stream(self.prefill_copy_stream):
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
-            self.prefill_copy_stream.synchronize()
+            with self._prof.phase("chunk_sync"):
+                self.prefill_copy_stream.synchronize()
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap or layer_id >= self.num_layers:
@@ -765,15 +777,18 @@ class OffloadMoeCache:
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
         if self._prefill_hit_d2d_active:
-            self._prefetch_split(layer_id, buffer_id)
+            with self._prof.phase("stage_split"):
+                self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
-            copy()
-        else:
-            with torch.cuda.stream(self.prefill_copy_stream):
-                if self._prefill_buffer_has_release_event[buffer_id]:
-                    self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+            with self._prof.phase("stage_full"):
                 copy()
-                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+        else:
+            with self._prof.phase("stage_full"):
+                with torch.cuda.stream(self.prefill_copy_stream):
+                    if self._prefill_buffer_has_release_event[buffer_id]:
+                        self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+                    copy()
+                    self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
         self._prefill_buffer_layer[buffer_id] = layer_id
         self._prefill_buffer_released[buffer_id] = False
@@ -845,53 +860,57 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import prefill_hit_compact
 
         E = self.num_experts
-        snap = self._prefill_snapshot_np[layer_id]
-        hit_mask = snap >= self._prefill_depth * E
-        self.prefill_hit_rows += int(hit_mask.sum())
-        self.prefill_total_rows += E
+        with self._prof.phase("stage_classify"):
+            snap = self._prefill_snapshot_np[layer_id]
+            hit_mask = snap >= self._prefill_depth * E
+            self.prefill_hit_rows += int(hit_mask.sum())
+            self.prefill_total_rows += E
         if self._gather_dst_ptrs is not None:
-            prefill_hit_compact(self, layer_id, buffer_id)
+            with self._prof.phase("stage_compact"):
+                prefill_hit_compact(self, layer_id, buffer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
             # wider grid (~22 GB/s per 1024-thread block on H100).
-            fast_index_copy_multi_jit(
-                self._gather_dst_ptrs,
-                self._gather_dst_ptrs,
-                self._gather_feat_bytes,
-                self._prefill_hit_dst,
-                self._prefill_hit_src,
-                self._prefill_hit_num,
-                blocks_per_bank=64,
-            )
-        miss = np.nonzero(~hit_mask)[0]
-        with torch.cuda.stream(self.prefill_copy_stream):
-            if self._prefill_buffer_has_release_event[buffer_id]:
-                self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
-            self._invalidate_prefill_buffer(buffer_id)
-            if miss.size:
-                run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
-                starts = miss[run_starts]
-                lengths = np.diff(np.concatenate((run_starts, [miss.size])))
-            dst, src, nbytes = [], [], []
-            for b, feat in enumerate(self._copy_feat_bytes_host):
-                if feat < _SMALL_BANK_FEAT_BYTES:
-                    # Whole layer as one entry, EVEN with zero misses: it keeps every
-                    # batch entry above the driver's async floor and covers the hit
-                    # rows the gather skips for these banks.
-                    dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
-                    src.append(self._copy_src_ptrs_host[layer_id][b])
-                    nbytes.append(E * feat)
-                elif miss.size:
-                    dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
-                    src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
-                    nbytes.extend(lengths * feat)
-            if dst:
-                self._batch_memcpy(
-                    torch.tensor(dst, dtype=torch.int64),
-                    torch.tensor(src, dtype=torch.int64),
-                    torch.tensor(nbytes, dtype=torch.int64),
-                    torch.cuda.current_stream(self.device).cuda_stream,
+            with self._prof.phase("stage_hitcopy"):
+                fast_index_copy_multi_jit(
+                    self._gather_dst_ptrs,
+                    self._gather_dst_ptrs,
+                    self._gather_feat_bytes,
+                    self._prefill_hit_dst,
+                    self._prefill_hit_src,
+                    self._prefill_hit_num,
+                    blocks_per_bank=64,
                 )
-            self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+        with self._prof.phase("stage_memcpy"):
+            miss = np.nonzero(~hit_mask)[0]
+            with torch.cuda.stream(self.prefill_copy_stream):
+                if self._prefill_buffer_has_release_event[buffer_id]:
+                    self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+                self._invalidate_prefill_buffer(buffer_id)
+                if miss.size:
+                    run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
+                    starts = miss[run_starts]
+                    lengths = np.diff(np.concatenate((run_starts, [miss.size])))
+                dst, src, nbytes = [], [], []
+                for b, feat in enumerate(self._copy_feat_bytes_host):
+                    if feat < _SMALL_BANK_FEAT_BYTES:
+                        # Whole layer as one entry, EVEN with zero misses: it keeps every
+                        # batch entry above the driver's async floor and covers the hit
+                        # rows the gather skips for these banks.
+                        dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
+                        src.append(self._copy_src_ptrs_host[layer_id][b])
+                        nbytes.append(E * feat)
+                    elif miss.size:
+                        dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
+                        src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
+                        nbytes.extend(lengths * feat)
+                if dst:
+                    self._batch_memcpy(
+                        torch.tensor(dst, dtype=torch.int64),
+                        torch.tensor(src, dtype=torch.int64),
+                        torch.tensor(nbytes, dtype=torch.int64),
+                        torch.cuda.current_stream(self.device).cuda_stream,
+                    )
+                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per
@@ -904,7 +923,8 @@ class OffloadMoeCache:
         buffer_id = layer_id % self._prefill_depth
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
-            torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
+            with self._prof.phase("stage_wait"):
+                torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 
     def release_prefill_layer(self, layer_id: int) -> None:
@@ -914,13 +934,25 @@ class OffloadMoeCache:
         if self._prefill_buffer_layer[buffer_id] != layer_id:
             return
         if self.prefill_release_events:
-            self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
+            with self._prof.phase("stage_release"):
+                self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
         if layer_id == self.num_layers - 1:
             # Chunk closed: the next chunk's begin_prefill (from the layer-entry hook or
             # the MoE entry) must re-fence the copy stream and re-snapshot the slot map.
             self._prefill_chunk_open = False
+            line = self._prof.end_chunk(
+                layers=self.num_layers,
+                extra=(
+                    f"rows={self.prefill_total_rows - self._prof_total_rows_start} "
+                    f"hits={self.prefill_hit_rows - self._prof_hit_rows_start} "
+                    f"path={'hit_d2d' if self._prefill_hit_d2d_active else 'full'} "
+                    f"depth={self._prefill_depth}"
+                ),
+            )
+            if line is not None:
+                logger.info_rank0(line)
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts

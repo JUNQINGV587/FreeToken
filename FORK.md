@@ -27,6 +27,13 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   page size); unset or 0 keeps the tier out of the manager entirely and the tree evicting as it
   always did. It does not free device memory -- it is host RAM buying prefix reuse, so the arm
   that matters is hit ratio/TTFT, and the arm that must not move is output bits.
+- `feat(moe)`: **opt-in prefill staging profile** — one log line per prefill chunk attributing
+  its host wall time to entry / PLE / attention (mix, core, combine) / MoE staging (classify,
+  hit compact, hit gather, batch memcpy, wait, release) / expert GEMM. `FREETOKEN_PREFILL_PROFILE=1`
+  turns it on; unset, every call site is a no-op method call and no timestamp is read. Built to
+  attribute the ~1.2 s host-CPU TTFT floor of a prefill batch on this box, which is flat in prompt
+  length (7 -> 4343 prompt tokens: rank-0 CPU 1200 -> 1210 ms) and charged per batch, not per
+  request. Method and numbers: `research/notes/freetoken/202609-freetoken-speed-report.md` §6.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
 ## Measurement protocol

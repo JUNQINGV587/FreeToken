@@ -22,6 +22,7 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.layers.moe import early_prefetch_prefill
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.moe import prefill_profile
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -75,19 +76,29 @@ class Qwen4ExpDecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+        prof = prefill_profile.get_profiler()
         # Expert-prefetch enqueue point (env-gated; no-op by default). Runs before
         # attention so the next layer's H2D window covers the whole layer.
-        early_prefetch_prefill(self.mlp, self._layer_id)
+        with prof.phase("entry"):
+            early_prefetch_prefill(self.mlp, self._layer_id)
         if self.ple is not None:
-            hidden = hidden + self.ple.forward(hidden, batch)
-        block_input, inject = self.attn_hyper_connection.mix(hidden)
-        if self._is_linear:
-            block_output = self.linear_attn.forward(block_input)
-        else:
-            block_output = self.self_attn.forward(block_input, batch)
-        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
-        block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+            with prof.phase("ple"):
+                hidden = hidden + self.ple.forward(hidden, batch)
+        with prof.phase("attn_mix"):
+            block_input, inject = self.attn_hyper_connection.mix(hidden)
+        with prof.phase("attn_core"):
+            if self._is_linear:
+                block_output = self.linear_attn.forward(block_input)
+            else:
+                block_output = self.self_attn.forward(block_input, batch)
+        with prof.phase("attn_combine"):
+            hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        with prof.phase("mlp_mix"):
+            block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        with prof.phase("moe_total"):
+            mlp_output = self.mlp.forward(block_input)
+        with prof.phase("mlp_combine"):
+            return self.mlp_hyper_connection.combine(hidden, mlp_output, inject)
 
 
 class Qwen4ExpModel(BaseOP):

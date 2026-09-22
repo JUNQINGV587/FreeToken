@@ -6,6 +6,7 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe import offload_cache as _offload_cache
+from freetoken.moe import prefill_profile
 from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -497,16 +498,17 @@ class OffloadMoELayer(MoELayer):
             return self._prefill_owner(hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
-            out = self._expert_gemm(
-                cache,
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                views=views,
-                n=self.num_experts,
-                alphas=cache.alphas_for_layer(self.layer_id),
-                is_prefill=True,
-            )
+            with prefill_profile.get_profiler().phase("moe_gemm"):
+                out = self._expert_gemm(
+                    cache,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    views=views,
+                    n=self.num_experts,
+                    alphas=cache.alphas_for_layer(self.layer_id),
+                    is_prefill=True,
+                )
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)

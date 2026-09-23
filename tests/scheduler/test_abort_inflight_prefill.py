@@ -72,6 +72,7 @@ def _setup():
         _host_tier_stats_snapshot=lambda: None,
         _match_stop_str=lambda _req: None,
         _pending_abort_acks=set(),
+        _prefill_start={},
         _last_data=None,
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)

@@ -55,6 +55,9 @@ class UserReply(BaseFrontendMsg):
     # Throttled host KV-tier snapshot (spills/restores/refusals + residency, see TierStats);
     # None until the first sample or when FREETOKEN_KV_HOST_TIER_PAGES is unset.
     host_tier_stats: dict | None = None
+    # Scheduler-measured prefill span (see DetokenizeMsg.prefill_ms). Arrives once, on the
+    # reply carrying the request's first generated token; 0.0 on every other reply.
+    prefill_ms: float = 0.0
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

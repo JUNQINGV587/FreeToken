@@ -62,6 +62,11 @@ class DetokenizeMsg(BaseTokenizerMsg):
     mm_stats: dict | None = None
     # Throttled host KV-tier snapshot; None when the deployment did not enable the tier.
     host_tier_stats: dict | None = None
+    # Scheduler-measured prefill span for this request: admission (the first prefill batch
+    # was prepared) to the token sampled off its last prefill chunk. Set on that first token
+    # only, 0.0 on every later one -- it is the one span a client cannot derive from HTTP
+    # timestamps, which is why it rides the wire instead of being re-estimated frontend-side.
+    prefill_ms: float = 0.0
 
 
 @dataclass

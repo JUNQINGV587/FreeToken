@@ -220,6 +220,8 @@ def _ack(text, finished=False):
         finish_reason="stop" if finished else None,
         matched_stop=None,
         logprobs=None,
+        # _Timer.observe reads this off every ack; the real message objects carry it.
+        prefill_ms=0.0,
     )
 
 

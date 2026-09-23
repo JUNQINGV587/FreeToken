@@ -216,7 +216,7 @@ def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, ta
         assert torch.all(pool.conv_states[:, match.mamba_value] == states[expected])
 
     # Finish/abort may occur before the prefill commit; use the real idempotent cleanup path.
-    stub = SimpleNamespace(cache_manager=cm, table_manager=tm)
+    stub = SimpleNamespace(cache_manager=cm, table_manager=tm, _prefill_start={})
     Scheduler._free_req_resources(stub, final)
     Scheduler._free_req_resources(stub, final)
     match = cm.match_req(_pend(prompt.tolist() + [999]))
@@ -806,7 +806,7 @@ def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, ta
         assert torch.all(pool.conv_states[:, match.mamba_value] == states[expected])
 
     # Finish/abort may occur before the prefill commit; use the real idempotent cleanup path.
-    stub = SimpleNamespace(cache_manager=cm, table_manager=tm)
+    stub = SimpleNamespace(cache_manager=cm, table_manager=tm, _prefill_start={})
     Scheduler._free_req_resources(stub, final)
     Scheduler._free_req_resources(stub, final)
     match = cm.match_req(_pend(prompt.tolist() + [999]))

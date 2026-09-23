@@ -241,6 +241,7 @@ def tokenize_worker(
                         moe_stats=msg.moe_stats,
                         mm_stats=msg.mm_stats,
                         host_tier_stats=msg.host_tier_stats,
+                        prefill_ms=msg.prefill_ms,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

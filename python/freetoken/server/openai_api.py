@@ -40,13 +40,16 @@ from .generation import (
     GenDone,
     GenerationError,
     GenSpec,
+    GenTimings,
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    build_metrics,
     count_prompt_tokens,
     generate_events,
     generate_full,
+    metrics_enabled,
     _uses_qwen_semantic_protocol,
     prerender_error,
     render_messages,
@@ -446,7 +449,7 @@ async def handle_chat_completion(
     if req.logprobs:
         choice["logprobs"] = {"content": [chat_content_entry(e) for e in result.logprobs]}
 
-    return {
+    response: dict[str, Any] = {
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -458,6 +461,14 @@ async def handle_chat_completion(
             _reported_cached(state, result.cached_tokens),
         ),
     }
+    if metrics_enabled(state):
+        response["metrics"] = build_metrics(
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            cached_tokens=result.cached_tokens,
+            timings=result.timings,
+        )
+    return response
 
 
 async def stream_chat_completion_chunks(
@@ -484,6 +495,7 @@ async def stream_chat_completion_chunks(
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    timings = GenTimings()
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
     events = generate_events(uid, spec, state, source="/v1/chat/completions")
@@ -590,21 +602,28 @@ async def stream_chat_completion_chunks(
             prompt_tokens = ev.prompt_tokens
             completion_tokens = ev.completion_tokens
             cached_tokens = ev.cached_tokens
+            timings = ev.timings
             yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]))
 
     if req.stream_options and req.stream_options.include_usage:
-        yield _sse(
-            {
-                "id": f"chatcmpl-{uid}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model,
-                "choices": [],
-                "usage": _usage(
-                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
-                ),
-            }
-        )
+        final: dict[str, Any] = {
+            "id": f"chatcmpl-{uid}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [],
+            "usage": _usage(
+                prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
+            ),
+        }
+        if metrics_enabled(state):
+            final["metrics"] = build_metrics(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                timings=timings,
+            )
+        yield _sse(final)
 
     yield b"data: [DONE]\n\n"
 

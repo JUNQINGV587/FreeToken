@@ -52,10 +52,14 @@ def _act_quant_kernel(
     amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-10)
     s = amax / 448.0  # [BLOCK_M] fp32 per-token-group scale (e4m3 finite max = 448)
     y = tl.clamp(x / s[:, None], -448.0, 448.0)
+    # Round onto the grid in fp32 before converting: converting an on-grid value is exact
+    # whatever the backend does, and Triton's own fp32 -> fp8 lowering is not exact RNE on
+    # this stack (measured: 0.34% of random values land one ulp low, biased toward zero,
+    # consistent with an intermediate-precision double rounding). Left to the conversion,
+    # the native path disagrees with the forced-EMU path on ~1 value in 300.
+    y = round_e4m3(y)
     if e4m3_native_cx():
         y = y.to(tl.float8e4nv)
-    else:
-        y = round_e4m3(y)  # e4m3-grid values into the wrapper's bf16 buffer
     tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yk, y, mask=m_mask[:, None])
     tl.store(s_ptr + offs_m * stride_sm + pid_k * stride_sk, s, mask=m_mask)
 

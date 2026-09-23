@@ -197,6 +197,7 @@ def marlin_fused_experts(
     vLLM's implementation is device-side only (no host syncs), so the decode call is
     CUDA-graph capturable.
     """
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
     from vllm.scalar_type import scalar_types
 
@@ -209,15 +210,19 @@ def marlin_fused_experts(
         None,  # bias2
         gate_up_s,
         down_s,
-        gating_output=None,
+        # No gating_output: the vendored vLLM takes the router result as topk_weights/topk_ids
+        # only, and passing the old kwarg made every Marlin NVFP4 call a TypeError.
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         quant_type_id=scalar_types.float4_e2m1f.id,
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=gate_up_q.size(0),
-        activation=activation,
-        global_scale1=gate_up_alpha,
-        global_scale2=down_alpha,
+        # the vendored vLLM takes the MoEActivation enum here; the old plain string made
+        # _fused_marlin_moe call .is_gated on it and die
+        activation=MoEActivation.SILU,
+        # the compiled op demands float32 scales; the banks may hold them in fp16
+        global_scale1=gate_up_alpha.float(),
+        global_scale2=down_alpha.float(),
     )
 
 

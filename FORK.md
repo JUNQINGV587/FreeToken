@@ -210,3 +210,37 @@ see "Measured and deliberately not changed"), #502/#292/#327 and the GGUF-in-FTW
 Flag naming: upstream renamed the backend switch to `--moe-backend`; this branch keeps
 `--moe-strategy` as the public name (`config.py` folds the old name in `__post_init__`) and
 production argv plus `ops/` scripts depend on it.
+
+**2026-09-23 round 2** (base `d95ca203`, 7 commits; community re-survey after the morning
+round - full detail in the research note's section 12):
+
+- `origin/main` unchanged (`cab110ec`); the 143 open PRs unchanged; a branch-tip diff of all
+  13 community forks found exactly one fork with new in-domain work: **vektory79**'s hybrid
+  cache "fix3" campaign (09-21/22, branch-only, no PR). gberasmus87's fork (first time in the
+  local ref set) was fully classified: the qwen4_exp o_proj row-parallel fix (#429) is already
+  in this tree, the block-FP8 dense reader exists here in a TP-aware superset, and the rest is
+  models this box does not serve.
+- `44046f5f` mamba eviction ordered by a per-node snapshot_lru stamp (vektory79 `9732be02`):
+  walks re-stamp every on-path node with one shared tic, so without a per-snapshot stamp all
+  on-path victims tie and eviction is arbitrary. Conflict with this fork's host tier resolved
+  by keeping both intents (their heap key + our host-resident filter).
+- `17635d8c` `--linear-state-cache-ratio` CLI flag (vektory79 `e5730e0e`): the engine config
+  field already existed; this exposes it and fails fast on ratio <= 0, plus `int` -> `ceil`
+  in the pool sizing.
+- `daa17df0`/`243e5f86` invariant comments + cross-conversation snapshot-eviction test.
+- `ba109809` **donate per-chunk boundary snapshots in chunked prefill** (vektory79 `70808240`):
+  intermediate ChunkedReq chunks never called cache_req, so every mid-history divergence
+  re-prefilled in full (the author's hardware measurement: 60184 -> 11480 tokens on turn 2).
+  This tree still carried the pre-fix drain skip, so the bug was live here. Their test suite
+  pins transfer semantics; `f231927d` adapts the slot-id assertions to this fork's
+  copy-on-donate (#287) - pool conservation and scenario coverage unchanged.
+- `02e4d2c9` **no-sync port of the donation** (this fork's rewrite, the reason it could merge):
+  the donated barrier (`torch.cuda.synchronize`) at continuation-creation time would have
+  drained the overlap pipeline once per prefill chunk. The schedule-time call site is already
+  stream-ordered in both loops (overlap asserts the scheduler runs on Scheduler.stream,
+  bracketed by the loop's wait pair; normal_loop's predecessor batch is drained), so
+  `cache_req(schedule_time=True)` skips the barrier; drain/finish commits keep it.
+- Deploy precondition for the next image: the donation path is the hybrid prefill hot path -
+  before it serves traffic, run a GPU saturation correctness probe (wrong-answer detector
+  under concurrent load) and a TTFT A/B against the previous image, per the GPU watchdog
+  rules (Xid delta check after).

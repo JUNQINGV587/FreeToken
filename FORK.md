@@ -118,6 +118,24 @@ output window; each rule below was learned by getting a wrong number first.
   `research/runs/202609-freetoken-port-batch1/sweep-summary.md`. The QSA *indexer* chain
   (`_qsa_mqa_paged_kernel` and the top-k kernels) was not measured and is a separate question.
 
+- **TP-sharded experts**: every rank holds half of every routed expert along the intermediate
+  axis and the MoE layer all-reduces the partial sums (upstream #385, community `tp4_5060ti`),
+  instead of this fork's owner-local EP where a rank owns whole, disjoint experts. Ported onto
+  this tree and A/B'd against production on 2026-09-23: same model, same image apart from the
+  five ported files, same flags except `--moe-ep-size`, both engines freshly started, warmed and
+  driven by the same probes. Cold 262K prefill 3368 (EP) vs 2840 tok/s, six concurrent 8K
+  prompts 3.68 vs 5.13 s median TTFT, cold 7-token floor 1.95 vs 1.99 s. Functionally equal
+  (smoke, penalties, logprobs, geometry, 0 Xid both sides).
+  The gap is structural, not tuning: EP partitions the expert set, so a rank's cache holds only
+  what it can compute (measured working set 58 experts/layer against 183 slots/layer, routing
+  table predicts a 1.0 hit at 8800 slots), while TP sharding replicates the requirement on every
+  rank (397/layer against the same 183 slots, hit 0.896, miss rate 14.1% against production's
+  2.1%). Halving the per-expert bytes doubles the slots at equal memory but doubles the resident
+  set with it, so equal bytes buy equal coverage and pay an extra collective per layer. The
+  mechanism itself is sound and verified (slices partition the checkpoint exactly; two
+  half-width banks sum to the full-width output on real kernels) and stays on
+  `exp/tp-shard-eval`. Numbers: `research/runs/202609-freetoken-upstream-sync/arm-tpshard/`.
+
 ## Precision contract
 
 Zero precision degradation vs upstream: kernel swaps are verified bit-identical or within
@@ -159,10 +177,32 @@ open decision list: `research/notes/freetoken/202609-freetoken-upstream-research
   from different sources, so both intents were merged (enforced value first, then clamped by
   `kv_pool_geometry()`); that combination is what makes upstream's two tests pass.
 
+**2026-09-23** (base `7f227d9a`, 3 commits, community survey round):
+
+- **#85** round onto the e4m3 grid before the native downcast, at the two call sites this
+  fork's own 2026-09-23 fix missed (`dsv4/fp8_linear.py`'s two quant kernels and
+  `fp8_pertensor_linear.py::_static_quant_kernel`), with its tests. The author left the diff
+  for anyone to pick up after maintainers declined AI-heavy contributions; the commit keeps
+  his authorship and both measurements (his 0.38% of 2**22 samples, this fork's 0.34% of 50k)
+  are in the merged comment. Not on the production hot path (that model is pure NVFP4).
+- **#466** tolerate coalesced msgpack frames in the zmq pull queues. One frame carrying two
+  packed objects raised `ExtraData` in `msgpack.unpackb` and killed the worker process; the
+  buffered unpacker decodes the first object and holds the rest. Same file as this fork's
+  #495 change, so the merge only touched the import line. Its async test is a bare `async def`
+  while this repo declares only `pytest` (no pytest-asyncio, no `asyncio_mode`), so it failed
+  collection here; rewritten to drive the coroutine with `asyncio.run`, same assertions.
+- Survey of all 969 branches and 251 `pr/*` refs, with per-candidate verdicts: 21 community
+  picks turned out to be already carried, `#198`'s KV reserve already exists here as a superset
+  (ours adds the `num_token_override` branch), and `#484` is byte-identical to this tree.
+  Full table: `research/notes/freetoken/202609-freetoken-upstream-research.md` section 11.
+
 Not merged, with reasons: #499 (its commits depend on `kv_host_offload.py`, a feature this
-tree does not carry), #525 (collides with this fork's own host tier), #491 (large refactor of
-the hybrid decode path this fork already owns), #385/#104/#507 (alternative TP
-implementations; this fork's TP=2 path is the one in production).
+tree does not carry), #525 (collides with this fork's own host tier, and the community's own
+stack ends up refusing the host KV tiers on an NVFP4 pool, which is this fork's combination),
+#491 (large refactor of the hybrid decode path this fork already owns), #385/#104/#507
+(alternative TP implementations, measured against owner-local EP on 2026-09-23 and declined:
+see "Measured and deliberately not changed"), #502/#292/#327 and the GGUF-in-FTW work on
+`vektory79` (model directions this box does not serve; revisit when one is actually served).
 
 Flag naming: upstream renamed the backend switch to `--moe-backend`; this branch keeps
 `--moe-strategy` as the public name (`config.py` folds the old name in `__post_init__`) and

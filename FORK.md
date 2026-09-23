@@ -121,20 +121,23 @@ output window; each rule below was learned by getting a wrong number first.
 - **TP-sharded experts**: every rank holds half of every routed expert along the intermediate
   axis and the MoE layer all-reduces the partial sums (upstream #385, community `tp4_5060ti`),
   instead of this fork's owner-local EP where a rank owns whole, disjoint experts. Ported onto
-  this tree and A/B'd against production on 2026-09-23: same model, same image apart from the
-  five ported files, same flags except `--moe-ep-size`, both engines freshly started, warmed and
-  driven by the same probes. Cold 262K prefill 3368 (EP) vs 2840 tok/s, six concurrent 8K
-  prompts 3.68 vs 5.13 s median TTFT, cold 7-token floor 1.95 vs 1.99 s. Functionally equal
-  (smoke, penalties, logprobs, geometry, 0 Xid both sides).
-  The gap is structural, not tuning: EP partitions the expert set, so a rank's cache holds only
-  what it can compute (measured working set 58 experts/layer against 183 slots/layer, routing
-  table predicts a 1.0 hit at 8800 slots), while TP sharding replicates the requirement on every
-  rank (397/layer against the same 183 slots, hit 0.896, miss rate 14.1% against production's
-  2.1%). Halving the per-expert bytes doubles the slots at equal memory but doubles the resident
-  set with it, so equal bytes buy equal coverage and pay an extra collective per layer. The
-  mechanism itself is sound and verified (slices partition the checkpoint exactly; two
-  half-width banks sum to the full-width output on real kernels) and stays on
-  `exp/tp-shard-eval`. Numbers: `research/runs/202609-freetoken-upstream-sync/arm-tpshard/`.
+  this tree (`exp/tp-shard-eval`) and A/B'd against production on 2026-09-23: same model, same
+  image apart from the five ported files, same flags except `--moe-ep-size`, both engines freshly
+  started, warmed and driven by the same probes. At **equal cache bytes** (17,600 half-width slots
+  for the sharded arm against production's 8,800 full-width ones) the two are indistinguishable:
+  cold 262K prefill 3173 vs 3149 tok/s, six concurrent 8K prompts 3.80 vs 3.91 s median TTFT, miss
+  rate 0.083 vs 0.084 and predicted routing hit 0.9971 vs 0.9989, while production itself scatters
+  3149-3368 tok/s across two identical runs. An earlier pass that gave both arms the same
+  `--moe-cache-size` rather than the same bytes put EP ahead by 16-28%; that is a slot-width
+  artifact, not a property of the layouts, and the working-set numbers quoted from it compared
+  different cache warm-up stages and are withdrawn. Functionally equal in both passes (smoke,
+  penalties, logprobs, geometry, 0 Xid). Declined: no measurable benefit at equal memory, against a
+  kernel-contract change (`tp_ok` plus the Triton layout/pack moving to `local_intermediate`), a
+  fork-only predicate, and marlin/b12x excluded under sharding. The mechanism is sound and verified
+  on its own (slices partition the checkpoint exactly; two half-width banks sum to the full-width
+  output on real kernels). Numbers:
+  `research/runs/202609-freetoken-upstream-sync/arm-tpshard-slots8800/` (slot-count pass) and
+  `arm-tpshard-eqbytes/` (equal-bytes pass).
 
 ## Precision contract
 

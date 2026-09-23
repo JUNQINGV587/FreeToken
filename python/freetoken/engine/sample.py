@@ -136,6 +136,10 @@ class Sampler:
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            if args.penalties:
+                logits = logits.float().clone()
+                for row, counts, presence, frequency in args.penalties:
+                    logits[row] -= frequency * counts + presence * (counts > 0)
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:

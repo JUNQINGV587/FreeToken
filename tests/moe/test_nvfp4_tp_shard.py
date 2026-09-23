@@ -28,11 +28,12 @@ _E2M1 = torch.tensor(
 )
 
 
-def _flat_sources(device, seed: int = 0) -> dict[str, torch.Tensor]:
+def _flat_sources(seed: int = 0) -> dict[str, list[torch.Tensor]]:
     """Bank-ready native sources for ONE layer, in the modelopt layout the loader produces.
 
-    ``gate_up_*`` rows are ``[gate (I) | up (I)]``; ``down_*`` carry I on the column axis,
-    packed two codes per byte and one scale per sixteen values.
+    Shapes carry the expert axis and the layer list is length 1, the way ``set_bank_sources``
+    takes them. ``gate_up_*`` rows are ``[gate (I) | up (I)]``; ``down_*`` carry I on the
+    column axis, packed two codes per byte and one scale per sixteen values.
     """
     g = torch.Generator().manual_seed(seed)
 
@@ -42,41 +43,45 @@ def _flat_sources(device, seed: int = 0) -> dict[str, torch.Tensor]:
     def rand_scale(*shape):
         return (torch.rand(*shape, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
 
-    gate_up_global = torch.full((2 * I,), 1.0, dtype=torch.float16)
-    gate_up_global[I:] = 0.5  # up global != gate global: exercises the alpha fold
-    return {
-        "gate_up_packed": rand_u8(2 * I, H // 2).to(device),
-        "gate_up_scale": rand_scale(2 * I, H // 16).to(device),
-        "gate_up_global": gate_up_global.to(device),
-        "down_packed": rand_u8(H, I // 2).to(device),
-        "down_scale": rand_scale(H, I // 16).to(device),
-        "down_global": torch.full((H,), 0.75, dtype=torch.float16).to(device),
+    gate_up_global = torch.full((E, 2 * I), 1.0, dtype=torch.float16)
+    gate_up_global[:, I:] = 0.5  # up global != gate global: exercises the alpha fold
+    flat = {
+        "gate_up_packed": rand_u8(E, 2 * I, H // 2),
+        "gate_up_scale": rand_scale(E, 2 * I, H // 16),
+        "gate_up_global": gate_up_global,
+        "down_packed": rand_u8(E, H, I // 2),
+        "down_scale": rand_scale(E, H, I // 16),
+        "down_global": torch.full((E, H), 0.75, dtype=torch.float16),
     }
+    return {name: [t.pin_memory()] for name, t in flat.items()}
 
 
-def _rank_slice(full: dict[str, torch.Tensor], rank: int) -> dict[str, torch.Tensor]:
+def _rank_slice(full: dict[str, list[torch.Tensor]], rank: int) -> dict[str, list[torch.Tensor]]:
     """Rank ``rank``'s slice of one layer's banks: the I rows of gate and of up (kept in that
-    order), the I columns of down (packed /16 for the block scales), globals untouched."""
+    order), the I columns of down (packed /2 codes, /16 block scales), globals untouched."""
     lo, hi = rank * HALF, (rank + 1) * HALF
     lo2, hi2 = lo // 2, hi // 2
     lo16, hi16 = lo // 16, hi // 16
-    return {
+    layer = {name: tensors[0] for name, tensors in full.items()}
+    out = {
         "gate_up_packed": torch.cat(
-            [full["gate_up_packed"][lo:hi], full["gate_up_packed"][I + lo : I + hi]], dim=0
+            [layer["gate_up_packed"][:, lo:hi], layer["gate_up_packed"][:, I + lo : I + hi]], dim=1
         ),
         "gate_up_scale": torch.cat(
-            [full["gate_up_scale"][lo:hi], full["gate_up_scale"][I + lo : I + hi]], dim=0
+            [layer["gate_up_scale"][:, lo:hi], layer["gate_up_scale"][:, I + lo : I + hi]], dim=1
         ),
         "gate_up_global": torch.cat(
-            [full["gate_up_global"][lo:hi], full["gate_up_global"][I + lo : I + hi]], dim=0
+            [layer["gate_up_global"][:, lo:hi], layer["gate_up_global"][:, I + lo : I + hi]], dim=1
         ),
-        "down_packed": full["down_packed"][:, lo2:hi2],
-        "down_scale": full["down_scale"][:, lo16:hi16],
-        "down_global": full["down_global"],
+        "down_packed": layer["down_packed"][:, :, lo2:hi2],
+        "down_scale": layer["down_scale"][:, :, lo16:hi16],
+        "down_global": layer["down_global"],
     }
+    # the cache requires contiguous per-layer sources; a column slice is a view
+    return {name: [tensor.contiguous()] for name, tensor in out.items()}
 
 
-def _run(sources: dict[str, torch.Tensor], hidden, topk_weights, topk_ids, device):
+def _run(sources: dict[str, list[torch.Tensor]], hidden, topk_weights, topk_ids, device):
     """One layer through the Triton inline-dequant grouped GEMM, straight from native banks."""
     from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -106,7 +111,7 @@ def _run(sources: dict[str, torch.Tensor], hidden, topk_weights, topk_ids, devic
 @cuda
 def test_rank_partial_sums_add_up_to_the_full_layer():
     device = torch.device("cuda")
-    full = _flat_sources(device, seed=3)
+    full = _flat_sources(seed=3)
     torch.manual_seed(4)
     M = 8
     hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4

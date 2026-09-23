@@ -123,3 +123,47 @@ output window; each rule below was learned by getting a wrong number first.
 Zero precision degradation vs upstream: kernel swaps are verified bit-identical or within
 1 bf16 ulp (fp32 accumulation-order noise only), with output A/B on the production model.
 Deterministic decode (no atomic-order-dependent kernels).
+
+## Upstream sync log
+
+Merges use `git merge origin/pr/<N>` so upstream SHAs are preserved and a later real merge
+into `origin/main` is recognised as already applied. Survey, full classification and the
+open decision list: `research/notes/freetoken/202609-freetoken-upstream-research.md`.
+
+**2026-09-23** (base `271e8be4`, 8 commits):
+
+- `origin/main` `cab110ec` - glm4 router correction bias in fp32 (#469). Routine sync.
+- **#505** preserve the pending hybrid checkpoint across prefill chunks: a short
+  continuation chunk cannot mint a new mamba snapshot, so `mamba_last_track_seqlen` has to
+  survive to the final prefill commit, otherwise the hybrid prefix cache can match a
+  recurrent state that does not belong to the cached prefix. This is the prefill and cache
+  path the 2026-09-22 crash RCA pointed at
+  (`research/runs/202609-freetoken-ttft-window/incident-20260922-xid31.md`).
+- **#464** match stop strings with incremental decoding (same decode path as the frontend,
+  terminal EOS excluded) instead of decoding a suffix every step.
+- **#495** wait for `size-1` rank subscribers before the first broadcast (PUB to XPUB).
+  Live risk here: production runs TP=2 and a lost first broadcast deadlocks both ranks.
+- **#527** reject non-finite sampling penalties at the API boundary. The substantive half of
+  that PR (applying presence and frequency penalties) already existed in this fork together
+  with the logprobs plumbing, so ours was kept.
+- **#500** single-launch MoE prefill buffer invalidation. The boolean-mask form hid a
+  device-to-host synchronization per call, twice per chunk across 48 layers, which
+  serialized the prefill-overlap pipeline on long cached contexts. Took upstream's kernel
+  revision (identical body plus a bounds guard and a wrapper-level CPU fallback) and kept
+  this fork's profiler phase and caller-side CPU fallback. **A first GPU run of that kernel
+  still owes a compute-sanitizer memcheck and the Xid-delta check before it serves traffic.**
+- `origin/fix/prefill-jit-warmup` - warm prefill triton kernels at startup and stop l2norm
+  recompiling per token count. Both take work off the first request of a backend, where the
+  1.03-1.04 s cache-warm TTFT floor lives.
+- **#531** clamp `/v1/models` context_length to the allocated KV pool. Both sides clamped
+  from different sources, so both intents were merged (enforced value first, then clamped by
+  `kv_pool_geometry()`); that combination is what makes upstream's two tests pass.
+
+Not merged, with reasons: #499 (its commits depend on `kv_host_offload.py`, a feature this
+tree does not carry), #525 (collides with this fork's own host tier), #491 (large refactor of
+the hybrid decode path this fork already owns), #385/#104/#507 (alternative TP
+implementations; this fork's TP=2 path is the one in production).
+
+Flag naming: upstream renamed the backend switch to `--moe-backend`; this branch keeps
+`--moe-strategy` as the public name (`config.py` folds the old name in `__post_init__`) and
+production argv plus `ops/` scripts depend on it.

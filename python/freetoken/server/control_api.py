@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable
 
 from fastapi import FastAPI, Response
+from fastapi.responses import JSONResponse
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -74,6 +75,23 @@ def register_control_routes(
         if not is_ready(doc):
             response.status_code = 503
         return doc
+
+    # The k8s-style probe split. /health and /ready stay exactly as they are (the desktop
+    # reads /health for load progress and ops gates on /ready), and readiness here goes
+    # through the same is_ready(doc) predicate instead of a second copy of the state checks.
+    @app.get("/healthz")
+    async def healthz():
+        # Liveness is deliberately independent of engine startup/rebuild/failure.
+        # Restarting an HTTP process just because weights are loading only repeats
+        # that loading forever. Readiness below carries the admission signal.
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz():
+        # Same lifecycle/phase/progress document as /health: the status code, not a
+        # replacement body, tells an orchestrator when to route.
+        doc = build_health(get_state(), app.version)
+        return JSONResponse(doc, status_code=200 if is_ready(doc) else 503)
 
     from . import request_ring
 

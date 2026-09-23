@@ -253,12 +253,16 @@ def test_prefill_continuation_donates_prior_boundary_before_inheriting():
     assert req2.mamba_last_track_seqlen is None
     assert req2.cached_len == 64
     assert req2.cache_handle.cached_len == 64      # rebound to the donated boundary node
-    assert req2.mamba_ping_pong[0] != pp0          # donated slot replaced before inheriting
+    # copy-on-donate (#287): the tree holds a PRIVATE CLONE; the request keeps its slot
+    # for the next track -- no replacement alloc, no shared ownership.
+    assert req2.mamba_ping_pong[0] == pp0
+    donated0 = next(iter(cm.prefix_cache.root.children.values())).mamba_value
+    assert donated0 is not None and donated0 != pp0
 
     # the boundary is reusable by any request sharing the prefix
     mr = cm.match_req(_pend(list(range(64)) + [99]))
     assert mr.cuda_handle.cached_len == 64
-    assert mr.mamba_value == pp0
+    assert mr.mamba_value == donated0
 
     # chain integration: the final chunk still commits its own boundary at the drain, and the
     # aligned finish donates the live slot at the next boundary -- no double donation
@@ -270,7 +274,7 @@ def test_prefill_continuation_donates_prior_boundary_before_inheriting():
     assert pool.num_free_slots == free_before + 2  # the pair freed; live donated at 128
     mr2 = cm.match_req(_pend(list(range(128)) + [99]))
     assert mr2.cuda_handle.cached_len == 128
-    assert mr2.mamba_value == live_id
+    assert mr2.mamba_value is not None and mr2.mamba_value != live_id   # tree's private clone
     cm.prefix_cache.check_integrity()
 
 
@@ -290,16 +294,17 @@ def test_chunked_req_donates_each_intermediate_boundary():
     chunk2, inherited = _forward_chunk(adder, pending, 192, 0)   # chunk [128,256): tracks 192
     # creating chunk 2 donated chunk 1's boundary 64 before inheriting its state
     a = next(iter(cm.prefix_cache.root.children.values()))
-    assert a.length == 64 and a.mamba_value == pp0          # page-aligned end 64, snapshot attached
+    # copy-on-donate: the node holds a private clone of the frozen slot, not the slot itself
+    assert a.length == 64 and a.mamba_value is not None and a.mamba_value != pp0
     assert inherited is None                                # chunk 1's mark was consumed by the donation
     assert chunk2.cache_handle.cached_len == 64             # rebound to the donated node
-    assert chunk2.mamba_ping_pong[0] != pp0                 # donated slot replaced before inheriting
+    assert chunk2.mamba_ping_pong[0] == pp0                 # the request keeps its slot (clone semantics)
     pp1 = chunk2.mamba_ping_pong[1]
 
     adder = PrefillAdder(token_budget=128, reserved_size=0, cache_manager=cm, table_manager=tm)
     chunk3, inherited3 = _forward_chunk(adder, pending, None, 0)   # final chunk [256,300): no x64 track
     b = next(iter(a.children.values()))
-    assert a.length + b.length == 192 and b.mamba_value == pp1   # boundary 192, page-aligned end
+    assert a.length + b.length == 192 and b.mamba_value is not None and b.mamba_value != pp1
     assert b.mamba_ref_count == 1 and a.mamba_ref_count == 0     # newest locked, prior evictable
     assert inherited3 is None                               # chunk 2's mark consumed too
     assert chunk3.cache_handle.cached_len == 192
@@ -406,8 +411,11 @@ def test_donation_fund_pressure_evicts_stalest_validated_boundary():
     cm.prefix_cache.check_integrity()
     # the aligned finish (1280) donates the live state at boundary 1280; full conservation
     cm.cache_req(chunk, finished=True)
-    assert pool.num_free_slots == 2
-    assert cm.prefix_cache.mamba_evictable_size == 6 and cm.prefix_cache.mamba_protected == 0
+    # copy-on-donate: funding the finish's private clone with a full pool evicts the
+    # stalest-validated boundary first (the amended Fix-3 ordering), then the request's
+    # three slots come back -- the tree ends with the live clone + the 4 surviving boundaries.
+    assert pool.num_free_slots == 3
+    assert cm.prefix_cache.mamba_evictable_size == 5 and cm.prefix_cache.mamba_protected == 0
     cm.check_integrity()
 
 
@@ -427,10 +435,12 @@ def test_finish_does_not_double_donate_final_boundary():
     pp1 = chunk2.mamba_ping_pong[1]
     cm.cache_req(chunk2, finished=False)                    # the drain commit donates 192
     chain = _snapshot_chain(cm)
-    assert [c.mamba_value for c in chain] == [pp0, pp1]
+    # copy-on-donate: the tree's snapshots are private clones, never the request's slot ids
+    donated = [c.mamba_value for c in chain]
+    assert all(d is not None for d in donated) and pp0 not in donated and pp1 not in donated
     assert chain[1].mamba_ref_count == 1                    # the drain commit locked the tip
     cm.cache_req(chunk2, finished=True)                     # L is None: no pending-frozen re-donate
-    assert [c.mamba_value for c in chain] == [pp0, pp1]     # unchanged: no double donation
+    assert [c.mamba_value for c in chain] == donated        # unchanged: no double donation
     assert pool.num_free_slots == 13                        # 15 - 2 tree-owned
     cm.check_integrity()
 
@@ -452,12 +462,13 @@ def test_finish_pending_frozen_dedup_keeps_existing_snapshot():
     chunk2, _ = _forward_chunk(adder, pending, 192, 0)
     pp1 = chunk2.mamba_ping_pong[1]
     cm.cache_req(chunk2, finished=False)                    # drain commit donates 192
+    donated = [c.mamba_value for c in _snapshot_chain(cm)]  # the tree's private clones
     # force the collision: a stale L naming the already-donated boundary 64
     chunk2.mamba_last_track_seqlen = 64
     cm.cache_req(chunk2, finished=True)
     chain = _snapshot_chain(cm)
-    assert [c.mamba_value for c in chain] == [pp0, pp1]     # the original snapshots survive
-    assert pool.num_free_slots == 13                        # the colliding slot returned with the pair
+    assert [c.mamba_value for c in chain] == donated        # the original snapshots survive
+    assert pool.num_free_slots == 13                        # the colliding clone returned unused
     cm.check_integrity()
 
 
@@ -485,16 +496,18 @@ def test_aligned_final_boundary_finish_live_donate():
     chain = _snapshot_chain(cm)
     assert [n.length for n in chain] == [64, 64]            # spans; cumulative ends 64, 128
     assert sum(n.length for n in chain) == 128              # the drain-donated boundary L=128
-    assert [n.mamba_value for n in chain] == [pp0, pp1]
+    # copy-on-donate: the chain holds private clones; the request's own ids never enter the tree
+    donated = [n.mamba_value for n in chain]
+    assert all(d is not None for d in donated) and pp0 not in donated and pp1 not in donated
 
     live_id = chunk2.linear_slot_idx
     free_before = pool.num_free_slots
     cm.cache_req(chunk2, finished=True)                     # the aligned live-donate fires at 192
     chain = _snapshot_chain(cm)
-    assert len(chain) == 3 and chain[2].mamba_value == live_id   # the live slot DONATED at 192
-    assert pool.num_free_slots == free_before + 2           # only the pair freed (keep_live=True)
-    # (the live slot ref is always cleared by _free_req_slots; tree ownership is the
-    # chain[2].mamba_value == live_id assert above plus the +2, not +3, pool count)
+    # the tree holds a CLONE of the live state at 192 (donated clone != the request's live slot)
+    assert len(chain) == 3 and chain[2].mamba_value is not None
+    assert chain[2].mamba_value != live_id and chain[2].mamba_value not in donated
+    assert pool.num_free_slots == free_before + 2           # 3 req slots freed, 1 clone alloc'd
     cm.check_integrity()
 
     # phase B: a re-prefill of the same prompt; its aligned finish live-donate dedups
@@ -507,7 +520,7 @@ def test_aligned_final_boundary_finish_live_donate():
     free_before_b = pool.num_free_slots
     cm.cache_req(req_b, finished=True)                      # the live-donate dedups at 192
     assert pool.num_free_slots == free_before_b + 3         # live + pair freed; nothing donated
-    assert [n.mamba_value for n in _snapshot_chain(cm)] == [pp0, pp1, live_id]   # untouched
+    assert [n.mamba_value for n in _snapshot_chain(cm)] == donated + [chain[2].mamba_value]   # untouched
     assert req_b.mamba_ping_pong is None and req_b.linear_slot_idx is None
     cm.check_integrity()
 

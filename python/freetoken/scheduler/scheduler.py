@@ -339,16 +339,9 @@ class Scheduler(SchedulerIOMixin):
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
-                    # The drain must not cache_req an intermediate chunk: under overlap the
-                    # continuation has already copied the pre-commit handle and ping-pong
-                    # tuple, so committing here double-frees the donated snapshot slot
-                    # (still listed in the continuation's stale tuple) and the tree-adopted
-                    # pages (the stale handle's cached_len). Hybrid commits each chunk's
-                    # tracked boundary at continuation creation instead
-                    # (PrefillAdder.try_add_one), before the state is inherited. A FINAL
-                    # chunk has no continuation, so that commit point does not cover it:
-                    # it still commits at its own drain below (and via the finish branches
-                    # when the request ends).
+                    # Don't cache intermediate chunks; the full prompt is cached once when the
+                    # final chunk is processed. Caching here snapshots a handle the next chunk
+                    # already copied (overlap), so cache_req double-frees the prior chunk.
                     if req.aborted:
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this

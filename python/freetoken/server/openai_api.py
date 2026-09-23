@@ -991,6 +991,20 @@ def _model_context_length(state: Any) -> int | None:
     except (TypeError, ValueError):
         enforced = 0
     value = enforced if enforced > 0 else ceiling
+    # Clamp by the pool's own geometry as well (upstream #531): the readiness meta can be
+    # in flight (or an older engine may send none), and the frontend holds an unclamped
+    # ServerArgs copy -- so the enforced value alone can still overstate what the
+    # scheduler admits. kv_pool_geometry resolves the last rebuild first, then the live
+    # stats snapshot, then the load-time ack.
+    try:
+        from .api_server import kv_pool_geometry
+
+        num_pages, page_size = kv_pool_geometry(state)
+        kv_tokens = num_pages * page_size
+    except Exception:  # noqa: BLE001
+        kv_tokens = 0
+    if kv_tokens > 0:
+        value = min(value, kv_tokens) if value > 0 else kv_tokens
     return value if value > 0 else None
 
 
@@ -1001,4 +1015,15 @@ def _checkpoint_context_length(state: Any) -> int | None:
         value = int(state.config.max_seq_len)
     except Exception:  # noqa: BLE001
         return None
-    return value if value > 0 else None
+    if value <= 0:
+        return None
+    try:
+        # Local import: api_server imports this module, so a module-level one would cycle.
+        from .api_server import kv_pool_geometry
+
+        num_pages, page_size = kv_pool_geometry(state)
+        kv_tokens = num_pages * page_size
+    except Exception:  # noqa: BLE001
+        kv_tokens = 0
+    # 0 before the ("meta", …) ack lands; the ceiling is the best available answer until then.
+    return min(value, kv_tokens) if kv_tokens > 0 else value

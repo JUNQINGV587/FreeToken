@@ -88,9 +88,17 @@ int64_t host_device_ptr(int64_t host_ptr) {
   void *dev_ptr = nullptr;
   const cudaError_t err =
       cudaHostGetDevicePointer(&dev_ptr, reinterpret_cast<void *>(host_ptr), 0);
-  TORCH_CHECK(err == cudaSuccess,
-              "cudaHostGetDevicePointer failed (host memory must be pinned+mapped): ",
-              cudaGetErrorString(err));
+  if (err != cudaSuccess) {
+    // Read the last-error slot out before throwing. A failed runtime call latches its error
+    // in this thread, and the next CUDA call reports it instead -- so one bad query (say,
+    // pageable memory handed to us by mistake) would surface later as an unrelated failure
+    // in innocent code. Measured on 2xL20: without this, a rejected pointer made every
+    // following CUDA op raise "invalid argument".
+    (void)cudaGetLastError();
+    TORCH_CHECK(false,
+                "cudaHostGetDevicePointer failed (host memory must be pinned+mapped): ",
+                cudaGetErrorString(err));
+  }
   return reinterpret_cast<int64_t>(dev_ptr);
 }
 

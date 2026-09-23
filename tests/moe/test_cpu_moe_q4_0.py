@@ -115,8 +115,17 @@ def test_cpu_decode_q4_0_matches_dequant_then_gpu(bs):
 def test_cpu_decode_q4_0_matches_ggml_mmvq():
     """Sanity: the CPU W4A16 GEMV lands close to the GPU ggml MMVQ (W4A8) kernel the
     offload path uses -- a looser tol since MMVQ quantizes activations to int8."""
+    from freetoken.kernel import gguf as gguf_kernels
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+
+    try:
+        gguf_kernels._module()
+    except RuntimeError as exc:
+        # The GGUF kernels are JIT-built with nvcc, whose host pass needs a compiler the
+        # installed torch headers accept. An image shipping only gcc 14/15 cannot build
+        # them; that is a toolchain gap, not a regression in the Q4_0 path, so name it.
+        pytest.skip(f"gguf kernels are not buildable in this image: {exc}")
 
     torch.manual_seed(77)
     L, E, H, I, top_k = 2, 16, 2816, 704, 8

@@ -30,11 +30,15 @@ def _host_compiler() -> str | None:
     decltype`` in ``List_inl.h`` once ``torch::Tensor`` is instantiated -- but nvcc
     with ``clang++`` as host compiles it cleanly. So prefer clang++, then fall back
     to an older gcc. Override with ``FREETOKEN_GGUF_HOST_CXX``.
+
+    The gcc-14/15 fallbacks are last on purpose: they are the versions measured to trip
+    that header error, so a hit here means the build will fail and the caller should say
+    so plainly (see ``_module``) rather than let ninja's output stand as the diagnosis.
     """
     override = os.environ.get("FREETOKEN_GGUF_HOST_CXX")
     if override:
         return override
-    for cxx in ("clang++", "g++-13", "g++-14", "g++-15"):
+    for cxx in ("clang++", "g++-12", "g++-13", "g++-14", "g++-15"):
         if shutil.which(cxx):
             return cxx
     return None
@@ -64,13 +68,26 @@ def _module():
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
-    return load(
-        name="freetoken_gguf_kernels",
-        sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC)],
-        extra_cuda_cflags=extra_cuda_cflags,
-        verbose=True,
-    )
+    try:
+        return load(
+            name="freetoken_gguf_kernels",
+            sources=[str(_CSRC / "gguf_kernel.cu")],
+            extra_include_paths=[str(_CSRC)],
+            extra_cuda_cflags=extra_cuda_cflags,
+            verbose=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A compile failure here is almost always the toolchain, not this source: nvcc's
+        # host pass inherits a gcc the torch headers reject (ATen/core/List_inl.h wants a
+        # `typename` gcc 14+ does not require). Say that, and how to fix it, instead of
+        # letting a raw ninja error read as a bug in the GGUF kernels.
+        raise RuntimeError(
+            "could not build the GGUF kernels"
+            f" (host compiler: {host_cxx or 'system default'}); nvcc's host pass needs a"
+            " compiler the installed torch headers accept. Install clang++ (preferred) or"
+            " gcc 12/13, or point FREETOKEN_GGUF_HOST_CXX at one."
+            f" Underlying failure: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 # ---- thin typed wrappers (signatures mirror sgl_kernel.quantization.gguf) ----

@@ -244,3 +244,19 @@ round - full detail in the research note's section 12):
   before it serves traffic, run a GPU saturation correctness probe (wrong-answer detector
   under concurrent load) and a TTFT A/B against the previous image, per the GPU watchdog
   rules (Xid delta check after).
+
+**2026-09-23 evening - fix3 donation REVERTED (production incident)**: delta21 (the image
+carrying `ba109809`/`f231927d`/`02e4d2c9`) passed every gate - image self-tests (2165 CPU+GPU
+green), divergence probe (the fix works: cached-token 0 -> 16,320, re-prefill -34%, TTFT
+-27%), floor/262K/concurrency A/B (zero regression over 4 samples) - and then **died under
+the saturation correctness probe**: 15 concurrent 12K-token divergent prefills plus 2
+background decode streams killed both TP scheduler ranks with CUDA illegal memory access
+(Xid 31 MMU Fault, VIRT_READ, same address pattern on both ranks = deterministic code path),
+surfaced at the drain-time donate barrier. Production rolled back to delta20 (verified green)
+within minutes. The donation trio is reverted from this branch (`41185f51`, `ce503db1`,
+`20b6cd32`); the work lives on `exp/vektory-fix3-eval` pending RCA (sanitizer repro on an
+experiment arm; the barrier-vs-logic discrimination experiment is designed). The four
+low-risk picks (snapshot_lru eviction order, --linear-state-cache-ratio, invariant comments,
+cross-conversation test) REMAIN merged - they are not implicated: the crash path (donation +
+hit-restore of donated boundaries) does not exist without the reverted commits.
+Detail: `research/notes/freetoken/202609-freetoken-upstream-research.md` section 12.4.

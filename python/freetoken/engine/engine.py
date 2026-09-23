@@ -1361,6 +1361,40 @@ class Engine:
             lens.add(8193)  # chunk_delta_h NT bucket 2 (NT > 128)
         return sorted(n for n in lens if 2 <= n <= cap)
 
+    def _warmup_prefill_lens(self) -> list[int]:
+        """Prefill lengths that cross every size bucket the in-repo Triton prefill kernels specialize on."""
+        cap = min(self.max_seq_len, self.config.max_forward_len)
+        if ENV.WARMUP_MAX_LEN.value > 0:
+            cap = min(cap, ENV.WARMUP_MAX_LEN.value)
+        mc = self.config.model_config
+        # 16/32/64 BLOCK_M ladders (nvfp4_linear, fused MoE) plus an odd twin each: triton re-specializes int args on % 16 == 0
+        lens = {9, 16, 17, 32, 33, 48, 65, 80}
+        if mc.is_moe:
+            top_k = max(1, mc.num_experts_per_tok)
+            # moe_align leaves its single-CTA path at numel = tokens * top_k > 1024
+            lens.add(1024 // top_k + 1)
+            import triton
+
+            from freetoken.kernel.backend import is_sgl_kernel_installed
+
+            if not is_sgl_kernel_installed():
+                # the single-CTA path keys on (next_pow2(numel), num_warps); walk each cell once
+                seen = set()
+                for tokens in range(2, 1024 // top_k + 1):
+                    numel = tokens * top_k
+                    cell = (triton.next_power_of_2(numel), triton.next_power_of_2(min(16, max(2, numel // 32))))
+                    if cell not in seen:
+                        seen.add(cell)
+                        lens.add(tokens)
+        if cap >= 4096:
+            # act_and_mul flips BLOCK_D at M >= 4096; also GDN chunk_delta_h NT bucket 1 (NT > 32)
+            lens.add(4096)
+        elif mc.has_linear_attention and cap >= 2049:
+            lens.add(2049)
+        if mc.has_linear_attention and cap >= 8193:
+            lens.add(8193)  # chunk_delta_h NT bucket 2 (NT > 128)
+        return sorted(n for n in lens if 2 <= n <= cap)
+
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
         """Compile the Triton prefill path before the first real request.

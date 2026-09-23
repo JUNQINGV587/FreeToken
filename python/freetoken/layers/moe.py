@@ -9,6 +9,7 @@ from freetoken.moe import offload_cache as _offload_cache
 from freetoken.moe import prefill_profile
 from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
+from freetoken.moe.ownership import expert_tp_size
 
 
 from .base import BaseOP
@@ -695,7 +696,8 @@ def make_moe_layer(
         kwargs["layer_id"] = layer_id
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
-    if getattr(config, "moe_ep_size", 1) > 1:
-        # owner-local EP: whole disjoint experts per rank -> the expert GEMM is not sharded
-        kwargs["expert_tp_size"] = 1
+    # 1 under owner-local EP (whole disjoint experts per rank, GEMM unsharded), else the TP
+    # size, so the kernel sizes its banks from a halved intermediate and the piece stream
+    # slices to match. Both sides ask the same function; see moe.ownership.expert_tp_size.
+    kwargs["expert_tp_size"] = expert_tp_size(config)
     return layer_cls(**kwargs)

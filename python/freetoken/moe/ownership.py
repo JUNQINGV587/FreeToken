@@ -62,6 +62,23 @@ class OwnedRoute:
         return int((~self.owned_mask).sum().item())
 
 
+def expert_tp_size(config) -> int:
+    """Ranks sharing one routed expert: 1 under owner-local EP, else the TP size.
+
+    The bank layout (``MoEConfig.local_intermediate``) and the piece stream written into it
+    (``models/nvfp4_banks``) have to use the same split, so both call this. Owner-local EP
+    hands each rank whole, disjoint experts and the expert GEMM stays unsharded; otherwise
+    TP slices every expert along the intermediate axis, so each rank holds a piece of all
+    of them and the MoE layer all-reduces the partial sums.
+    """
+    if getattr(config, "moe_ep_size", 1) > 1:
+        return 1
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    return tp.size if tp is not None else 1
+
+
 @dataclass(frozen=True)
 class ExpertOwnership:
     """Contiguous expert ownership for one rank in an EP group.
@@ -582,4 +599,5 @@ __all__ = [
     "OwnerCacheGeometry",
     "OwnerCacheUpdate",
     "OwnerCacheAdapter",
+    "expert_tp_size",
 ]

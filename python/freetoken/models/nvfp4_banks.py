@@ -8,7 +8,7 @@ from typing import Callable
 
 import safetensors
 import torch
-from freetoken.moe.ownership import ExpertOwnership
+from freetoken.moe.ownership import ExpertOwnership, expert_tp_size
 from freetoken.utils import download_hf_weight
 from tqdm import tqdm
 
@@ -58,6 +58,36 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
             f"is outside [0, {num_layers})"
         )
     return bank_layer
+
+
+def _tp_slice(config) -> tuple[int, int] | None:
+    """``(tp_size, tp_rank)`` when this rank stores a slice of every routed expert, else None.
+
+    Keyed on ``expert_tp_size`` rather than the raw TP size: the world can be TP2 while
+    owner-local EP owns whole experts, and slicing there would halve the pieces while the
+    bank layout keeps the full intermediate.
+    """
+    tp_size = expert_tp_size(config)
+    if tp_size == 1:
+        return None
+    from freetoken.distributed import try_get_tp_info
+
+    return tp_size, try_get_tp_info().rank
+
+
+def _tp_shard(role: str, tensor: torch.Tensor, inter: int, tp_size: int, tp_rank: int):
+    """This rank's I-slice of one checkpoint expert tensor. ``_global`` is a per-tensor scalar
+    and has no I axis; gate/up carry I on the row axis, down on the column axis (halved for the
+    packed FP4 codes, sixteenthed for the fp8 block scales)."""
+    if role.endswith("_global"):
+        return tensor
+    n = inter // tp_size
+    assert n % 16 == 0, f"NVFP4 TP shard {n} must cover whole 16-wide scale blocks"
+    lo = tp_rank * n
+    if role.startswith("down"):
+        d = 2 if role == "down" else 16
+        return tensor[:, lo // d : (lo + n) // d]
+    return tensor[lo : lo + n]
 
 
 def _kind_suffix(kind: str) -> str:
@@ -150,7 +180,19 @@ def iter_nvfp4_expert_pieces(
                 tensor = _ingest_global(spec, tensor)
             yield name, tensor
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    stream = _parallel() if parallel else _serial()
+    shard = _tp_slice(config)
+    if shard is not None:
+        tp_size, tp_rank = shard
+        inter = config.moe_intermediate_size
+        base = stream
+
+        def _sharded():
+            for name, tensor in base:
+                yield name, _tp_shard(wanted[name][2], tensor, inter, tp_size, tp_rank)
+
+        stream = _sharded()
+    return per_expert_pieces(stream, wanted.get, tensors_per_expert=9)
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

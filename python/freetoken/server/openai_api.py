@@ -52,6 +52,7 @@ from .generation import (
     metrics_enabled,
     _uses_qwen_semantic_protocol,
     prerender_error,
+    parse_response_format,
     render_messages,
     resolve_sampling,
     submit_generation,
@@ -149,6 +150,7 @@ def chat_request_to_genspec(
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=sampling_params,
+        structured_output_schema=parse_response_format(req.response_format),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
@@ -370,7 +372,7 @@ async def handle_chat_completion(
     logprobs_conflict = _chat_logprobs_conflict(req, state)
     if logprobs_conflict is not None:
         return create_error_response(logprobs_conflict, param="logprobs")
-    if _response_format_unsupported(req.response_format):
+    if _response_format_unsupported(req.response_format) and req.response_format.get("type") != "json_schema":
         return create_error_response(
             "response_format json_object/json_schema is not supported (no constrained decoding)",
             param="response_format",
@@ -404,6 +406,8 @@ async def handle_chat_completion(
             default_max_tokens=default_max_tokens,
             default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
         )
+    except GenerationError as exc:
+        return create_error_response(str(exc), param="response_format", code=exc.code)
     except ValueError as exc:
         return create_error_response(str(exc))
 

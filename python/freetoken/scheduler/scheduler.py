@@ -37,6 +37,7 @@ from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
+from .structured_output import ensure_structured_output_supported
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
@@ -652,6 +653,16 @@ class Scheduler(SchedulerIOMixin):
                         )
                     ]
                 )
+            try:
+                ensure_structured_output_supported(msg.sampling_params.structured_output_schema)
+            except NotImplementedError as exc:
+                # Direct tokenizer/IPC callers must also fail closed. Return a
+                # terminal client error, not an exception that kills the scheduler.
+                # This is before prompt admission/KV allocation: rejected schemas
+                # consume no engine work and cannot increment prompt accounting.
+                self.send_result([
+                    ErrorReplyMsg(uid=msg.uid, error=str(exc), code="unsupported_response_format")
+                ])
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             # max_seq_len is the model's advertised context, which can far exceed the

@@ -31,6 +31,9 @@ class SamplingParams:
     top_logprobs: int = 0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # Transport only until the scheduler has a grammar logits processor. Never
+    # interpret this as permission to sample unconstrained text for a schema request.
+    structured_output_schema: dict | None = None
 
     @property
     def is_greedy(self) -> bool:

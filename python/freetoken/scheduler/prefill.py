@@ -245,7 +245,10 @@ class PrefillAdder:
             # first, so the inheritance is post-commit; a no-op when the chunk crossed no
             # boundary (L is None) and idempotent across budget-bounced retries.
             if self.cache_manager.is_hybrid:
-                self.cache_manager.cache_req(chunked_req, finished=False)
+                # schedule_time: at this point the scheduling loop's streams already order
+                # the commit after the prior chunk's forward and before the continuation's,
+                # so the donation runs without a host-side device sync (see cache.py).
+                self.cache_manager.cache_req(chunked_req, finished=False, schedule_time=True)
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,

@@ -92,25 +92,33 @@ class TestCoalescedFrames:
             sub.stop()
 
 
-async def test_async_pull_coalesced():
-    import sys
+def test_async_pull_coalesced():
+    """The async queue goes through the same buffered unpacker.
 
-    from freetoken.utils.mp import ZmqAsyncPullQueue as _AsyncPull
-    from freetoken.utils.mp import ZmqAsyncPushQueue as _AsyncPush
+    Written as a sync test that drives the coroutine with ``asyncio.run``: a bare
+    ``async def`` test needs pytest-asyncio (plus ``asyncio_mode = auto``), and this
+    repo declares only ``pytest`` in its dev extras, so the plugin form would fail
+    collection here rather than exercise the queue.
+    """
+    import sys
 
     # zmq.asyncio needs a Selector loop on Windows; the project runs on Linux CI.
     if sys.platform == "win32":
         pytest.skip("zmq.asyncio requires SelectorEventLoop on Windows (prod runs on Linux)")
-    push = ZmqAsyncPushQueue(_addr(5604), create=True, encoder=lambda o: o)
-    pull = ZmqAsyncPullQueue(_addr(5604), create=False, decoder=_identity_decoder)
-    try:
-        await push.put({"n": 1})
-        await push.put({"n": 2})
-        await asyncio.sleep(0.1)
 
-        # Even if both messages arrive in a single frame, two gets must succeed.
-        assert await pull.get() == {"n": 1}
-        assert await pull.get() == {"n": 2}
-    finally:
-        push.stop()
-        pull.stop()
+    async def _exercise() -> None:
+        push = ZmqAsyncPushQueue(_addr(5604), create=True, encoder=lambda o: o)
+        pull = ZmqAsyncPullQueue(_addr(5604), create=False, decoder=_identity_decoder)
+        try:
+            await push.put({"n": 1})
+            await push.put({"n": 2})
+            await asyncio.sleep(0.1)
+
+            # Even if both messages arrive in a single frame, two gets must succeed.
+            assert await pull.get() == {"n": 1}
+            assert await pull.get() == {"n": 2}
+        finally:
+            push.stop()
+            pull.stop()
+
+    asyncio.run(_exercise())

@@ -525,6 +525,55 @@ def test_aligned_final_boundary_finish_live_donate():
     cm.check_integrity()
 
 
+def test_continuation_donation_is_marked_schedule_time(monkeypatch):
+    """The overlap-safe contract: PrefillAdder's per-chunk donation must declare
+    schedule_time=True so the hybrid commit skips the host-side donate barrier and
+    enqueues its clone on the scheduler's commit stream instead (the loop's stream
+    pair already orders it). A regression here reintroduces one full device sync per
+    prefill chunk."""
+    from freetoken.scheduler.prefill import PrefillAdder
+
+    cm, pool, pt, tm, pending = _chunked_setup(prompt_len=300)
+    calls = []
+    real = cm.cache_req
+    def spy(req, *, finished, schedule_time=False):
+        calls.append(schedule_time)
+        return real(req, finished=finished, schedule_time=schedule_time)
+    monkeypatch.setattr(cm, "cache_req", spy)
+
+    adder = PrefillAdder(token_budget=128, reserved_size=0, cache_manager=cm, table_manager=tm)
+    _forward_chunk(adder, pending, 64, 1)
+    adder = PrefillAdder(token_budget=128, reserved_size=0, cache_manager=cm, table_manager=tm)
+    _forward_chunk(adder, pending, 192, 0)
+    assert calls == [True]
+
+
+def test_schedule_time_commit_skips_the_donate_barrier(monkeypatch):
+    """schedule_time=True (the PrefillAdder continuation-creation call site) skips the
+    host-side torch.cuda.synchronize: the scheduling loop's own stream discipline already
+    orders the commit against the in-flight and upcoming forwards (see the barrier note
+    in cache.py). Drain/finish call sites keep the barrier."""
+    from freetoken.scheduler.prefill import PrefillAdder
+
+    cm, pool, pt, tm, pending = _chunked_setup(prompt_len=300)
+    adder = PrefillAdder(token_budget=100, reserved_size=0, cache_manager=cm, table_manager=tm)
+    chunk1, _ = _forward_chunk(adder, pending, 64, 1)     # chunk [0,64): boundary 64 marked
+
+    syncs = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: syncs.append(1))
+    monkeypatch.setattr(cm, "device", SimpleNamespace(type="cuda"))
+
+    cm.cache_req(chunk1, finished=False, schedule_time=True)   # the schedule-time donation
+    assert syncs == []                           # no host-side device drain
+    assert chunk1.mamba_last_track_seqlen is None              # the mark was consumed
+
+    # drain-style and finish call sites keep the barrier
+    chunk1.mamba_last_track_seqlen = 64
+    chunk1.mamba_next_track_idx = 1
+    cm.cache_req(chunk1, finished=False)                       # drain-style -> barrier
+    assert syncs == [1]
+
+
 def test_naive_cache_does_not_align_prefill_chunks():
     """The alignment hook is hybrid-only; every other cache keeps the raw budget chunk."""
     from freetoken.scheduler.prefill import ChunkedReq, PrefillAdder

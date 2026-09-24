@@ -146,9 +146,12 @@ def enable_custom_all_reduce(
     """Attach the vLLM custom-allreduce donor ahead of the current plugin, if usable.
 
     The donor self-disables when P2P is unavailable; any failure leaves the pynccl
-    plugin as the active one. FREETOKEN_CUSTOM_ALL_REDUCE=0 opts out.
+    plugin as the active one. The donor is OPT-IN: its 1-stage spin-read kernel has
+    produced Xid 31 MMU faults under PCIe P2P+H2D contention twice on this fleet
+    (2026-09-16 reproduced, 2026-09-23 suspected), so it only activates with
+    FREETOKEN_CUSTOM_ALL_REDUCE=1.
     """
-    if tp_info.size == 1 or os.getenv("FREETOKEN_CUSTOM_ALL_REDUCE", "1") == "0":
+    if tp_info.size == 1 or os.getenv("FREETOKEN_CUSTOM_ALL_REDUCE", "0") != "1":
         return False
     global _boot_tp_cpu_group
     _boot_tp_cpu_group = tp_cpu_group

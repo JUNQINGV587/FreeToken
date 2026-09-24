@@ -373,11 +373,11 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
-    def cache_req(self, req: Req, *, finished: bool, schedule_time: bool = False) -> None:
+    def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
-            return self._cache_req_hybrid(req, finished=finished, schedule_time=schedule_time)
+            return self._cache_req_hybrid(req, finished=finished)
         # ==================================== valid cache region ====================================
         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
         # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
@@ -433,7 +433,7 @@ class CacheManager:
         self.linear_state_pool.copy_from(src, dst)
         return dst
 
-    def _cache_req_hybrid(self, req: Req, *, finished: bool, schedule_time: bool = False) -> None:
+    def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
         Prefill chunk commit: donate a PRIVATE CLONE of the frozen ping-pong slot (the
         snapshot the forward wrote at the tracked ×64 boundary mamba_last_track_seqlen)
@@ -447,18 +447,7 @@ class CacheManager:
         # corrupted GDN state (reproduced with deterministic ground-truth probes: ~10% wrong
         # answers under saturation, cold prefill always clean). Fires once per prefill
         # commit / request finish -- request-level, sub-millisecond.
-        #
-        # Exception: a SCHEDULE-TIME chunk commit (per-chunk boundary donation from
-        # PrefillAdder.try_add_one) needs no host-side sync. Its device work runs on the
-        # caller's current stream, which is already ordered at that point in both loops:
-        # overlap runs the whole scheduler on Scheduler.stream (run_forever asserts it),
-        # bracketed by the loop's stream pair -- self.stream waits on the engine stream
-        # before scheduling (the prior chunk's forward has finished writing the frozen
-        # slot) and the engine stream waits on self.stream before the continuation's
-        # forward (the clone lands first); normal_loop schedules on the engine stream with
-        # the predecessor batch already drained. A per-chunk torch.cuda.synchronize would
-        # instead drain the overlap pipeline once per chunk, not once per request.
-        if self.device.type == "cuda" and not schedule_time:
+        if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         pool = self.linear_state_pool
         old_handle = req.cache_handle

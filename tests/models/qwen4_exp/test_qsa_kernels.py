@@ -634,3 +634,29 @@ def test_split_k_workspace_stays_bounded():
         partial_lse = num_splits * tokens * _PROD_NUM_Q_HEADS * 4
         worst = max(worst, partial_output + partial_lse)
     assert worst <= ceiling, f"split-K workspace grew to {worst >> 20} MiB"
+
+
+@requires_cuda
+def test_index_norm_rope_drops_out_of_range_dest_rows():
+    """_index_norm_rope used to bound dest rows only from below: a garbage index above
+    out.shape[0] was a wild write into (and past) the cmp slab, later read back as poisoned
+    page numbers. Out-of-range and -1 rows must be dropped, the rest written."""
+    from freetoken.kernel.triton.qsa.compress import qsa_index_norm_rope
+
+    torch.manual_seed(0)
+    rows, head_dim, rotary = 8, 128, 64
+    x = torch.randn(rows, head_dim, device="cuda", dtype=torch.float32)
+    positions = torch.arange(rows, device="cuda", dtype=torch.int32)
+    cos_sin = torch.randn(64, rotary, device="cuda", dtype=torch.float32)
+    weight = torch.randn(head_dim, device="cuda", dtype=torch.float32)
+    sentinel = 12345.0
+    out_rows = rows + 4
+    out = torch.full((out_rows, head_dim), sentinel, device="cuda", dtype=torch.float32)
+    dest = torch.arange(rows, device="cuda", dtype=torch.int32)
+    dest[3] = out_rows + 7    # out-of-range garbage
+    dest[5] = -1              # disabled row
+
+    qsa_index_norm_rope(x, positions, cos_sin, weight, 1e-6, out, heads=1, dest_rows=dest)
+
+    changed = (out != sentinel).any(dim=1).tolist()
+    assert changed == [True, True, True, False, True, False, True, True] + [False] * 4

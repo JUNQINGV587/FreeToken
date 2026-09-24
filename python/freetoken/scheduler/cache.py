@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -724,7 +726,8 @@ class CacheManager:
             yield
         finally:
             del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            if lazy_free_list:
+                self._append_free(torch.cat(lazy_free_list))
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
@@ -742,15 +745,40 @@ class CacheManager:
                     self.linear_state_pool.free(er.mamba_slots)
             else:
                 evicted = self.prefix_cache.evict(need)
-            self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+            self._append_free(evicted[:: self.page_size])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
         return allocated
 
+    def _append_free(self, pages: torch.Tensor) -> None:
+        """Return page-start offsets to free_slots, dropping entries that would
+        corrupt the pool.
+
+        free_slots feeds the next allocation verbatim and its values land in device
+        index tensors without further checks, so a stale, out-of-pool, or duplicated
+        page here surfaces much later as an MMU fault inside an attention kernel --
+        mask it out and log instead of letting it through (the lazy_free_region clone
+        exists because this exact double-return bug class has happened before).
+        """
+        if len(pages) == 0:
+            return
+        n_in = len(pages)
+        bound = self.num_pages * self.page_size
+        keep = (pages >= 0) & (pages < bound) & (pages % self.page_size == 0)
+        keep &= ~torch.isin(pages, self.free_slots)
+        pages = torch.unique(pages[keep])
+        if len(pages) != n_in:
+            logger.warning(
+                f"free_slots injection filtered {n_in - len(pages)}/{n_in} "
+                "stale/out-of-pool/duplicate pages"
+            )
+        if len(pages) > 0:
+            self.free_slots = torch.cat([self.free_slots, pages])
+
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
-            self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+            self._append_free(indices[:: self.page_size])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

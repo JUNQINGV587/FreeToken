@@ -1322,3 +1322,37 @@ def test_chunked_prefill_retains_resumable_snapshot(monkeypatch, full_chunks, ta
     cm.check_integrity()
     assert pool.num_free_slots == pool.num_slots - 1
     assert len(cm.free_slots) == cm.num_pages
+
+
+def test_free_slots_injection_is_rejected_loudly():
+    """free_slots values land in device index tensors unchecked, so a stale/duplicated/garbage
+    page must be filtered at the injection point instead of an MMU fault much later."""
+    pool = _pool()
+    page_table = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+
+    # a legitimately allocated-and-returned page still goes back exactly once
+    allocated, cm.free_slots = cm.free_slots[:4].clone(), cm.free_slots[4:]
+    cm._free(allocated)
+    assert len(cm.free_slots) == 64
+    assert int((cm.free_slots == 0).sum()) == 1
+
+    # out-of-pool garbage must not enter free_slots
+    cm._free(torch.tensor([999, -3], dtype=torch.int32))
+    assert len(cm.free_slots) == 64
+
+    # a page that is already free being returned again is a double free: dropped
+    cm._free(torch.tensor([5], dtype=torch.int32))
+    assert int((cm.free_slots == 5).sum()) == 1
+
+    # duplicates within a single free batch collapse to one entry
+    cm.free_slots = cm.free_slots[cm.free_slots != 7]
+    cm._free(torch.tensor([7, 7], dtype=torch.int32))
+    assert int((cm.free_slots == 7).sum()) == 1
+    assert len(cm.free_slots) == 64, "every filtered batch leaves the pool whole"
+
+    # page-aligned pool rejects unaligned offsets
+    cm2 = CacheManager(8, 2, torch.zeros(4, 64, dtype=torch.int32), "hybrid_radix",
+                       linear_state_pool=_pool())
+    cm2._free(torch.tensor([3], dtype=torch.int32))
+    assert int((cm2.free_slots == 3).sum()) == 0

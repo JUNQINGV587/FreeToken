@@ -233,6 +233,41 @@ def test_fused_hash_is_off_on_cpu():
     )
 
 
+def test_ple_table_files_ftw_falls_back_to_conversion_source(tmp_path):
+    """An FTW checkpoint has no safetensors index; the PLE table streams from the
+    conversion source recorded in the FTW index."""
+    from freetoken.models.qwen4_exp.weight import _ple_table_files
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "x.ple.ple_embedding.ngram_embedding.part0": "model-00001-of-00002.safetensors",
+            "x.ple.ple_embedding.ngram_embedding.part1": "model-00002-of-00002.safetensors",
+            "model.layers.0.mlp.weight": "model-00001-of-00002.safetensors",
+        }}))
+    ftw = tmp_path / "ftw"
+    ftw.mkdir()
+    (ftw / "freetoken_weight.json").write_text(
+        json.dumps({"source_model_path": str(src), "tensors": []}))
+    assert _ple_table_files(str(ftw)) == [
+        str(src / "model-00001-of-00002.safetensors"),
+        str(src / "model-00002-of-00002.safetensors"),
+    ]
+
+
+def test_ple_table_files_ftw_missing_source_raises(tmp_path):
+    """No table in the FTW dir and no reachable source: fail with the actionable error."""
+    from freetoken.models.qwen4_exp.weight import _ple_table_files
+
+    ftw = tmp_path / "ftw"
+    ftw.mkdir()
+    (ftw / "freetoken_weight.json").write_text(
+        json.dumps({"source_model_path": str(tmp_path / "gone"), "tensors": []}))
+    with pytest.raises(ValueError, match="no PLE n-gram table"):
+        _ple_table_files(str(ftw))
+
+
 @requires_cuda
 @pytest.mark.parametrize("decode", [False, True])
 def test_fused_hash_matches_the_torch_reference(decode):

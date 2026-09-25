@@ -45,6 +45,18 @@ class StatsTracker:
         # residency); None until the first sample or when the tier is not enabled -- None is NOT
         # "enabled but idle", which is why the field is absent rather than zeroed.
         self.host_tier_stats: dict | None = None
+        # Cumulative timing, summed per request like llama.cpp's prompt/predicted seconds, so a
+        # poller can diff consecutive polls into speeds; the sliding-window rates above decay
+        # to zero between polls. Prefill runs from admission to a request's first output reply;
+        # decode is the time between its later output replies, and decode_tokens_total counts
+        # only the tokens those replies carried. cached_prompt_tokens_total mirrors
+        # cached_tokens_total above under upstream #553's name so future stats.py merges align.
+        self.cached_prompt_tokens_total = 0
+        self.prefill_seconds_total = 0.0
+        self.decode_seconds_total = 0.0
+        self.decode_tokens_total = 0
+        self._admitted_at: dict[int, float] = {}
+        self._last_output_at: dict[int, float] = {}
         self.kv_used_pages = 0
         self.kv_total_pages = 0
         self.mamba_used_slots = 0
@@ -62,9 +74,10 @@ class StatsTracker:
         """Stable snapshot used by prepare-stop to abort every still-admitted request."""
         return tuple(sorted(self._inflight))
 
-    def on_new_user(self, uid: int) -> None:
+    def on_new_user(self, uid: int, now: float | None = None) -> None:
         self._inflight.add(uid)
         self._aborting.discard(uid)
+        self._admitted_at[uid] = time.monotonic() if now is None else now
 
     def on_abort(self, uid: int) -> None:
         if uid in self._inflight:
@@ -72,14 +85,17 @@ class StatsTracker:
 
     def observe(self, reply: Any, now: float | None = None) -> None:
         t = time.monotonic() if now is None else now
+        uid = getattr(reply, "uid", None)
         if getattr(reply, "completion_tokens_delta", 0) > 0:
             self._decode.append((t, reply.completion_tokens_delta))
             self.completion_tokens_total += reply.completion_tokens_delta
+            self._observe_output_timing(uid, reply.completion_tokens_delta, t)
         if getattr(reply, "prompt_tokens_delta", 0) > 0:
             self._prefill.append((t, reply.prompt_tokens_delta))
             self.prompt_tokens_total += reply.prompt_tokens_delta
         if getattr(reply, "cached_tokens", 0) > 0:
             self.cached_tokens_total += reply.cached_tokens
+            self.cached_prompt_tokens_total += reply.cached_tokens
         if getattr(reply, "moe_stats", None) is not None:
             self.moe_stats = reply.moe_stats
         if getattr(reply, "mm_stats", None) is not None:
@@ -98,13 +114,27 @@ class StatsTracker:
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
         if getattr(reply, "finished", False):
-            uid = getattr(reply, "uid", None)
+            self._admitted_at.pop(uid, None)
+            self._last_output_at.pop(uid, None)
             if uid in self._inflight:
                 self._inflight.discard(uid)
                 if uid in self._aborting:
                     self._aborting.discard(uid)
                 else:
                     self.completed += 1
+
+    def _observe_output_timing(self, uid: Any, tokens: int, t: float) -> None:
+        last = self._last_output_at.get(uid)
+        if last is None:
+            # The first output reply ends prefill. Tokens riding on it (overlap can deliver
+            # several) were measured by no decode interval, so they are not decode work.
+            admitted = self._admitted_at.pop(uid, None)
+            if admitted is not None:
+                self.prefill_seconds_total += max(0.0, t - admitted)
+        else:
+            self.decode_seconds_total += max(0.0, t - last)
+            self.decode_tokens_total += tokens
+        self._last_output_at[uid] = t
 
     def _rate(self, window: "deque[tuple[float, int]]", now: float | None) -> float:
         t = time.monotonic() if now is None else now
@@ -260,6 +290,10 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "ttft_mean_ms": ttft_mean_ms,
             "prompt_tokens_total": tr.prompt_tokens_total,
             "completion_tokens_total": tr.completion_tokens_total,
+            "cached_prompt_tokens_total": tr.cached_prompt_tokens_total,
+            "decode_tokens_total": tr.decode_tokens_total,
+            "prefill_seconds_total": round(tr.prefill_seconds_total, 6),
+            "decode_seconds_total": round(tr.decode_seconds_total, 6),
         },
         "prefix_cache": {
             "cached_tokens_total": tr.cached_tokens_total,

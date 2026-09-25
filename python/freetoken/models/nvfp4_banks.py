@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import itertools
 import os
 import re
 from dataclasses import dataclass
@@ -75,6 +76,7 @@ def iter_nvfp4_expert_pieces(
     drop_page_cache: DropPageCache | None = None,
     primary: bool = True,
     ownership: ExpertOwnership | None = None,
+    skip_experts_from: int | None = None,
 ):
     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
@@ -86,6 +88,13 @@ def iter_nvfp4_expert_pieces(
     ``ownership`` (owner-local TP+EP): keep only this rank's experts and renumber them into the
     rank-local bank rows ``[0, local_num_experts)``, so the pieces land in the owner-local banks
     the cache actually allocates. Without it every expert is loaded at its global row.
+
+    ``skip_experts_from`` (the disk tier): experts ``[skip_experts_from, E)`` are disk-resident.
+    The serial reader never calls ``get_tensor`` for them (no I/O); the parallel reader filters
+    them at the reader (the whole-shard read is unchanged, but no per-expert work happens). Each
+    skipped expert still yields an EMPTY piece so the bank fill completes the layer without
+    touching the (released) tail rows. Under ``ownership`` the skip range is global, and the
+    empty pieces are renumbered into rank-local rows like the read ones.
     """
     from freetoken.models.loader import drop_page_cache as _drop
     from freetoken.models.loader import safetensors_weight_map
@@ -109,6 +118,8 @@ def iter_nvfp4_expert_pieces(
         match = spec.key_pattern.match(name)
         if match is None:
             continue
+        if skip_experts_from is not None and int(match.group("expert")) >= skip_experts_from:
+            continue  # disk-resident: never read
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None:
             continue
@@ -122,7 +133,11 @@ def iter_nvfp4_expert_pieces(
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
         wanted[name] = (bank_layer, expert - global_start, spec.proj_to_role[proj] + _kind_suffix(kind))
-    expected = _num_moe_layers(config) * local_E * 9
+    # Resident rows: owned experts below the disk-tier cutoff, counted in rank-local space.
+    resident_local = local_E
+    if skip_experts_from is not None:
+        resident_local = min(local_E, max(0, skip_experts_from - global_start))
+    expected = _num_moe_layers(config) * resident_local * 9
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 
@@ -150,7 +165,21 @@ def iter_nvfp4_expert_pieces(
                 tensor = _ingest_global(spec, tensor)
             yield name, tensor
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    pieces = per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    if skip_experts_from is not None:
+        pieces = itertools.chain(pieces, _disk_skip_pieces(config, skip_experts_from, global_start, global_start + local_E))
+    return pieces
+
+
+def _disk_skip_pieces(config, skip_from: int, global_start: int = 0, global_end: int | None = None):
+    """Empty pieces for the disk-resident experts ``[skip_from, E)``: the rows are
+    complete without a checkpoint read (``build_expert_banks`` marks them written,
+    pins only the prefix, and releases the tail). ``[global_start, global_end)``
+    bounds the range to the owned experts and the rows are renumbered rank-local."""
+    end = config.num_experts if global_end is None else global_end
+    for bank_layer in range(_num_moe_layers(config)):
+        for e in range(max(skip_from, global_start), end):
+            yield bank_layer, e - global_start, e - global_start + 1, {}
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

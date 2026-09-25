@@ -11,6 +11,7 @@ from __future__ import annotations
 import glob
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -26,6 +27,22 @@ logger = init_logger(__name__)
 
 # the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
 _PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+
+
+@contextmanager
+def _single_threaded_torch_copies():
+    """Avoid intra-op fanout for the loader's many small host tensor copies.
+
+    Bank filling is tens of thousands of small, disjoint host copies; letting PyTorch
+    fan each assignment across a large intra-op pool is dramatically slower on high-core
+    hosts (and competes with the O_DIRECT reader workers). Placement stays single-threaded
+    and the process setting is restored before the runtime is constructed."""
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 @dataclass(frozen=True)
@@ -161,12 +178,14 @@ def build_expert_banks(
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
 
     if layer_sink is not None:
-        _fill(layer_sink)
+        with _single_threaded_torch_copies():
+            _fill(layer_sink)
     elif torch.cuda.is_available():
-        with PinPipeline(prefix_rows=ram_prefix) as pins:
+        with _single_threaded_torch_copies(), PinPipeline(prefix_rows=ram_prefix) as pins:
             _fill(pins)
     else:
-        _fill(None)
+        with _single_threaded_torch_copies():
+            _fill(None)
 
     if ram_prefix is not None:
         # Drop the released tail pages now that the load has settled (the prefix

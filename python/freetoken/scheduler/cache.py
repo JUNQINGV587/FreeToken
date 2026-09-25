@@ -565,7 +565,10 @@ class CacheManager:
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
-        insert_len = align_down(req.cached_len, self.page_size)
+        insert_len = min(align_down(req.cached_len, self.page_size),
+                         req.input_ids.numel())  # clamp like the hybrid branch: decode tokens
+        # land on the host at drain, so numel can lag cached_len at EOS/abort; an unclamped
+        # insert_len would pair more page slots than tokens and swallow the surplus slots.
         freed = page_indices[:0]
         if insert_len > 0:
             # insert reconciles tombstones (revives the in-window ones by ADOPTING the request's

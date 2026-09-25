@@ -247,3 +247,30 @@ def test_ratio_and_override_never_dip_below_the_floor():
     # A pinned window (the rebuild path only validates num_swa_pages > 0) is clamped up.
     pinned = _cfg(128, max_running_req=4, override=1)
     assert _swa_paged_num_tokens(pinned, num_full_pages=1024) == _swa_pool_floor(pinned) + 1
+
+
+def test_swa_finish_frees_the_in_flight_decode_page():
+    """Same overlap leak class as the naive/hybrid finish paths: the padded tail used to
+    stop at page_ceil(cached_len), so the scheduled-not-executed step's pages (and their
+    charged swa slots) at allocated_len past that bound leaked. Tail must reach
+    allocated_len; both pools must come back."""
+    cm, tm, _pm = _managers(window=64, num_swa_tokens=512)
+    prompt = torch.arange(1, 13, dtype=torch.int32)
+    mr = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt)))
+    req = Req(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=4,
+              uid=UID, sampling_params=SamplingParams(max_tokens=4),
+              cache_handle=mr.cuda_handle)
+    cm.lock(mr.cuda_handle)
+    cm.allocate_paged([req])
+    req.complete_one()
+
+    # Two overlap launches with drains, then the schedule of a third step: its slot
+    # (position 14) is allocated while its forward is still in flight.
+    for _ in range(2):
+        cm.allocate_paged([req])
+        req.complete_one()
+    cm.allocate_paged([req])
+    assert req.cached_len == 14 and req.allocated_len == 15
+
+    cm.cache_req(req, finished=True)
+    cm.check_integrity()

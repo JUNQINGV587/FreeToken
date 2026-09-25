@@ -211,6 +211,32 @@ if __name__ == "__main__":
             print(f"{name}: PASS")
 
 
+def test_finish_frees_the_in_flight_decode_page():
+    """Overlap: a finish (EOS here, predicate-independent) fires while the next decode
+    step is in flight; that step's page was allocated past cached_len at schedule time.
+    The finish path must return it -- page_indices bounded by cached_len leaks it."""
+    pool, cm, tm, dm, _pm, sent, stub = _setup()
+    stub.eos_token_ids = {42}
+    req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32),
+                      track_seqlen=8)
+    dm.filter_reqs([req])
+
+    # Two overlap launches without drains, then the schedule of a third step: its page
+    # (position 14) is allocated while its forward is still in flight -> cached_len 14,
+    # allocated_len 15.
+    for _ in range(2):
+        cm.allocate_paged([req])
+        req.complete_one()
+    cm.allocate_paged([req])
+    assert req.cached_len == 14 and req.allocated_len == 15
+
+    Scheduler._process_last_data(
+        stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+    assert req in stub.finished_reqs              # EOS on the first delivered token
+    assert req.input_ids.numel() == 13
+    cm.check_integrity()
+
+
 def test_post_terminal_overlap_step_is_dropped():
     """Overlap scheduling launches one more decode step for a request that already
     terminated (filter_reqs keeps it while output budget remains). The extra drain

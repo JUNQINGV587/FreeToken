@@ -361,6 +361,7 @@ class CacheManager:
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
+            req.allocated_len = max(req.allocated_len, last_page * self.page_size)
         if needed_pages > 0:
             allocated = self._page_to_token(self._allocate(needed_pages))
             if self.swa_paged:
@@ -451,7 +452,13 @@ class CacheManager:
             torch.cuda.synchronize(self.device)
         pool = self.linear_state_pool
         old_handle = req.cache_handle
-        page_indices = self.page_table[req.table_idx, : req.cached_len]
+        # Read through the ALLOCATED extent, not just cached_len: under overlap a finish fires
+        # while the next step's forward is in flight, and that step's page (allocated at
+        # schedule time, past cached_len) belongs to this request. Donate/insert slices below
+        # stay bounded by L/insert_len <= cached_len, so a longer page_indices only affects the
+        # free ranges.
+        page_indices = self.page_table[
+            req.table_idx, : max(req.allocated_len, req.cached_len)]
 
         if finished:
             # A pending freeze (the tool-call anchor, or a prefill ×64 track the request
@@ -486,7 +493,13 @@ class CacheManager:
             # page_size==1). For page_size>1 a non-aligned cached_len would attach an over-advanced
             # state to a shorter prefix node -> skip the finish-donate (the ×64 prefill snapshots
             # remain as reuse points).
-            insert_len = align_down(req.cached_len, self.page_size)
+            # The donation key is host-side input_ids, which lags cached_len while later decode
+            # steps are still in flight (EOS/abort drains). Slices clamp the key to the delivered
+            # length, so donating then would attach a state encoding cached_len tokens to a
+            # shorter node -> over-advanced restore on a future hit. Same skip as the misaligned
+            # case: free everything instead.
+            insert_len = min(
+                align_down(req.cached_len, self.page_size), req.input_ids.numel())
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
                 clone = self._clone_slot_for_tree(req.linear_slot_idx)
@@ -496,6 +509,10 @@ class CacheManager:
                     pool.free(clone)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                # The donated range ends at insert_len; an in-flight overlap step's page beyond
+                # it is this request's own. insert_len is page-aligned, so the [::page_size]
+                # pick in _free still lands on page bases.
+                self._free(page_indices[insert_len:])
                 keep_live = False                     # tree holds a private clone
             else:
                 self.unlock(old_handle)

@@ -75,6 +75,11 @@ class Req:
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
     stop_decode_status: DecodeStatus | None = None
+    # Page-table extent this request was allocated up to (page-aligned; set by allocate_paged
+    # in the scheduler thread, so the finish/abort free path reads it race-free). Under overlap
+    # a finish can fire while the next step's forward is still in flight; that step's page was
+    # already allocated past cached_len and must be returned with the request or it leaks.
+    allocated_len: int = 0
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:

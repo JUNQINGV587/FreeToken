@@ -142,7 +142,8 @@ class GatedResidual(BaseOP):
 
     def mix(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine)."""
-        return self._mix_kernel(R) if R.is_cuda else self._mix_torch(R)
+        # The vendored kernels are 2D-only; anything else takes the torch fallback.
+        return self._mix_kernel(R) if R.is_cuda and R.dim() == 2 else self._mix_torch(R)
 
     def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""

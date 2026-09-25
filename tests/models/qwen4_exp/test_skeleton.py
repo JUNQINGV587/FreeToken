@@ -625,3 +625,17 @@ def test_gemv_concat_qsa_forward_bitwise_vs_unfused(monkeypatch):
         _fresh_ctx(attn_backend=backend2)
         want = base.forward(x.clone(), batch)
         assert torch.equal(got, want), f"M={m}"
+
+
+def test_hc_mix_falls_back_to_torch_for_non_2d_cuda():
+    # The vendored mix kernels are 2D-only; a non-2D CUDA input must take the torch path,
+    # matching the guard grouped_plus_one_rms_norm already applies.
+    calls: list[str] = []
+    stub = SimpleNamespace(
+        _mix_kernel=lambda r: calls.append("kernel"),
+        _mix_torch=lambda r: calls.append("torch"),
+    )
+    GatedResidual.mix(stub, SimpleNamespace(is_cuda=True, dim=lambda: 3))
+    GatedResidual.mix(stub, SimpleNamespace(is_cuda=True, dim=lambda: 2))
+    GatedResidual.mix(stub, SimpleNamespace(is_cuda=False, dim=lambda: 2))
+    assert calls == ["torch", "kernel", "torch"]

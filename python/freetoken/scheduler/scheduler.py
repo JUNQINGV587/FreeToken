@@ -964,8 +964,11 @@ class Scheduler(SchedulerIOMixin):
             ]
             if pools["num_swa_pages"]:
                 swa_tokens = pools["num_swa_pages"] * pools["swa_page_size"]
+                # radix-SWA is token-granular (swa_page_size 1): calling those "pages"
+                # mislabels the unit; only DSV4 windows are real pages.
+                unit_name = "pages" if pools["swa_page_size"] > 1 else "tokens"
                 parts.append(
-                    f"swa {pools['num_swa_pages']} pages"
+                    f"swa {pools['num_swa_pages']} {unit_name}"
                     f" ({swa_tokens} tokens, {_gib(swa_tokens * unit['swa_bytes_per_token'])})"
                 )
             if pools["num_mamba_slots"]:

@@ -76,9 +76,25 @@ def test_log_cache_geometry_reports_all_pools(monkeypatch):
     Scheduler._log_cache_geometry(SimpleNamespace(engine=_fake_engine()), "Cache rebuilt")
     line = lines[-1]
     assert "Cache rebuilt: KV 64 pages (1024 tokens, 1.00 GiB)" in line
-    assert "swa 512 pages (512 tokens, 1.00 GiB)" in line
+    # swa_radix pools are token-granular (swa_page_size 1): the readout must say tokens.
+    assert "swa 512 tokens (512 tokens, 1.00 GiB)" in line
     assert "mamba 64 slots (1.00 GiB)" in line
     assert "MoE cache 24/128 (0.00 GiB)" in line
+
+
+def test_log_cache_geometry_dsv4_window_reports_pages(monkeypatch):
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.scheduler.scheduler import Scheduler
+
+    # DSV4 windows are real P-token pages: 9 physical minus the dummy page, 64 tokens each.
+    engine = _fake_engine(swa=False, moe=False, mamba=False)
+    engine.config.cache_type = "dsv4"
+    engine.config.model_config.dsv4_args = SimpleNamespace(window_size=64)
+    engine.kv_cache.sizes = SimpleNamespace(n_win_pages=9)
+    lines: list[str] = []
+    monkeypatch.setattr(sched_mod.logger, "info_rank0", lines.append)
+    Scheduler._log_cache_geometry(SimpleNamespace(engine=engine), "Cache rebuilt")
+    assert "swa 8 pages (512 tokens, 1.00 GiB)" in lines[-1]
 
 
 def test_log_cache_geometry_plain_model_kv_only(monkeypatch):

@@ -6,6 +6,7 @@ buffer slots (< 2 * num_experts), which must be re-fetched over PCIe."""
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -185,3 +186,79 @@ def test_small_bank_gather_fills_the_layer_buffer(monkeypatch):
             assert torch.equal(view.cpu(), per_layer[layer_id]), (layer_id, name)
         cache.release_prefill_layer(layer_id)
     assert cache.prefill_hit_rows == 2
+
+
+def _latch_stub(chunk_open: bool = True) -> OffloadMoeCache:
+    """An OffloadMoeCache shell carrying only the overlap-chunk latch state."""
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.prefill_overlap = True
+    cache._prefill_depth = 2
+    cache._prefill_chunk_open = chunk_open
+    cache._prefill_buffer_layer = [3, None] if chunk_open else [None, None]
+    cache._prefill_buffer_released = [False, True] if chunk_open else [True, True]
+    return cache
+
+
+def test_abort_prefill_chunk_clears_stuck_latch():
+    # A mid-chunk exception leaves the chunk half-open; abort must reset the latch so the
+    # next begin_prefill re-fences the copy stream instead of no-oping behind a stale map.
+    cache = _latch_stub()
+    cache.abort_prefill_chunk()
+    assert cache._prefill_chunk_open is False
+    assert cache._prefill_buffer_layer == [None, None]
+    assert cache._prefill_buffer_released == [True, True]
+
+
+def test_abort_prefill_chunk_noop_when_closed_or_overlap_off():
+    cache = _latch_stub(chunk_open=False)
+    cache.abort_prefill_chunk()
+    assert cache._prefill_buffer_layer == [None, None]
+    cache.prefill_overlap = False
+    cache._prefill_chunk_open = True
+    cache.abort_prefill_chunk()
+    assert cache._prefill_chunk_open is True
+
+
+def _layer_stub(cache, gemm):
+    return SimpleNamespace(
+        owner_cache=None,
+        offload_cache=cache,
+        layer_id=0,
+        num_experts=8,
+        _wait_prefill_overlap=lambda c: (),
+        _expert_gemm=gemm,
+    )
+
+
+def test_mid_chunk_exception_aborts_the_chunk():
+    from freetoken.layers.moe import OffloadMoELayer
+
+    calls: list[str] = []
+    cache = SimpleNamespace(
+        prefill_overlap=True,
+        alphas_for_layer=lambda layer: None,
+        release_prefill_layer=lambda layer: calls.append("release"),
+        abort_prefill_chunk=lambda: calls.append("abort"),
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated GEMM failure")
+
+    with pytest.raises(RuntimeError, match="simulated GEMM failure"):
+        OffloadMoELayer._prefill_routed(_layer_stub(cache, boom), None, None, None)
+    assert calls == ["abort"], "the chunk must be aborted, never released, on exception"
+
+
+def test_clean_layer_releases_without_abort():
+    from freetoken.layers.moe import OffloadMoELayer
+
+    calls: list[str] = []
+    cache = SimpleNamespace(
+        prefill_overlap=True,
+        alphas_for_layer=lambda layer: None,
+        release_prefill_layer=lambda layer: calls.append("release"),
+        abort_prefill_chunk=lambda: calls.append("abort"),
+    )
+    out = OffloadMoELayer._prefill_routed(_layer_stub(cache, lambda *a, **k: "out"), None, None, None)
+    assert out == "out"
+    assert calls == ["release"]

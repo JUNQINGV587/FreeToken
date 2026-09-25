@@ -498,18 +498,24 @@ class OffloadMoELayer(MoELayer):
             return self._prefill_owner(hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
-            with prefill_profile.get_profiler().phase("moe_gemm"):
-                out = self._expert_gemm(
-                    cache,
-                    hidden_states,
-                    topk_weights,
-                    topk_ids,
-                    views=views,
-                    n=self.num_experts,
-                    alphas=cache.alphas_for_layer(self.layer_id),
-                    is_prefill=True,
-                )
-            cache.release_prefill_layer(self.layer_id)
+            try:
+                with prefill_profile.get_profiler().phase("moe_gemm"):
+                    out = self._expert_gemm(
+                        cache,
+                        hidden_states,
+                        topk_weights,
+                        topk_ids,
+                        views=views,
+                        n=self.num_experts,
+                        alphas=cache.alphas_for_layer(self.layer_id),
+                        is_prefill=True,
+                    )
+                cache.release_prefill_layer(self.layer_id)
+            except BaseException:
+                # A mid-chunk exception must not leave the overlap chunk half-open:
+                # begin_prefill would no-op forever behind a stale buffer map.
+                cache.abort_prefill_chunk()
+                raise
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
@@ -570,21 +576,27 @@ class OffloadMoELayer(MoELayer):
         # Four elementwise ops over [rows, topk] plus two allocations; the profile needs the
         # count to tell "few expensive calls" from "many cheap ones".
         prof.bump("route_mask", 6)
-        out = self._expert_gemm(
-            owner,
-            hidden_states,
-            safe_weights,
-            safe_ids,
-            views=views,
-            n=owner.num_experts,
-            alphas=owner.alphas_for_layer(self.layer_id),
-            is_prefill=True,
-        )
-        # Recorded before release_prefill_layer: that call closes the chunk on the last
-        # layer, and the row must carry its own right edge before the chunk is parked.
-        prof.evt("gemm_end", self.layer_id)
-        if owner.geometry.prefill_overlap:
-            owner.release_prefill_layer(self.layer_id)
+        try:
+            out = self._expert_gemm(
+                owner,
+                hidden_states,
+                safe_weights,
+                safe_ids,
+                views=views,
+                n=owner.num_experts,
+                alphas=owner.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
+            # Recorded before release_prefill_layer: that call closes the chunk on the last
+            # layer, and the row must carry its own right edge before the chunk is parked.
+            prof.evt("gemm_end", self.layer_id)
+            if owner.geometry.prefill_overlap:
+                owner.release_prefill_layer(self.layer_id)
+        except BaseException:
+            # Same stuck-chunk guard as the global-ID overlap path above.
+            if owner.geometry.prefill_overlap:
+                owner.abort_prefill_chunk()
+            raise
         return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:

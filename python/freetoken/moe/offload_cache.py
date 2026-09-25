@@ -989,6 +989,22 @@ class OffloadMoeCache:
                 torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 
+    def abort_prefill_chunk(self) -> None:
+        """Drop a half-finished overlap chunk after a mid-chunk exception.
+
+        release_prefill_layer only closes the chunk at the last layer, so an
+        exception escaping mid-chunk would leave _prefill_chunk_open stuck:
+        begin_prefill no-ops from then on, the copy-stream fence is never
+        re-recorded, and the stale buffer map can be served to the next chunk.
+        The staging buffers are scratch, so abandoning them is safe; in-flight
+        copies are FIFO-ordered behind the next chunk's on the same stream.
+        """
+        if not self.prefill_overlap or not self._prefill_chunk_open:
+            return
+        self._prefill_chunk_open = False
+        self._prefill_buffer_layer = [None] * self._prefill_depth
+        self._prefill_buffer_released = [True] * self._prefill_depth
+
     def release_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap:
             return
@@ -1854,6 +1870,9 @@ This variant never changes the shape.  Remote entries are remapped to a row that
 
     def release_prefill_layer(self, layer_id: int) -> None:
         self._cache.release_prefill_layer(layer_id)
+
+    def abort_prefill_chunk(self) -> None:
+        self._cache.abort_prefill_chunk()
 
     def materialize_layer(self, layer_id: int, buffer_id: int = 0) -> torch.Tensor:
         """Materialize all local rows using the legacy prefill choreography."""

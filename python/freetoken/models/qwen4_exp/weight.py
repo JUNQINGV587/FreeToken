@@ -312,7 +312,19 @@ def _rename(raw_name: str, keep_scale_inv: bool = False) -> str | None:
         keep_scale_inv and raw_name.endswith(".weight_scale_inv")
     ):
         return None
+    # Flat indexer layout (the variant upstream #293's load_state_dict tolerated) ->
+    # our nested indexer.* names, so such a checkpoint loads instead of erroring.
+    for flat, nested in _FLAT_INDEXER_KEYS.items():
+        if raw_name.endswith(flat):
+            return rename_vl_prefix(raw_name[: -len(flat)] + nested)
     return rename_vl_prefix(raw_name)
+
+
+_FLAT_INDEXER_KEYS = {
+    ".self_attn.index_qk_proj.weight": ".self_attn.indexer.index_qk_proj.weight",
+    ".self_attn.index_q_norm.weight": ".self_attn.indexer.q_layernorm.weight",
+    ".self_attn.index_k_norm.weight": ".self_attn.indexer.k_layernorm.weight",
+}
 
 
 def _split_kind(name: str) -> tuple[str, str]:

@@ -931,3 +931,25 @@ def test_gemv_concat_modules_m_dispatch_bitwise():
         qkv, index = qsa.forward(x)
         assert torch.equal(qkv, F.linear(x, qsa.weight[:qkv_rows]))
         assert torch.equal(index, F.linear(x, qsa.weight[qkv_rows:]))
+
+
+def test_flat_indexer_keys_rename_to_the_nested_layout():
+    # The flat self_attn.index_* checkpoint layout (upstream #293's tolerated variant)
+    # must map onto our nested indexer.* names instead of failing the load loudly.
+    from freetoken.models.qwen4_exp.weight import _rename
+
+    cases = {
+        "model.layers.3.self_attn.index_qk_proj.weight":
+            "model.layers.3.self_attn.indexer.index_qk_proj.weight",
+        "model.layers.3.self_attn.index_q_norm.weight":
+            "model.layers.3.self_attn.indexer.q_layernorm.weight",
+        "model.layers.3.self_attn.index_k_norm.weight":
+            "model.layers.3.self_attn.indexer.k_layernorm.weight",
+        # The nested layout our production checkpoint uses passes through untouched.
+        "model.layers.3.self_attn.indexer.index_qk_proj.weight":
+            "model.layers.3.self_attn.indexer.index_qk_proj.weight",
+        "model.layers.3.self_attn.indexer.q_layernorm.weight":
+            "model.layers.3.self_attn.indexer.q_layernorm.weight",
+    }
+    for raw, want in cases.items():
+        assert _rename(raw) == want, raw

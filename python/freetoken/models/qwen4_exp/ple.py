@@ -175,6 +175,11 @@ class PinnedUVATable:
             return buf
         buf = self._staging
         if buf is None or buf.shape[0] < rows:
+            if buf is not None and self._stream is not None:
+                # A previous prefetch's side-stream gather may still be writing the old
+                # buffer; without record_stream the freed block can be handed to the new
+                # allocation and the late gather would stomp the new staging bytes.
+                buf.record_stream(self._stream)
             buf = torch.empty((rows, self.head_dim), dtype=self.dtype, device=self._device)
             self._staging = buf
         return buf[:rows]
@@ -719,6 +724,11 @@ class PLELayer(BaseOP):
         forward advances, so the two writes are order-independent."""
         src = fla.track_boundary_row.unsqueeze(1) + torch.arange(
             -self.state_len, 0, device=x.device
+        )
+        # A boundary before the conv-history window would index x from its tail
+        # (negative-index wrap) and snapshot the wrong history -- fail loudly instead.
+        assert bool((src >= 0).all()), (
+            "track snapshot source underflows the chunk: boundary row precedes the conv window"
         )
         window = x[src].transpose(-1, -2).contiguous()
         states.index_copy_(0, fla.track_dst, window.to(states.dtype))

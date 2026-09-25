@@ -848,3 +848,49 @@ def test_decode_graph_replay_matches_eager():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(static_out, replayed)
+
+
+# --------------------------------------------------------------------------------------
+# staging-buffer lifetime and track-snapshot guards
+# --------------------------------------------------------------------------------------
+
+
+@requires_cuda
+def test_prefetch_growth_realloc_waits_for_in_flight_gather():
+    # Growing the staging buffer must not recycle the old block while a previous
+    # prefetch's side-stream gather still writes it: the late gather would stomp the
+    # new staging bytes lookup then returns. Run under compute-sanitizer for the UAF
+    # itself; here the oracle check catches visible corruption.
+    rows, dim = 4096, 160
+    bank = _pinned_bank(rows, dim, torch.bfloat16)
+    oracle = GpuResidentTable(bank.tensor.cuda(), 1.0, dtype=torch.bfloat16)
+    pinned = PinnedUVATable(bank.tensor, 1.0)
+    small = torch.randint(0, rows, (8,), device="cuda")
+    big = torch.randint(0, rows, (8192,), device="cuda")
+    want = oracle.lookup(big)
+    for _ in range(50):
+        pinned.prefetch(small)
+        pinned.prefetch(big)  # realloc while small's gather may still be in flight
+        assert torch.equal(pinned.lookup(big), want)
+
+
+def _snapshot_stub(state_len: int):
+    return SimpleNamespace(state_len=state_len)
+
+
+def test_track_snapshot_rejects_an_underflowing_boundary():
+    # track_boundary_row < state_len would wrap negative src indices to the tail of x and
+    # snapshot the wrong history; the guard must fire instead of corrupting the state.
+    x = torch.arange(5 * 3, dtype=torch.float32).view(5, 3)
+    fla = SimpleNamespace(track_boundary_row=torch.tensor([2]), track_dst=torch.tensor([0]))
+    states = torch.zeros(1, 3, 4)
+    with pytest.raises(AssertionError, match="underflows"):
+        PLELayer._write_track_snapshot(_snapshot_stub(4), states, x, fla)
+
+
+def test_track_snapshot_copies_the_window_before_the_boundary():
+    x = torch.arange(6 * 3, dtype=torch.float32).view(6, 3)
+    fla = SimpleNamespace(track_boundary_row=torch.tensor([6]), track_dst=torch.tensor([0]))
+    states = torch.zeros(1, 3, 4)
+    PLELayer._write_track_snapshot(_snapshot_stub(4), states, x, fla)
+    assert torch.equal(states[0], x[2:6].transpose(-1, -2))

@@ -383,7 +383,9 @@ class Scheduler(SchedulerIOMixin):
                         row_top_logprobs = []
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
+                # Overlap can advance device_len ahead of the token delivered to the host
+                # (upstream #546).
+                hit_length = req.input_ids.numel() >= req.max_device_len
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 )

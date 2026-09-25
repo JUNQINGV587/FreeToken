@@ -237,6 +237,44 @@ def test_finish_frees_the_in_flight_decode_page():
     cm.check_integrity()
 
 
+def test_overlap_length_finish_waits_for_the_in_flight_token():
+    """Upstream #546: overlap advances device_len ahead of host delivery. The old
+    hit_length predicate (not req.can_decode, device-side) fired at the drain of the
+    max-1'th token -- while the max'th decode step was still in flight -- truncating
+    the output by one token and entering finish/free paths with a forward pending.
+    The host-side predicate (input_ids.numel() >= max_device_len) finishes exactly
+    when the final token is delivered: max_tokens=4 must deliver 4 tokens."""
+    from freetoken.message import DetokenizeMsg
+
+    pool, cm, tm, dm, _pm, sent, stub = _setup()
+    # prompt 12 + output_len 4 -> max_device_len 16; launch leaves device_len 13.
+    req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32),
+                      track_seqlen=8)
+    dm.filter_reqs([req])
+    assert req.device_len == 13 and req.input_ids.numel() == 12
+
+    # Steady-state overlap: allocate the decode page, launch step N+1 (complete_one),
+    # then drain step N.
+    for _ in range(3):
+        cm.allocate_paged([req])
+        req.complete_one()
+        Scheduler._process_last_data(
+            stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+    assert req.device_len == req.max_device_len      # 4th step already in flight...
+    assert req.input_ids.numel() == 15               # ...but only 3 delivered
+    assert req not in stub.finished_reqs             # old code finished here, dropping it
+
+    cm.allocate_paged([req])  # the in-flight 4th step's page (its launch preceded drain 3)
+    Scheduler._process_last_data(
+        stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+    assert req in stub.finished_reqs
+    assert req.input_ids.numel() == req.max_device_len  # all 4 output tokens delivered
+    msgs = [m for m in sent if isinstance(m, DetokenizeMsg)]
+    assert len(msgs) == 4 and msgs[-1].finished
+    assert all(not m.finished for m in msgs[:-1])
+    cm.check_integrity()
+
+
 def test_post_terminal_overlap_step_is_dropped():
     """Overlap scheduling launches one more decode step for a request that already
     terminated (filter_reqs keeps it while output budget remains). The extra drain

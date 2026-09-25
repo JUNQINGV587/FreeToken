@@ -699,3 +699,15 @@ def test_a_random_op_sequence_keeps_the_ledger_and_the_bytes_honest():
 
     # The walk must actually have exercised the paths it models, not just walked in circles.
     assert want["spills"] > 20 and want["restores"] > 10 and want["dropped"] > 0
+
+
+def test_spill_refuses_a_node_longer_than_the_tier():
+    # An oversize node is refused (the cache evicts as if there were no tier) instead of
+    # reaching alloc_entry, whose assert would abort the engine on a long prefix.
+    pool = FakeQSAPool()
+    br, tier = bridge(pool)                     # capacity 4 pages
+    node = Node("big", 5 * PAGE, first_page=0)
+    assert br.spill(node) is None
+    assert tier.resident_entries == 0
+    with pytest.raises(AssertionError, match="pages for a"):
+        tier.alloc_entry("direct", 5)

@@ -300,3 +300,11 @@ def test_geometry_check_rejects_a_mismatched_field(qsa_pool, field, value):
 
     with pytest.raises(TierGeometryMismatch):
         check_tier_geometry(g, qsa_pool, page_size=g.page_size)
+
+
+def test_qsa_shadow_refuses_a_non_two_byte_dtype():
+    # The shadow slab rides the compute dtype (2-byte, like QSAKVCache's own pool assert);
+    # a store-dtype pool must decline the tier, not die inside a CUDA graph capture.
+    g = replace(geom(index_layers=2, index_head_dim=6, index_ratio=2), dtype=torch.float32)
+    with pytest.raises(TierGeometryMismatch, match="2-byte"):
+        HostKVTier(g, 1)

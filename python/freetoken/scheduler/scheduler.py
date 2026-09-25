@@ -171,6 +171,27 @@ class Scheduler(SchedulerIOMixin):
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
+        moe_cache = getattr(self.engine, "moe_offload_cache", None)
+        if moe_cache is not None and moe_cache.collect_stats:
+            stats = moe_cache.decode_miss_stats()
+            if stats["layer_calls"]:
+                per_layer = moe_cache.decode_miss_stats_per_layer()["per_layer"]
+                logger.info_rank0(
+                    "MoE decode cache stats, "
+                    f"layer calls: {stats['layer_calls']}, "
+                    f"active/layer: {stats['active_per_layer']:.3f}, "
+                    f"missing/layer: {stats['missing_per_layer']:.3f}, "
+                    f"miss rate: {stats['miss_rate']:.6f}, "
+                    f"prefill hit rows: {stats['prefill_hit_rows']}/"
+                    f"{stats['prefill_rows']}"
+                )
+                logger.info_rank0(
+                    "MoE decode cache per-layer miss rates: "
+                    + ",".join(f"{row['layer']}={row['miss_rate']:.6f}" for row in per_layer)
+                )
+            # CUDA graph capture can contribute a one-off warm-up increment. Reset at every
+            # idle boundary so the next log is exactly one busy window (normally one request).
+            moe_cache.reset_stats()
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
 

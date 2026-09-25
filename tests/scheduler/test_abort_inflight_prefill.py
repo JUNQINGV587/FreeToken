@@ -298,3 +298,29 @@ def test_post_terminal_overlap_step_is_dropped():
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()
+
+
+def test_naive_finish_frees_the_in_flight_decode_page():
+    """The plain radix finish path bounded its tail free by page_ceil(cached_len),
+    so an overlap step's page allocated past cached_len (forward still in flight
+    at drain) leaked. The tail must reach allocated_len, like the hybrid fix."""
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "radix")
+    prompt = torch.arange(1, 13, dtype=torch.int32)
+    mr = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt)))
+    req = Req(input_ids=prompt, table_idx=0, cached_len=0, output_len=4, uid=UID,
+              sampling_params=SamplingParams(max_tokens=4), cache_handle=mr.cuda_handle)
+    cm.lock(mr.cuda_handle)
+    cm.allocate_paged([req])
+    req.complete_one()
+
+    # Two overlap launches with drains, then the schedule of a third step: its slot
+    # (position 14) is allocated while its forward is still in flight.
+    for _ in range(2):
+        cm.allocate_paged([req])
+        req.complete_one()
+    cm.allocate_paged([req])
+    assert req.cached_len == 14 and req.allocated_len == 15
+
+    cm.cache_req(req, finished=True)
+    cm.check_integrity()

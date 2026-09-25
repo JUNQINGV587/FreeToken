@@ -635,9 +635,14 @@ class CacheManager:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish
         frees through the page-CEIL bound, not cached_len: allocate_paged allocates (and, when
         swa_paged, charges swa for) whole pages, so the padding [cached_len, page_ceil) belongs
-        to the finishing request. ``start`` is page-aligned (a match/insert boundary), so the
-        full-pool page bases derived via ``[::page_size]`` are identical to the unpadded slice."""
-        end = div_ceil(req.cached_len, self.page_size) * self.page_size
+        to the finishing request. Under overlap the extent reaches allocated_len: the
+        scheduled-not-executed step's pages sit past page_ceil(cached_len) and belong to
+        this request too (the hybrid branch frees by allocated_len explicitly; the naive
+        and SWA finish paths free through here). ``start`` is page-aligned (a match/insert
+        boundary), so the full-pool page bases derived via ``[::page_size]`` are identical
+        to the unpadded slice."""
+        end = max(div_ceil(req.cached_len, self.page_size) * self.page_size,
+                  req.allocated_len)
         return self.page_table[req.table_idx, start:end]
 
     def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:

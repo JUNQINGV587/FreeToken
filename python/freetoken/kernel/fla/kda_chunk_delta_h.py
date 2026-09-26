@@ -361,7 +361,13 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    # Export per-chunk states in fp32 (not k.dtype): the recurrent state is
+    # carried in fp32 registers between chunks, and track snapshots copy h
+    # rows into the fp32 linear-state pool -- storing h as bf16 would silently
+    # round every snapshot (P3-29, qwen3_5_moe GDN root cause; GLM5 KDA is
+    # the same pattern). chunk_gla_fwd_kernel_o casts b_h back to the query
+    # dtype before tl.dot, so prefill outputs are bit-identical either way.
+    h = k.new_empty(B, NT, H, V, K, dtype=torch.float32)
     final_state = (
         k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
     )

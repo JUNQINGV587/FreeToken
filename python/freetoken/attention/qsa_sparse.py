@@ -389,6 +389,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             expand_qsa_block_indices,
             qsa_index_norm_rope,
             qsa_mqa_paged,
+            qsa_mqa_paged_prefill,
         )
 
         rows = index.q.shape[0]
@@ -413,22 +414,43 @@ class QSASparseAttnBackend(BaseAttnBackend):
         columns = md.block_table.shape[1] * self.cmp_page_size
         indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)
         rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
+        # Prefill/extend scores on the TILE_R-packed kernel (vllm #54513 port); decode
+        # stays on the per-row kernel bit-for-bit (CUDA-graph captured, dql is always 1).
+        max_query_len = 1
+        if not md.is_decode and rows:
+            max_query_len = int((md.qo_indptr_cpu[1:] - md.qo_indptr_cpu[:-1]).max())
         for start in range(0, rows, rows_per_chunk):
             end = min(start + rows_per_chunk, rows)
             chunk = slice(start, end)
             logits = self._scratch("logits", end - start, columns, dtype=torch.float32)
             visible = self._scratch("visible", end - start, dtype=torch.int32)
-            qsa_mqa_paged(
-                q_index[chunk],
-                cmp_pages,
-                md.block_table,
-                md.token_to_req[chunk],
-                positions[chunk],
-                md.seq_lens,
-                self.ratio,
-                logits,
-                visible,
-            )
+            if md.is_decode:
+                qsa_mqa_paged(
+                    q_index[chunk],
+                    cmp_pages,
+                    md.block_table,
+                    md.token_to_req[chunk],
+                    positions[chunk],
+                    md.seq_lens,
+                    self.ratio,
+                    logits,
+                    visible,
+                )
+            else:
+                qsa_mqa_paged_prefill(
+                    q_index,
+                    cmp_pages,
+                    md.block_table,
+                    md.cu_seqlens,
+                    positions,
+                    md.seq_lens,
+                    self.ratio,
+                    logits,
+                    visible,
+                    query_offset=start,
+                    num_rows=end - start,
+                    max_query_len=max_query_len,
+                )
             blocks = self._scratch("blocks", end - start, self.block_topk, dtype=torch.int32)
             self._top_blocks(logits, visible, blocks)
             expand_qsa_block_indices(

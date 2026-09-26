@@ -780,7 +780,9 @@ def chunk_gla_fwd_kernel_o(
         # [BT, BK]
         b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
         # [BV, BK]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
+        # h is exported in fp32 (see kda_chunk_delta_h); cast back to the
+        # query dtype so tl.dot consumes the same values as a bf16 buffer.
+        b_h = tl.load(p_h, boundary_check=(0, 1)).to(b_q.dtype)
         # [BT, BV]
         if i_k >= 0:
             b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))

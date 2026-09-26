@@ -104,3 +104,90 @@ def test_fused_recurrent_serves_slot_zero():
     _assert_close(o[0], ref_o, "slot-0 output")
     _assert_close(pool[0], ref_h, "slot-0 final state")
     assert pool[1].abs().max().item() == 0.0  # only slot 0 was touched
+
+
+# --- P3-29 follow-up: KDA chunked prefill must also export fp32 chunk states ---
+
+CHUNK = 64
+
+
+def _chunk_inputs(total: int, seed: int = 7):
+    torch.manual_seed(seed)
+    mk = lambda *s: torch.randn(*s, device="cuda", dtype=torch.bfloat16)
+    q, k, v = mk(1, total, H, D), mk(1, total, H, D), mk(1, total, H, D)
+    raw_g = mk(1, total, H, D)
+    beta = torch.sigmoid(mk(1, total, H)).float()
+    a_log = torch.randn(H, device="cuda", dtype=torch.float32) * 0.5
+    dt_bias = torch.randn(H * D, device="cuda", dtype=torch.float32) * 0.5
+    cu = torch.tensor([0, total], dtype=torch.int32, device="cuda")
+    return q, k, v, raw_g, beta, a_log, dt_bias, cu
+
+
+def _run_chunk(q, k, v, raw_g, beta, a_log, dt_bias, cu, initial, return_h):
+    from freetoken.kernel.fla import chunk_kda_with_fused_gate
+
+    # chunk_kda_with_fused_gate writes its output IN-PLACE into v (the model
+    # passes an ephemeral conv buffer by design); clone per call so repeated
+    # runs in one test do not feed clobbered outputs back as inputs.
+    return chunk_kda_with_fused_gate(
+        q=q.clone(), k=k.clone(), v=v.clone(), raw_g=raw_g.clone(), beta=beta.clone(),
+        A_log=a_log, g_bias=dt_bias,
+        scale=SCALE, initial_state=initial, output_final_state=True,
+        use_qk_l2norm_in_kernel=True, cu_seqlens=cu, safe_gate=True,
+        # Mild decay (sigmoid(0)=0.5 -> |lower_bound|/2 per token); the default
+        # -5.0 forgets the initial state within one chunk and would mask any
+        # snapshot rounding (same lesson as the GDN probe).
+        lower_bound=-0.01, return_h=return_h,
+    )
+
+
+def test_chunked_track_h_is_fp32():
+    """Snapshot path copies h rows into the fp32 linear-state pool; h must be
+    exported in fp32 so snapshots are not bf16-rounded (P3-29)."""
+    total = CHUNK * 3
+    q, k, v, raw_g, beta, a_log, dt_bias, cu = _chunk_inputs(total)
+    initial = torch.zeros(1, H, D, D, dtype=torch.float32, device="cuda")
+    _, _, h = _run_chunk(q, k, v, raw_g, beta, a_log, dt_bias, cu, initial, True)
+    assert h.dtype == torch.float32, f"chunked KDA exports h as {h.dtype}"
+
+
+def test_chunked_snapshot_resume_bit_exact():
+    """Resume from a chunk-boundary snapshot must be bit-identical to cold."""
+    total, boundary = CHUNK * 3, CHUNK * 2
+    q, k, v, raw_g, beta, a_log, dt_bias, cu = _chunk_inputs(total)
+    zero = torch.zeros(1, H, D, D, dtype=torch.float32, device="cuda")
+    o_full, fs_full, h = _run_chunk(q, k, v, raw_g, beta, a_log, dt_bias, cu, zero, True)
+
+    snap = h[0, 2].unsqueeze(0).contiguous()  # state after `boundary` tokens
+    cu_sfx = torch.tensor([0, total - boundary], dtype=torch.int32, device="cuda")
+    o_res, fs_res = _run_chunk(
+        q[:, boundary:], k[:, boundary:], v[:, boundary:],
+        raw_g[:, boundary:], beta[:, boundary:], a_log, dt_bias,
+        cu_sfx, snap, False,
+    )
+    torch.testing.assert_close(o_res, o_full[:, boundary:], rtol=0, atol=0)
+    torch.testing.assert_close(fs_res, fs_full, rtol=0, atol=0)
+
+
+def test_chunked_resume_observes_state_rounding():
+    """Sensitivity pin: a bf16-rounded snapshot MUST change the continuation --
+    proves the probes above can actually detect snapshot-state rounding.
+    Asserts on the fp32 final state: outputs pass through bf16 casts at every
+    tl.dot, which can legitimately mask a bf16-ULP-scale state difference,
+    while the register state recurrence (init * chunk decay, fp32) carries it
+    straight into the fp32 final_state store."""
+    total, boundary = CHUNK * 3, CHUNK * 2
+    q, k, v, raw_g, beta, a_log, dt_bias, cu = _chunk_inputs(total)
+    zero = torch.zeros(1, H, D, D, dtype=torch.float32, device="cuda")
+    _, _, h = _run_chunk(q, k, v, raw_g, beta, a_log, dt_bias, cu, zero, True)
+
+    cu_sfx = torch.tensor([0, total - boundary], dtype=torch.int32, device="cuda")
+    sfx = (q[:, boundary:], k[:, boundary:], v[:, boundary:],
+           raw_g[:, boundary:], beta[:, boundary:])
+    exact = h[0, 2].unsqueeze(0).contiguous()
+    rounded = h[0, 2].to(torch.bfloat16).to(torch.float32).unsqueeze(0).contiguous()
+    _, fs_exact = _run_chunk(*sfx, a_log, dt_bias, cu_sfx, exact, False)
+    _, fs_bad = _run_chunk(*sfx, a_log, dt_bias, cu_sfx, rounded, False)
+    assert not torch.equal(fs_bad, fs_exact), (
+        "rounded snapshot produced identical final state -- probe cannot detect P3-29"
+    )

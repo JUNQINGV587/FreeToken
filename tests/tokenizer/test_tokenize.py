@@ -47,6 +47,36 @@ def test_tokenize_manager_passes_chat_template_kwargs():
     assert input_ids.tolist() == [1, 2, 3]
 
 
+def test_chat_template_gate_units():
+    from freetoken.tokenizer.tokenize import chat_template_from_request_allowed
+
+    assert chat_template_from_request_allowed(None)
+    assert chat_template_from_request_allowed({})
+    assert chat_template_from_request_allowed({"enable_thinking": True})
+    assert not chat_template_from_request_allowed({"chat_template": "x"})
+
+
+def test_request_chat_template_rejected_by_default():
+    manager = TokenizeManager(FakeTokenizer())
+    with pytest.raises(ValueError, match="chat_template"):
+        manager._render(
+            [{"role": "user", "content": "hi"}], None, {"chat_template": "{{ evil }}"}
+        )
+
+
+def test_request_chat_template_allowed_when_trusted(monkeypatch):
+    monkeypatch.setattr(
+        "freetoken.tokenizer.tokenize.TRUST_REQUEST_CHAT_TEMPLATE", True
+    )
+    tokenizer = FakeTokenizer()
+    manager = TokenizeManager(tokenizer)
+    out = manager._render(
+        [{"role": "user", "content": "hi"}], None, {"chat_template": "custom jinja"}
+    )
+    assert out == "rendered prompt"
+    assert tokenizer.chat_template_kwargs["chat_template"] == "custom jinja"
+
+
 def test_tokenize_manager_passes_tools_to_chat_template():
     tokenizer = FakeTokenizer()
     manager = TokenizeManager(tokenizer)

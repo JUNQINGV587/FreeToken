@@ -122,3 +122,45 @@ def test_async_pull_coalesced():
             pull.stop()
 
     asyncio.run(_exercise())
+
+class TestOversizedFrames:
+    """A frame above the msgpack buffer cap is dropped, not fatal (2026-09-26 incident:
+    a 258k-token prompt with logprobs packed past the 100 MiB msgpack default and the
+    uncaught BufferFull killed the tokenizer worker)."""
+
+    def test_default_cap_is_one_gib(self):
+        from freetoken.utils.mp import _CoalescedUnpacker, _DEFAULT_MAX_BUFFER
+
+        assert _DEFAULT_MAX_BUFFER == 1 << 30
+        assert _CoalescedUnpacker()._max_buffer_size == _DEFAULT_MAX_BUFFER
+
+    def test_env_override_and_invalid_fallback(self, monkeypatch):
+        from freetoken.utils.mp import _CoalescedUnpacker
+
+        monkeypatch.setenv("FREETOKEN_MSGPACK_MAX_BUFFER", str(64 << 20))
+        assert _CoalescedUnpacker()._max_buffer_size == 64 << 20
+        monkeypatch.setenv("FREETOKEN_MSGPACK_MAX_BUFFER", "not-a-number")
+        assert _CoalescedUnpacker()._max_buffer_size == 1 << 30
+        monkeypatch.setenv("FREETOKEN_MSGPACK_MAX_BUFFER", "0")
+        assert _CoalescedUnpacker()._max_buffer_size == 1 << 30
+
+    def test_oversized_frame_is_dropped_and_service_continues(self, capsys):
+        from freetoken.utils.mp import _CoalescedUnpacker
+
+        unpacker = _CoalescedUnpacker(max_buffer_size=1 << 20)
+        big = msgpack.packb({"blob": b"x" * (2 << 20)}, use_bin_type=True)
+        unpacker.feed(big)  # must not raise
+        assert unpacker.dropped_frames == 1
+        assert "dropped" in capsys.readouterr().err
+        # Later frames still decode: the worker survives the oversized request.
+        unpacker.feed(msgpack.packb({"i": 1}, use_bin_type=True))
+        assert unpacker.take() == {"i": 1}
+
+    def test_pending_objects_survive_a_later_oversized_frame(self):
+        from freetoken.utils.mp import _CoalescedUnpacker
+
+        unpacker = _CoalescedUnpacker(max_buffer_size=1 << 20)
+        unpacker.feed(msgpack.packb("kept", use_bin_type=True))
+        unpacker.feed(msgpack.packb({"blob": b"y" * (2 << 20)}, use_bin_type=True))
+        assert unpacker.dropped_frames == 1
+        assert unpacker.take() == "kept"

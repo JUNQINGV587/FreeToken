@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 import time
 from typing import Any, Callable, Dict, Generic, TypeVar
 
@@ -8,6 +10,22 @@ import zmq
 import zmq.asyncio
 
 T = TypeVar("T")
+
+# A 262144-token prompt with logprobs packs to ~107 MiB (measured ~407 B/token) and
+# top_logprobs multiplies that, so the msgpack default (100 MiB) sits below the legal
+# worst case; env-overridable for tighter deployments.
+_DEFAULT_MAX_BUFFER = 1 << 30
+
+
+def _max_buffer_size() -> int:
+    raw = os.environ.get("FREETOKEN_MSGPACK_MAX_BUFFER")
+    if raw is None:
+        return _DEFAULT_MAX_BUFFER
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_BUFFER
+    return value if value > 0 else _DEFAULT_MAX_BUFFER
 
 
 class _CoalescedUnpacker:
@@ -22,15 +40,31 @@ class _CoalescedUnpacker:
     in order instead of crashing.
     """
 
-    def __init__(self) -> None:
-        self._unpacker = msgpack.Unpacker(raw=False)
+    def __init__(self, max_buffer_size: int | None = None) -> None:
+        self._max_buffer_size = max_buffer_size if max_buffer_size is not None else _max_buffer_size()
+        self._unpacker = self._new_unpacker()
         self._pending: list[Any] = []
+        self.dropped_frames = 0
+
+    def _new_unpacker(self) -> msgpack.Unpacker:
+        return msgpack.Unpacker(raw=False, max_buffer_size=self._max_buffer_size)
 
     def feed(self, frame: bytes) -> None:
         """Queue up every msgpack object contained in ``frame`` (usually exactly one)."""
-        self._unpacker.feed(frame)
-        for obj in self._unpacker:
-            self._pending.append(obj)
+        try:
+            self._unpacker.feed(frame)
+            for obj in self._unpacker:
+                self._pending.append(obj)
+        except msgpack.exceptions.BufferFull:
+            # One oversized message must not kill the worker: drop that frame and keep
+            # serving later ones; the owning request times out instead of the process.
+            self.dropped_frames += 1
+            print(
+                f"freetoken.mp: dropped a {len(frame)}-byte frame above the "
+                f"{self._max_buffer_size}-byte msgpack buffer (FREETOKEN_MSGPACK_MAX_BUFFER)",
+                file=sys.stderr,
+            )
+            self._unpacker = self._new_unpacker()
 
     def take(self) -> Any:
         """Pop the oldest undelivered object; raises StopIteration when the buffer is empty."""

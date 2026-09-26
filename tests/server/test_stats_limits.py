@@ -39,6 +39,8 @@ def _state(*, cache_pools=None, enforced=None, page_size=1, model_max=262144,
         kv_used_pages=10, kv_total_pages=4096, mamba_used_slots=0, mamba_total_slots=0,
         swa_used_tokens=0, swa_total_tokens=0, vram_bytes=1 << 30, active=0, completed=0,
         prompt_tokens_total=0, completion_tokens_total=0, cached_tokens_total=0,
+        cached_prompt_tokens_total=0, decode_tokens_total=0,
+        prefill_seconds_total=0.0, decode_seconds_total=0.0,
         moe_stats=None, mm_stats=mm_stats, host_tier_stats=host_tier_stats, decode_tps=lambda *_: 0.0, prefill_tps=lambda *_: 0.0,
     )
     return state

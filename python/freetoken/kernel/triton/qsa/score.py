@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import math
 
 import torch
 import triton
@@ -35,7 +34,6 @@ def _qsa_mqa_paged_kernel(
     num_columns,
     num_pages,
     num_requests,
-    score_divisor,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
     NUM_HEADS: tl.constexpr,
@@ -107,7 +105,9 @@ def _qsa_mqa_paged_kernel(
         )
         scores = tl.dot(keys, query, out_dtype=tl.float32)
         scores = tl.where(heads[None, :] < NUM_HEADS, tl.maximum(scores, 0.0), 0.0)
-        score = tl.sum(scores, axis=1) / score_divisor
+        # vllm #54915: no 1/sqrt(d) scaling -- a constant divisor is ranking-neutral
+        # and dropping it avoids fp32 rounding collapse of near-ties.
+        score = tl.sum(scores, axis=1)
         tl.store(
             logits_ptr + row * stride_logits_row + columns,
             tl.where(page_valid, score, -float("inf")),
@@ -125,7 +125,6 @@ def qsa_mqa_paged(
     compress_ratio: int,
     logits: torch.Tensor,
     visible_blocks: torch.Tensor,
-    score_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
 
@@ -139,7 +138,6 @@ def qsa_mqa_paged(
         raise ValueError("QSA request mapping and positions must match query rows")
     if sequence_lengths.shape != (page_table.shape[0],):
         raise ValueError("QSA sequence lengths must match page-table requests")
-    score_divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
     columns = logits.shape[1]
     if not q.shape[0] or not columns:
         return logits, visible_blocks
@@ -172,7 +170,6 @@ def qsa_mqa_paged(
         columns,
         k_cache.shape[0],
         page_table.shape[0],
-        float(score_divisor),
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=page_table.shape[1],
         NUM_HEADS=q.shape[1],
@@ -211,7 +208,6 @@ def _qsa_mqa_paged_prefill_kernel(
     query_offset,
     num_columns,
     num_pages,
-    score_divisor,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
     NUM_HEADS: tl.constexpr,
@@ -301,7 +297,7 @@ def _qsa_mqa_paged_prefill_kernel(
         scores = tl.reshape(scores, (BLOCK_N, TILE_R, HEADS_PAD))
         # Padded heads loaded query=0.0, so their dot is exactly 0 and relu keeps it 0 --
         # no head mask needed inside the sum.
-        score = tl.sum(tl.maximum(scores, 0.0), axis=2) / score_divisor
+        score = tl.sum(tl.maximum(scores, 0.0), axis=2)
         # live is tile-level (max_visible); each row's own bound is its visible count.
         store_mask = (
             valid_rows[None, :]
@@ -329,12 +325,12 @@ def qsa_mqa_paged_prefill(
     query_offset: int,
     num_rows: int,
     max_query_len: int,
-    score_scale: float | None = None,
 ) -> None:
     """Prefill/extend counterpart of :func:`qsa_mqa_paged` (vllm #54513 port).
 
-    Same per-element math (relu of the q·k dot, summed over heads, divided by
-    ``score_divisor``) but TILE_R rows share one tensor-core dot. ``q``,
+    Same per-element math (relu of the q·k dot, summed over heads -- vllm
+    #54915 drops the ranking-neutral 1/sqrt(d) divisor) but TILE_R rows share
+    one tensor-core dot. ``q``,
     ``cu_seqlens``, ``query_positions`` address the WHOLE packed batch; the call
     scores the chunk ``[query_offset, query_offset + num_rows)`` into the
     chunk-sized ``logits``/``visible_blocks`` buffers. The chunk may cut through
@@ -355,7 +351,6 @@ def qsa_mqa_paged_prefill(
         raise ValueError("QSA prefill outputs must be chunk-sized")
     if num_rows == 0 or logits.shape[1] == 0:
         return
-    score_divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
     columns = logits.shape[1]
     TILE_R = 64
     BLOCK_N = 64
@@ -388,7 +383,6 @@ def qsa_mqa_paged_prefill(
         query_offset,
         columns,
         k_cache.shape[0],
-        float(score_divisor),
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=page_table.shape[1],
         NUM_HEADS=q.shape[1],

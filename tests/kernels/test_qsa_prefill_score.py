@@ -84,6 +84,32 @@ def test_prefill_score_matches_legacy_oracle(seqs, ext, chunk_rows):
     assert torch.equal(chosen_ref, chosen_new), "top-k block selection diverged"
 
 
+def test_prefill_score_compacted_width():
+    """vllm #54915: logits compacted to cdiv(max_seq_len, ratio) (64-rounded) must
+    select identically to the full page-table width -- compacted-away columns are
+    unreachable (>= every row's visible count)."""
+    q, k_cache, block_table, cu, positions, seq_lens, _, rows = _build(
+        [1000, 4096, 333], [37, 300, 128]
+    )
+    full_columns = WIDTH * PAGE
+    max_seq = 4096
+    compact = min(full_columns, max(64, -(-(-(-max_seq // RATIO)) // 64) * 64))
+    assert compact < full_columns
+
+    topk = 32
+    selections = []
+    for columns in (full_columns, compact):
+        logits = torch.full((rows, columns), float("nan"), dtype=torch.float32, device="cuda")
+        visible = torch.empty(rows, dtype=torch.int32, device="cuda")
+        qsa_mqa_paged_prefill(
+            q, k_cache, block_table, cu, positions, seq_lens, RATIO, logits, visible,
+            query_offset=0, num_rows=rows, max_query_len=300,
+        )
+        in_range = torch.arange(columns, device="cuda").unsqueeze(0) < visible.unsqueeze(1)
+        selections.append(logits.masked_fill(~in_range, -float("inf")).topk(topk, dim=-1).indices)
+    assert torch.equal(selections[0], selections[1]), "compacted width changed the selection"
+
+
 def test_prefill_score_empty_and_bounds():
     # zero-row chunk is a no-op; out-of-range chunk rejected
     q, k_cache, block_table, cu, positions, seq_lens, _, rows = _build([128], [16])

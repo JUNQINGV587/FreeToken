@@ -31,6 +31,7 @@ from freetoken.mm import restore_placeholder
 
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
+from freetoken.kernel.triton.ple_gate import fused_gate_enabled
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -699,15 +700,31 @@ class PLELayer(BaseOP):
             row_ids = self.ple_embedding.row_ids(meta)
 
         embeddings = self.ple_embedding.table.lookup(row_ids).to(R.dtype)
-        key = self.norm_key.forward(self.key_proj.forward(embeddings))
-        value = self.value_proj.forward(embeddings)
-        query = self.norm_query.forward(R)
-        shape = (-1, self.hc_count, self.hidden_size)
-        gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
-        gated = (gate * value.unsqueeze(-2)).flatten(-2)
+        if R.is_cuda and fused_gate_enabled():
+            # Fused vllm #54517 gate: norms + dot gate + sigmoid + gate*value +
+            # norm_conv in one kernel. Same dtype boundaries as eager, but the
+            # reduction order differs -> not bit-identical (see ple_gate.py).
+            from freetoken.kernel.triton.ple_gate import ple_gate
+
+            gated, x = ple_gate(
+                self.key_proj.forward(embeddings),
+                self.value_proj.forward(embeddings),
+                R,
+                self.norm_key.weight,
+                self.norm_query.weight,
+                self.norm_conv.weight,
+                self.norm_conv.eps,
+            )
+        else:
+            key = self.norm_key.forward(self.key_proj.forward(embeddings))
+            value = self.value_proj.forward(embeddings)
+            query = self.norm_query.forward(R)
+            shape = (-1, self.hc_count, self.hidden_size)
+            gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+            gated = (gate * value.unsqueeze(-2)).flatten(-2)
+            x = self.norm_conv.forward(gated)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
-        x = self.norm_conv.forward(gated)
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)

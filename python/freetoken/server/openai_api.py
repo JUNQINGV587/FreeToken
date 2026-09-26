@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
+from freetoken.tokenizer.tokenize import chat_template_from_request_allowed
 
 from .api_models import (
     ChatCompletionRequest,
@@ -379,6 +380,13 @@ async def handle_chat_completion(
         )
     if req.n != 1:
         return create_error_response("Only n=1 is supported", param="n")
+    if not chat_template_from_request_allowed(req.chat_template_kwargs):
+        return create_error_response(
+            "request-supplied chat_template is rejected by default (server-side "
+            "Jinja execution surface); set FREETOKEN_TRUST_REQUEST_CHAT_TEMPLATE=1 "
+            "to allow it",
+            param="chat_template_kwargs",
+        )
     # Case/whitespace and the "off" disable synonym stay accepted here because
     # effort_toggle_kwargs normalizes and honors them downstream.
     effort = req.reasoning_effort.strip().lower() if isinstance(req.reasoning_effort, str) else None

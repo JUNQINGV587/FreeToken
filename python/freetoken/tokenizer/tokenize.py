@@ -25,6 +25,23 @@ from .effort import (
 
 logger = init_logger(__name__)
 
+# A request-supplied chat_template is a server-side Jinja execution surface
+# (semantic port of sglang #28135). Fail closed unless explicitly trusted.
+TRUST_REQUEST_CHAT_TEMPLATE = os.getenv("FREETOKEN_TRUST_REQUEST_CHAT_TEMPLATE", "").strip() in (
+    "1",
+    "true",
+    "True",
+)
+
+
+def chat_template_from_request_allowed(chat_template_kwargs: dict[str, Any] | None) -> bool:
+    """True when the request may carry its own ``chat_template`` through kwargs."""
+    return (
+        not chat_template_kwargs
+        or "chat_template" not in chat_template_kwargs
+        or TRUST_REQUEST_CHAT_TEMPLATE
+    )
+
 
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
     """Resolve the thinking mode (``"thinking"`` or ``"chat"``) for a chat request.
@@ -134,6 +151,12 @@ class TokenizeManager:
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
+        if not chat_template_from_request_allowed(chat_template_kwargs):
+            raise ValueError(
+                "request-supplied chat_template is rejected by default (server-side "
+                "Jinja execution surface); set FREETOKEN_TRUST_REQUEST_CHAT_TEMPLATE=1 "
+                "to allow it"
+            )
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs

@@ -252,7 +252,9 @@ def selection_spy(monkeypatch, backend) -> dict:
 
     def spy(self, index, md, slot):
         indices = original(self, index, md, slot)
-        seen["indices"] = indices.clone()
+        # #54873 packed buffer: trailing column is the per-row count, not a token
+        # index — strip it so consumers see pure selections.
+        seen["indices"] = indices[:, :-1].clone()
         return indices
 
     monkeypatch.setattr(QSASparseAttnBackend, "_select", spy)

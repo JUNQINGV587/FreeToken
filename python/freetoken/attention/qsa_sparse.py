@@ -412,6 +412,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
         )
         cmp_pages = self._cmp_pages(slot)
         columns = md.block_table.shape[1] * self.cmp_page_size
+        if not md.is_decode:
+            # vllm #54915: compact the logits workspace to the batch's real context --
+            # no row scores beyond cdiv(max_seq_len, ratio) columns, so the full
+            # page-table width only buys zero-work tiles and wider scratch. Decode
+            # keeps the static full width: its grid is baked into the CUDA graph.
+            need = -(-int(md.kv_len_cpu.max()) // self.ratio)
+            columns = min(columns, max(64, -(-need // 64) * 64))
         indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)
         rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
         # Prefill/extend scores on the TILE_R-packed kernel (vllm #54513 port); decode

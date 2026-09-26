@@ -17,10 +17,17 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
+    # ``build_fla_metadata`` attaches the pinned host cu_seqlens as ``_ft_cpu_shadow``;
+    # deriving chunk counts from it avoids a ``.tolist()`` device sync every prefill step
+    # (the tensor_cache keys on tensor identity and every step builds a fresh cu_seqlens).
+    # Chunk indices are integer metadata: host-derived values are identical to the
+    # device's, so numerics are unaffected.
+    shadow = getattr(cu_seqlens, "_ft_cpu_shadow", None)
+    lens = shadow[1:] - shadow[:-1] if shadow is not None else prepare_lens(cu_seqlens)
     indices = torch.cat(
         [
             torch.arange(n)
-            for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
+            for n in triton.cdiv(lens, chunk_size).tolist()
         ]
     )
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)

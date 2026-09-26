@@ -326,3 +326,37 @@ def test_packed_decode_beta_stays_fp32():
     for i, slot in enumerate((1, 2)):
         ref = beta[i, 0] * v[i].float()[:, None] * k[i].float()[None, :]
         torch.testing.assert_close(state[slot, 0], ref, rtol=1e-5, atol=1e-6)
+
+
+def test_prefill_chunk_indices_use_cpu_shadow(monkeypatch):
+    """vllm #49371-class fix: ``build_fla_metadata`` attaches the pinned host cu_seqlens as
+    ``_ft_cpu_shadow`` so ``prepare_chunk_indices`` derives chunk counts on the CPU. Without
+    the shadow path it calls ``.tolist()`` on the GPU tensor, forcing a device sync every
+    prefill step (the tensor_cache keys on identity and every step builds fresh tensors).
+    """
+    from freetoken.kernel.fla.index import prepare_chunk_indices
+
+    lens = [3, 130, 64, 1]  # ragged: sub-chunk, multi-chunk, exact-chunk, single-token
+    cu_host = torch.tensor([0, *lens], dtype=torch.int64).cumsum_(0)
+    cu_dev = cu_host.to(DEV)
+    cu_dev._ft_cpu_shadow = cu_host
+
+    # Fail if any .tolist() touches a CUDA tensor while the shadow is attached.
+    synced = []
+    orig_tolist = torch.Tensor.tolist
+
+    def spy_tolist(self):
+        if self.is_cuda:
+            synced.append(tuple(self.shape))
+        return orig_tolist(self)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", spy_tolist)
+    out = prepare_chunk_indices(cu_dev, 64)
+    monkeypatch.undo()
+    assert synced == [], f"GPU .tolist() sync despite CPU shadow: {synced}"
+
+    # Values identical to deriving from the device tensor directly (integer metadata).
+    ref = prepare_chunk_indices(cu_host.to(DEV), 64)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    assert out.device == cu_dev.device
+    assert out.dtype == torch.int64

@@ -84,8 +84,13 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
 
     track = _build_track_metadata(reqs, cu_host, device, pin)
 
+    cu_dev = cu_host.to(device, non_blocking=True)
+    # Attach the host copy so FLA's chunk-index prep (kernel/fla/index.py) derives the
+    # per-sequence lengths on the CPU instead of ``.tolist()``-syncing the GPU tensor.
+    cu_dev._ft_cpu_shadow = cu_host
+
     return FLAMetadata(
-        cu_seqlens=cu_host.to(device, non_blocking=True),
+        cu_seqlens=cu_dev,
         cache_indices=idx_host.to(device, non_blocking=True),
         has_initial_state=has_init_host.to(device, non_blocking=True),
         fresh_state_indices=(

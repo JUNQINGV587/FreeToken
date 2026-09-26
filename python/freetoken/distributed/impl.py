@@ -83,12 +83,46 @@ class CustomAllReduceImpl(DistributedImpl):
     ca: Any  # vllm CustomAllreduce
     calls: int = 0
     calls_custom: int = 0
+    # Single-stream guard (semantic port of sglang #31135's host-side fix): the
+    # one-stage kernel is single-in-flight-per-communicator by construction; two
+    # custom ARs in flight on DIFFERENT streams alias the rendezvous state and
+    # hang both ranks permanently (unkillable spin loops). FreeToken currently
+    # issues every AR from the single engine stream (all other streams are copy
+    # streams), but the removed early-prefetch path was exactly such a dual-stream
+    # forward -- serialize cross-stream issues by construction so a future
+    # dual-stream path cannot reintroduce the deadlock. Steady state (same stream
+    # forever) costs one current_stream() + raw-pointer compare per custom AR;
+    # graph replay costs nothing (no host call). Engine-thread-only; no locking.
+    _ar_stream_ptr: int = -1
+    _ar_stream_obj: Any = None
+    _ar_event: Any = None
+
+    def _serialize_ar_stream(self) -> None:
+        cur = torch.cuda.current_stream()
+        ptr = cur.cuda_stream
+        if ptr == self._ar_stream_ptr:
+            return
+        prev = self._ar_stream_obj
+        if prev is not None:
+            ev = self._ar_event
+            if ev is None:
+                ev = self._ar_event = torch.cuda.Event()
+            ev.record(prev)
+            cur.wait_event(ev)
+        self._ar_stream_ptr = ptr
+        self._ar_stream_obj = cur
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         # The counters feed verify_ar_sequence_boot: the donor pairs spin barriers by
         # call order, so per-rank (total, custom-served) counts must match after boot.
         self.calls += 1
-        out = self.ca.custom_all_reduce(x) if not self.ca.disabled else None
+        ca = self.ca
+        if not ca.disabled and not ca._IS_CAPTURING and ca.should_custom_ar(x):
+            # Guard only the custom-issued path (NCCL fallback is multi-in-flight
+            # safe); skip during graph capture (single capturing stream by
+            # construction, and events would perturb the captured topology).
+            self._serialize_ar_stream()
+        out = ca.custom_all_reduce(x) if not ca.disabled else None
         if out is not None:
             self.calls_custom += 1
             return out

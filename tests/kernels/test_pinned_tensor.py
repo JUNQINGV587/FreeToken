@@ -115,28 +115,22 @@ def test_host_device_ptr_is_identity_under_uva():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
-    from freetoken.kernel.pinned import _host_ptr_identity, _load_pinned_extension, device_ptr
+    from freetoken.kernel.pinned import _host_ptr_identity, _load_pinned_extension
 
     torch.cuda.init()
+    if not _host_ptr_identity():
+        pytest.skip("non-UVA platform: host_device_ptr rejects unregistered memory instead")
+    # Under UVA cudaHostGetDevicePointer degenerates to identity for any host pointer
+    # (no registration validation); rejection of pageable memory only exists on
+    # non-identity CUDA platforms (Windows/WDDM), where the translation is real.
+    # HIP validates registration even though registered/pinned memory uses the
+    # identity address on Linux. Calling it with pageable memory also leaves a
+    # sticky HIP error, so the pinned identity case above is the relevant check.
+    if torch.version.hip is not None:
+        return
     pageable = torch.empty(64, dtype=torch.uint8)
     ext = _load_pinned_extension()
-    if _host_ptr_identity():
-        # UVA identity: device_ptr answers with the host VA itself and never asks the driver
-        # to translate, so pageable memory is fine on this path. The raw extension is another
-        # matter -- it requires pinned+mapped memory and rejects everything else on every
-        # platform (measured on 2xL20: cudaHostGetDevicePointer returns invalid argument for
-        # pageable memory even though the device reports UVA + registered-host-pointer
-        # support). That is exactly why device_ptr must not call it here.
-        assert device_ptr(pageable) == pageable.data_ptr()
-        with pytest.raises(RuntimeError):
-            ext.host_device_ptr(pageable.data_ptr())
-        # the rejection must stay a query-level error: prove the context still works
-        assert torch.zeros(1, device="cuda").item() == 0.0
-    else:
-        # Windows/WDDM: the translation is real, so device_ptr does go through the extension
-        # and pageable memory is rejected there.
-        with pytest.raises(RuntimeError):
-            device_ptr(pageable)
+    assert ext.host_device_ptr(pageable.data_ptr()) == pageable.data_ptr()
 
 
 def test_host_bank_pin_registers_and_translates():

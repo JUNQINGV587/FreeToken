@@ -11,6 +11,7 @@ quant modes, and the pool/backend resolution.
 from __future__ import annotations
 
 import pytest
+import torch
 
 from freetoken.attention.base import AttnType
 from freetoken.models.muse_glimmer.config import parse_config
@@ -363,6 +364,10 @@ def _bf16_checkpoint_tensors(hf) -> dict:
 
 
 @pytest.mark.parametrize("include_vision", [False, True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="builds the model; the kernel import chain (sgl_kernel common_ops) ships no CPU variant",
+)
 def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, include_vision):
     """The BF16 loader must produce exactly the model's state-dict keys with the
     right shapes (rename + qkvg / gate_up fusion, norms raw); the image path only
@@ -409,6 +414,10 @@ def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, inclu
     assert torch.equal(fused[-q_dim:], tensors[p + "gate_proj.weight"])
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="builds the model; the kernel import chain (sgl_kernel common_ops) ships no CPU variant",
+)
 def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     """compressed-tensors loader: native FP4 parts fused with per-part scales, the
     reciprocal global, and sibling scales resolved through the index even when they
@@ -537,6 +546,10 @@ def test_raw_config_shim_serves_unknown_model_type(tmp_path):
     assert cfg._name_or_path == str(tmp_path)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="builds the model; the kernel import chain (sgl_kernel common_ops) ships no CPU variant",
+)
 def test_model_state_dict_matches_loader_keys():
     import torch
 

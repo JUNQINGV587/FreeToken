@@ -329,6 +329,10 @@ def checkpoint(request, tmp_path_factory):
 # --------------------------------------------------------------------------- the reader against the engine's model
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="builds the model; the kernel import chain (sgl_kernel common_ops) ships no CPU variant",
+)
 def test_emitted_keys_are_the_model_state_dict(checkpoint):
     """Every layout fills exactly the buffers the engine builds from the same config, with the buffers' shapes and (for the weights) dtypes."""
     _name, folder, _raw = checkpoint

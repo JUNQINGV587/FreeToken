@@ -1139,6 +1139,15 @@ class OffloadMoeCache:
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
 
+    def _effective_fetched(self, missing: int) -> int:
+        """Fetch count for the miss-split metrics. Only the hybrid decode paths
+        increment ``stat_fetched``, so without this fallback the gpu/cpu counters
+        read a misleading constant 0. On the gpu target every miss is served by an
+        H2D fetch (count equals ``missing``); on the cpu target misses never fetch."""
+        if self.decode_target == "hybrid":
+            return int(self.stat_fetched.item())
+        return missing if self.decode_target == "gpu" else 0
+
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
             active = int(self.stat_active.item())
@@ -1146,7 +1155,7 @@ class OffloadMoeCache:
             calls = int(self.stat_calls.item())
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
-        fetched = int(self.stat_fetched.item())
+        fetched = self._effective_fetched(missing)
         return {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
@@ -1291,7 +1300,7 @@ class OffloadMoeCache:
             )
         elif self.collect_stats:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0).tolist())
-            fetched = int(self.stat_fetched.item())
+            fetched = self._effective_fetched(missing)
         else:
             active = missing = calls = fetched = 0
         out.update(

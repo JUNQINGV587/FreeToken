@@ -2340,3 +2340,66 @@ def test_copy_miss_verify_probe_gated_on_disk_tier(monkeypatch, capsys):
 
     cache.copy_missing()
     assert "[copy-miss]" not in capsys.readouterr().out
+
+
+def _stats_cache(decode_target: str):
+    """A minimal CPU cache for the decode-stats getters (no banks needed)."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    return OffloadMoeCache(
+        num_layers=1, num_experts=4, cache_size=4,
+        device=torch.device("cpu"), quant_format="bf16", decode_target=decode_target,
+    )
+
+
+def test_gpu_target_reports_misses_as_fetched():
+    """On decode_target="gpu" every miss is an H2D fetch; fetched_per_layer must equal
+    missing_per_layer instead of reading the hybrid-only counter's constant 0
+    (production showed fetched_per_layer=0.0 while misses were nonzero)."""
+    cache = _stats_cache("gpu")
+    cache.collect_stats = True
+    cache.lru_stats[0] = torch.tensor([100, 8, 10])  # [ACTIVE, MISS, CALLS]
+
+    snap = cache.stats_snapshot()
+    assert snap["missing_per_layer"] == pytest.approx(0.8)
+    assert snap["fetched_per_layer"] == pytest.approx(0.8)
+    assert snap["fetch_rate"] == pytest.approx(1.0)
+
+    stats = cache.decode_miss_stats()
+    assert stats["fetched_per_layer"] == pytest.approx(0.8)
+    assert stats["cpu_per_layer"] == pytest.approx(0.0)
+    assert stats["fetch_rate"] == pytest.approx(1.0)
+
+
+def test_cpu_target_reports_zero_fetches():
+    """On decode_target="cpu" misses are computed on the CPU, never fetched."""
+    cache = _stats_cache("cpu")
+    cache.collect_stats = True
+    cache.lru_stats[0] = torch.tensor([100, 8, 10])
+
+    snap = cache.stats_snapshot()
+    assert snap["fetched_per_layer"] == 0.0
+    assert snap["fetch_rate"] == 0.0
+
+    stats = cache.decode_miss_stats()
+    assert stats["fetched_per_layer"] == 0.0
+    assert stats["cpu_per_layer"] == pytest.approx(0.8)
+
+
+def test_hybrid_target_keeps_the_real_split():
+    """The hybrid path must keep reporting its own PCIe/CPU split untouched."""
+    cache = _stats_cache("hybrid")
+    cache.stat_active += 100
+    cache.stat_missing += 8
+    cache.stat_fetched += 5
+    cache.stat_calls += 10
+
+    stats = cache.decode_miss_stats()
+    assert stats["fetched_per_layer"] == pytest.approx(0.5)
+    assert stats["cpu_per_layer"] == pytest.approx(0.3)
+    assert stats["fetch_rate"] == pytest.approx(5 / 8)
+
+    snap = cache.stats_snapshot()
+    assert snap["fetched_per_layer"] == pytest.approx(0.5)
+    assert snap["fetch_rate"] == pytest.approx(5 / 8)

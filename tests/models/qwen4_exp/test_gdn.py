@@ -290,3 +290,73 @@ def test_output_gate_comes_from_the_config():
     torch.testing.assert_close(out_sig.float(), _ref_out(ref_sig, hidden[0]), rtol=RTOL, atol=ATOL)
 
     assert (out_sig.float() - out_silu.float()).abs().max().item() > 10 * ATOL
+
+
+def test_packed_decode_beta_stays_fp32():
+    """Regression: the packed decode kernel must not round-trip sigmoid(beta) through bf16.
+
+    With a zero initial state the recurrence collapses to ``ht = beta * v (x) k``,
+    so the fp32 state reads beta back directly; a bf16 round-trip lands ~1e-3
+    away, far outside the fp32 tolerance used here.
+    """
+    from freetoken.kernel.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_packed_decode,
+    )
+
+    torch.manual_seed(23)
+    B, H, HV, K, V = 2, 1, 1, 128, 128
+    q = torch.zeros(B, H * K, device=DEV, dtype=torch.bfloat16)
+    k = torch.zeros(B, H * K, device=DEV, dtype=torch.bfloat16)
+    q[:, 0] = k[:, 0] = 1.0
+    v = torch.rand(B, HV * V, device=DEV, dtype=torch.bfloat16) + 0.5
+    mixed_qkv = torch.cat([q, k, v], dim=1)
+    a = torch.randn(B, HV, device=DEV, dtype=torch.bfloat16)
+    b = torch.randn(B, HV, device=DEV, dtype=torch.bfloat16) * 2
+    A_log = torch.zeros(HV, device=DEV, dtype=torch.float32)
+    dt_bias = torch.zeros(HV, device=DEV, dtype=torch.float32)
+    state = torch.zeros(3, HV, V, K, device=DEV, dtype=torch.float32)
+    out = torch.empty(B, 1, HV, V, device=DEV, dtype=torch.bfloat16)
+    idx = torch.tensor([1, 2], dtype=torch.int32, device=DEV)
+
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv, a, b, A_log, dt_bias, 1.0, state, out, idx
+    )
+
+    beta = b.float().sigmoid()
+    for i, slot in enumerate((1, 2)):
+        ref = beta[i, 0] * v[i].float()[:, None] * k[i].float()[None, :]
+        torch.testing.assert_close(state[slot, 0], ref, rtol=1e-5, atol=1e-6)
+
+
+def test_prefill_chunk_indices_use_cpu_shadow(monkeypatch):
+    """vllm #49371-class fix: ``build_fla_metadata`` attaches the pinned host cu_seqlens as
+    ``_ft_cpu_shadow`` so ``prepare_chunk_indices`` derives chunk counts on the CPU. Without
+    the shadow path it calls ``.tolist()`` on the GPU tensor, forcing a device sync every
+    prefill step (the tensor_cache keys on identity and every step builds fresh tensors).
+    """
+    from freetoken.kernel.fla.index import prepare_chunk_indices
+
+    lens = [3, 130, 64, 1]  # ragged: sub-chunk, multi-chunk, exact-chunk, single-token
+    cu_host = torch.tensor([0, *lens], dtype=torch.int64).cumsum_(0)
+    cu_dev = cu_host.to(DEV)
+    cu_dev._ft_cpu_shadow = cu_host
+
+    # Fail if any .tolist() touches a CUDA tensor while the shadow is attached.
+    synced = []
+    orig_tolist = torch.Tensor.tolist
+
+    def spy_tolist(self):
+        if self.is_cuda:
+            synced.append(tuple(self.shape))
+        return orig_tolist(self)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", spy_tolist)
+    out = prepare_chunk_indices(cu_dev, 64)
+    monkeypatch.undo()
+    assert synced == [], f"GPU .tolist() sync despite CPU shadow: {synced}"
+
+    # Values identical to deriving from the device tensor directly (integer metadata).
+    ref = prepare_chunk_indices(cu_host.to(DEV), 64)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    assert out.device == cu_dev.device
+    assert out.dtype == torch.int64

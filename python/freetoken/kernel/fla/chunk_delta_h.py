@@ -112,7 +112,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
     h0 = initial_state + index * stride_h
     ht = initial_state + index * stride_h
     if USE_INITIAL_STATE:

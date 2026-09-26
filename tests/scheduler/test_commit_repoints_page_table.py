@@ -89,6 +89,9 @@ def test_lazy_free_snapshots_the_rows_it_was_handed():
     page_table = torch.zeros(2, 8, dtype=torch.int32)
     cm = CacheManager(8, 1, page_table, "radix")
     page_table[0, :4] = torch.tensor([4, 5, 6, 7], dtype=torch.int32)
+    # pages 4-7 stand in as allocated: _append_free now filters pages that are
+    # still sitting in free_slots (double free), so take them out of the pool first
+    cm.free_slots = cm.free_slots[~torch.isin(cm.free_slots, page_table[0, :4])]
     before = cm.free_slots.clone()
 
     with cm.lazy_free_region():

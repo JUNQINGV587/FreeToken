@@ -115,6 +115,7 @@ def _index_norm_rope_kernel(
     stride_out_row,
     stride_cos_sin_row,
     num_rows,
+    out_rows,
     eps,
     HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -156,7 +157,9 @@ def _index_norm_rope_kernel(
 
     if HAS_DEST_ROWS:
         dest = tl.load(dest_rows_ptr + rows, mask=live, other=-1)
-        live = live & (dest >= 0)
+        # Bound dest against the out tensor: a garbage row index here is a wild write
+        # into (and past) the cmp slab, which later reads back as poisoned page numbers.
+        live = live & (dest >= 0) & (dest < out_rows)
         dest_row = tl.maximum(dest, 0).to(tl.int64)
     else:
         dest_row = rows.to(tl.int64)
@@ -284,6 +287,7 @@ def qsa_index_norm_rope(
         out.stride(0),
         cos_sin_cache.stride(0),
         rows,
+        out.shape[0],
         eps,
         HEADS=heads,
         HEAD_DIM=head_dim,

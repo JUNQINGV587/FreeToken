@@ -432,6 +432,10 @@ def test_decode_triton_attention_with_sinks_matches_reference():
         (256, 8, None, [0, 0], [5, 3]),
         (256, 8, 4, [3, 2], [4, 3]),
         (512, 2, None, [2, 4], [3, 2]),
+        # Long prefix >> window: exercises the sglang-#34462 loop bounds (prefix floor,
+        # extend floor) skipping real tiles; must stay bit-identical to the reference.
+        (128, 4, 64, [700, 900], [130, 200]),
+        (256, 8, 128, [4096], [513]),
     ],
 )
 def test_extend_triton_attention_matches_reference(

@@ -541,7 +541,17 @@ def _extend_attention_kernel(
         l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_DV), dtype=tl.float32)
 
-    for start_n in tl.range(0, kv_loop_end, BLOCK_N):
+    # The window mask keeps (q, kv) iff kv + SLIDING_WINDOW > q_abs; the smallest q_abs
+    # in this block is prefix_len + block_m_id * BLOCK_M, so no tile under this floor can
+    # hold an unmasked element. skip_tile already made those tiles exact no-ops, so
+    # bounding the loop is bit-identical and drops their cross-wave tl.max reduction
+    # (sglang #34462, extended here to the prefix loop).
+    kv_loop_start = 0
+    if SLIDING_WINDOW > 0:
+        kv_loop_start = (
+            tl.maximum(prefix_len + block_m_id * BLOCK_M - SLIDING_WINDOW, 0) // BLOCK_N
+        ) * BLOCK_N
+    for start_n in tl.range(kv_loop_start, kv_loop_end, BLOCK_N):
         kv_offsets = start_n + offs_n
         mask_n = kv_offsets < kv_len
         key_pos = kv_offsets
@@ -669,7 +679,15 @@ def _extend_attention_split_kernel(
         l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_DV), dtype=tl.float32)
 
-    for start_n in tl.range(0, prefix_len, BLOCK_N):
+    # Same window-floor bound as the merged kernel (bit-identical: skip_tile already made
+    # sub-floor tiles exact no-ops; sglang #34462). q_abs min in block is
+    # prefix_len + block_m_id * BLOCK_M.
+    prefix_start = 0
+    if SLIDING_WINDOW > 0:
+        prefix_start = (
+            tl.maximum(prefix_len + block_m_id * BLOCK_M - SLIDING_WINDOW, 0) // BLOCK_N
+        ) * BLOCK_N
+    for start_n in tl.range(prefix_start, prefix_len, BLOCK_N):
         kv_offsets = start_n + offs_n
         mask_n = kv_offsets < prefix_len
         key_pos = kv_offsets
@@ -720,7 +738,15 @@ def _extend_attention_split_kernel(
         current_end = tl.minimum(q_len, tl.maximum(current_end, tl.max(block_end, axis=0)))
     else:
         block_end = tl.zeros((BLOCK_M,), dtype=tl.int32)
-    for start_n in tl.range(0, current_end, BLOCK_N):
+    # Local-coordinate window floor for the extend loop: q_local min in block is
+    # block_m_id * BLOCK_M; tiles under it are all-masked even with HAS_BLOCKS (the
+    # window mask is ANDed last). Bit-identical to skipping them via skip_tile.
+    extend_start = 0
+    if SLIDING_WINDOW > 0:
+        extend_start = (
+            tl.maximum(block_m_id * BLOCK_M - SLIDING_WINDOW, 0) // BLOCK_N
+        ) * BLOCK_N
+    for start_n in tl.range(extend_start, current_end, BLOCK_N):
         local_kv_offsets = start_n + offs_n
         mask_n = local_kv_offsets < current_end
         local_q_pos = offs_m

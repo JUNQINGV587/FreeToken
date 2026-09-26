@@ -687,7 +687,13 @@ def _extend_attention_split_kernel(
         prefix_start = (
             tl.maximum(prefix_len + block_m_id * BLOCK_M - SLIDING_WINDOW, 0) // BLOCK_N
         ) * BLOCK_N
-    for start_n in tl.range(prefix_start, prefix_len, BLOCK_N):
+    # Absolute-grid alignment (issue #31): the prefix loop stops at the BLOCK_N-aligned
+    # floor of prefix_len and the extend loop tiles on ABSOLUTE coordinates, so the tile
+    # that straddles the prefix/extend boundary is processed as ONE mixed-source tile with
+    # the same [floor(P/N)*N, +N) segmentation a cold full prefill (prefix_len=0) uses.
+    # Cold vs cache-hit extend then merge identical tiles in identical order => bitwise.
+    prefix_al_end = (prefix_len // BLOCK_N) * BLOCK_N
+    for start_n in tl.range(prefix_start, prefix_al_end, BLOCK_N):
         kv_offsets = start_n + offs_n
         mask_n = kv_offsets < prefix_len
         key_pos = kv_offsets
@@ -746,8 +752,16 @@ def _extend_attention_split_kernel(
         extend_start = (
             tl.maximum(block_m_id * BLOCK_M - SLIDING_WINDOW, 0) // BLOCK_N
         ) * BLOCK_N
-    for start_n in tl.range(extend_start, current_end, BLOCK_N):
-        local_kv_offsets = start_n + offs_n
+    # Iterate ABSOLUTE key positions aligned to the global BLOCK_N grid (issue #31):
+    # local = absolute - prefix_len. The first tile (start_abs < prefix_len) is the
+    # straddle tile mixing cache keys [start_abs, prefix_len) with extend keys
+    # [prefix_len, start_abs + BLOCK_N); all later tiles are pure extend. Cold prefill
+    # (prefix_len = 0) reduces to the previous 0-aligned local loop exactly.
+    ext_start_abs = ((extend_start + prefix_len) // BLOCK_N) * BLOCK_N
+    for start_abs in tl.range(ext_start_abs, prefix_len + current_end, BLOCK_N):
+        abs_off = start_abs + offs_n
+        local_kv_offsets = abs_off - prefix_len
+        is_cache = abs_off < prefix_len
         mask_n = local_kv_offsets < current_end
         local_q_pos = offs_m
         causal_mask = local_kv_offsets[None, :] <= local_q_pos[:, None]
@@ -764,14 +778,39 @@ def _extend_attention_split_kernel(
             skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not skip_tile:
-            k = tl.load(
-                k_extend_ptr
-                + (q_start + local_kv_offsets[None, :]) * stride_ket
-                + kv_head * stride_keh
-                + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
+            if start_abs < prefix_len:
+                # Straddle tile: cache lanes (< prefix_len) from the paged cache via
+                # kv_indices, extend lanes from k_extend; values identical either way,
+                # gathered so this tile matches the cold-prefill segmentation bitwise.
+                slots = tl.load(
+                    kv_indices_ptr + kv_start + abs_off, mask=is_cache & mask_n, other=0
+                )
+                kc = tl.load(
+                    k_cache_ptr
+                    + slots[None, :] * stride_kcs
+                    + kv_head * stride_kch
+                    + offs_d[:, None],
+                    mask=(is_cache & mask_n)[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
+                ke = tl.load(
+                    k_extend_ptr
+                    + (q_start + local_kv_offsets[None, :]) * stride_ket
+                    + kv_head * stride_keh
+                    + offs_d[:, None],
+                    mask=(~is_cache & mask_n)[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
+                k = tl.where(is_cache[None, :], kc, ke)
+            else:
+                k = tl.load(
+                    k_extend_ptr
+                    + (q_start + local_kv_offsets[None, :]) * stride_ket
+                    + kv_head * stride_keh
+                    + offs_d[:, None],
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -781,14 +820,36 @@ def _extend_attention_split_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
 
-            v = tl.load(
-                v_extend_ptr
-                + (q_start + local_kv_offsets[:, None]) * stride_vet
-                + kv_head * stride_veh
-                + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if start_abs < prefix_len:
+                slots_v = tl.load(
+                    kv_indices_ptr + kv_start + abs_off, mask=is_cache & mask_n, other=0
+                )
+                vc = tl.load(
+                    v_cache_ptr
+                    + slots_v[:, None] * stride_vcs
+                    + kv_head * stride_vch
+                    + offs_dv[None, :],
+                    mask=(is_cache & mask_n)[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+                ve = tl.load(
+                    v_extend_ptr
+                    + (q_start + local_kv_offsets[:, None]) * stride_vet
+                    + kv_head * stride_veh
+                    + offs_dv[None, :],
+                    mask=(~is_cache & mask_n)[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+                v = tl.where(is_cache[:, None], vc, ve)
+            else:
+                v = tl.load(
+                    v_extend_ptr
+                    + (q_start + local_kv_offsets[:, None]) * stride_vet
+                    + kv_head * stride_veh
+                    + offs_dv[None, :],
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new

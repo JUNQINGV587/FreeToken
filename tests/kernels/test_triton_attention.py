@@ -888,3 +888,74 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
     assert metadata.indices.tolist() == [10, 11, 20, 21, 22]
     assert metadata.swa_indices is not None
     assert metadata.swa_indices.tolist() == [110, 111, 120, 121, 122]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize("sliding_window", [None, 1024])
+def test_extend_matches_cold_prefill_bitwise(sliding_window: int | None):
+    """Issue #31: a cache-hit extend must produce BITWISE the same outputs as a cold
+    full prefill over the same tokens. The extend kernel tiles the extend segment on
+    the absolute BLOCK_N grid and the prefix loop stops at the aligned floor of
+    prefix_len, so the straddle tile is one mixed-source tile with cold's exact
+    segmentation. Ragged (non-BLOCK_N-multiple) prefixes and scrambled cache slots
+    included.
+    """
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_q_heads, num_kv_heads, head_dim = 4, 1, 128
+    sm_scale = head_dim**-0.5
+    specs = [(100, 30), (2050, 256), (65, 2)]  # (total_len, extend_len), ragged prefixes
+    B = len(specs)
+
+    q_all = torch.randn(sum(n for n, _ in specs), num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_all = torch.randn(q_all.shape[0], num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_all = torch.randn_like(k_all)
+    qo = [0]
+    for n, _ in specs:
+        qo.append(qo[-1] + n)
+    empty = torch.zeros(0, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    o_cold = extend_paged_attention(
+        q_all, empty, empty,
+        qo_indptr=torch.tensor(qo, dtype=torch.int32, device=device),
+        kv_indptr=torch.zeros(B + 1, dtype=torch.int32, device=device),
+        kv_indices=torch.zeros(0, dtype=torch.int32, device=device),
+        prefix_lens=torch.zeros(B, dtype=torch.int32, device=device),
+        max_q_len=max(n for n, _ in specs), sm_scale=sm_scale,
+        sliding_window=sliding_window, k_extend=k_all, v_extend=v_all,
+    )
+
+    total_p = sum(n - m for n, m in specs)
+    k_pool = torch.randn(total_p, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_pool = torch.randn_like(k_pool)
+    perm = torch.randperm(total_p, device=device)
+    qi, kvi, pl, idx = [0], [0], [], []
+    off = 0
+    for i, (n, m) in enumerate(specs):
+        p = n - m
+        pl.append(p)
+        idx.append(perm[off:off + p].to(torch.int32))
+        k_pool[perm[off:off + p]] = k_all[qo[i]:qo[i] + p]
+        v_pool[perm[off:off + p]] = v_all[qo[i]:qo[i] + p]
+        off += p
+        qi.append(qi[-1] + m)
+        kvi.append(kvi[-1] + p)
+    q_ext = torch.cat([q_all[qo[i] + n - m:qo[i] + n] for i, (n, m) in enumerate(specs)])
+    k_ext = torch.cat([k_all[qo[i] + n - m:qo[i] + n] for i, (n, m) in enumerate(specs)])
+    v_ext = torch.cat([v_all[qo[i] + n - m:qo[i] + n] for i, (n, m) in enumerate(specs)])
+    o_ext = extend_paged_attention(
+        q_ext, k_pool, v_pool,
+        qo_indptr=torch.tensor(qi, dtype=torch.int32, device=device),
+        kv_indptr=torch.tensor(kvi, dtype=torch.int32, device=device),
+        kv_indices=torch.cat(idx),
+        prefix_lens=torch.tensor(pl, dtype=torch.int32, device=device),
+        max_q_len=max(m for _, m in specs), sm_scale=sm_scale,
+        sliding_window=sliding_window, k_extend=k_ext, v_extend=v_ext,
+    )
+    ref = torch.cat([o_cold[qo[i] + n - m:qo[i] + n] for i, (n, m) in enumerate(specs)])
+
+    assert torch.equal(o_ext, ref), (
+        f"extend-vs-cold diverged: maxdiff="
+        f"{(o_ext.float() - ref.float()).abs().max().item():.3e}"
+    )

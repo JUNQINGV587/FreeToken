@@ -24,7 +24,9 @@ def gdn_prefill_chunk_fla(
     Returns ``o`` of shape ``[total, num_v_heads, head_v_dim]`` (bf16).
 
     When ``return_h=True`` also returns the per-chunk hidden-state buffer ``h`` of shape
-    ``[1, NT_total, num_v_heads, head_v_dim, head_k_dim]`` (bf16). ``h[0, boh_i + c]`` is the
+    ``[1, NT_total, num_v_heads, head_v_dim, head_k_dim]`` (fp32 — the snapshot must keep
+    the kernel's inter-chunk register precision; a bf16-rounded snapshot makes a resumed
+    continuation diverge from a cold full prefill). ``h[0, boh_i + c]`` is the
     recurrent state after ``c*64`` tokens of packed sequence ``i`` (chunk granularity 64), where
     ``boh_i = prepare_chunk_offsets(cu_seqlens, 64)[i]``. Note the last two dims are ``[V, K]`` --
     transposed vs ``state_source``'s ``[K, V]``. Used by the hybrid-radix track-checkpoint path."""

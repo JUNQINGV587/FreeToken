@@ -80,6 +80,18 @@ def _expand_qsa_indices_kernel(
         tl.where(valid, token, -1),
         mask=(row < rows) & (columns < OUTPUT_WIDTH),
     )
+    # TRAILING COUNT COLUMN (vllm #54873): the packed buffer is OUTPUT_WIDTH+1
+    # wide; the last column holds this row's valid-entry count (expanded blocks
+    # plus causal tail). It is NOT a token index — the sparse attention kernel
+    # reads it as the row's tile-loop bound. Inert rows (invalid request, e.g.
+    # CUDA-graph padding) carry a zero count = empty loop bound.
+    if tl.program_id(1) == 0:
+        live_row = (request >= 0) & (request < num_requests)
+        tl.store(
+            output_ptr + row * stride_output_row + OUTPUT_WIDTH * stride_output_column,
+            tl.where(live_row, expanded_count + tail_count, 0),
+            mask=row < rows,
+        )
 
 
 def expand_qsa_block_indices(
@@ -91,7 +103,12 @@ def expand_qsa_block_indices(
     token_topk: int,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Expand compressed blocks and compact the causal tail of the open group."""
+    """Expand compressed blocks and compact the causal tail of the open group.
+
+    ``out`` is the PACKED buffer [rows, output_width + 1]: columns
+    [0, output_width) hold ``-1``-padded token indices and the trailing column
+    each row's valid-entry count (the attention kernel's tile-loop bound).
+    """
 
     if token_topk % compress_ratio:
         raise ValueError("QSA token top-k must be divisible by compression ratio")
@@ -99,7 +116,8 @@ def expand_qsa_block_indices(
     output_width = token_topk + compress_ratio - 1
     if block_indices.shape != (query_positions.numel(), block_topk):
         raise ValueError("QSA compressed top-k has an invalid shape")
-    if out.shape != (block_indices.shape[0], output_width):
+    # +1: trailing column holds the per-row valid-entry count, never an index.
+    if out.shape != (block_indices.shape[0], output_width + 1):
         raise ValueError("QSA expansion output has an invalid shape")
     if not block_indices.shape[0]:
         return out

@@ -419,7 +419,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             # keeps the static full width: its grid is baked into the CUDA graph.
             need = -(-int(md.kv_len_cpu.max()) // self.ratio)
             columns = min(columns, max(64, -(-need // 64) * 64))
-        indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)
+        # +1: trailing column carries each row's valid-entry count (vllm #54873).
+        indices = self._scratch("indices", rows, self.select_width + 1, dtype=torch.int32)
         rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
         # Prefill/extend scores on the TILE_R-packed kernel (vllm #54513 port); decode
         # stays on the per-row kernel bit-for-bit (CUDA-graph captured, dql is always 1).
@@ -540,7 +541,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "logits": empty(chunk, columns, dtype=torch.float32),
             "visible": empty(max_bs, dtype=torch.int32),
             "blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
-            "indices": empty(max_bs, self.select_width, dtype=torch.int32),
+            "indices": empty(max_bs, self.select_width + 1, dtype=torch.int32),
             "pooled": empty(max_bs, self.index_head_dim, dtype=self.dtype),
             "first_pos": empty(max_bs, dtype=torch.int32),
             "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),

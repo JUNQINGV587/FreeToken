@@ -171,7 +171,8 @@ def test_top_blocks_and_expansion_match_vllm_reference(length: int, bs: int, tor
     torch.testing.assert_close(blocks.sort(-1).values, expected_blocks.sort(-1).values)
 
     row_seq_lens = case.seq_lens.index_select(0, case.token_to_req.long())
-    indices = torch.empty(rows, BUDGET + RATIO - 1, dtype=torch.int32, device=case.device)
+    # Packed buffer (vllm #54873): index region plus the trailing count column.
+    indices = torch.empty(rows, BUDGET + RATIO - 1 + 1, dtype=torch.int32, device=case.device)
     expand_qsa_block_indices(
         expected_blocks, case.query_positions, case.seq_lens, case.token_to_req,
         RATIO, BUDGET, indices,
@@ -179,7 +180,9 @@ def test_top_blocks_and_expansion_match_vllm_reference(length: int, bs: int, tor
     expected = _expand_qsa_indices_reference(
         expected_blocks, case.query_positions, row_seq_lens, RATIO, BUDGET
     )
-    torch.testing.assert_close(indices, expected)
+    torch.testing.assert_close(indices[:, :-1], expected)
+    expected_counts = (expected >= 0).sum(dim=1, dtype=torch.int32)
+    torch.testing.assert_close(indices[:, -1], expected_counts)
 
 
 @requires_cuda

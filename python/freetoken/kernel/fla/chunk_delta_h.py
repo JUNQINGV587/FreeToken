@@ -321,7 +321,10 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    # fp32, not k.dtype: h feeds the hybrid-radix track snapshots, and the cold
+    # path carries the inter-chunk state in fp32 registers -- a bf16 h restarts a
+    # resumed continuation from a rounded state (P3-29 cold-vs-resume divergence).
+    h = k.new_empty(B, NT, H, V, K, dtype=torch.float32)
 
     v_new = torch.empty_like(u) if save_new_value else None
 

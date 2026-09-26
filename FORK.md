@@ -260,3 +260,31 @@ low-risk picks (snapshot_lru eviction order, --linear-state-cache-ratio, invaria
 cross-conversation test) REMAIN merged - they are not implicated: the crash path (donation +
 hit-restore of donated boundaries) does not exist without the reverted commits.
 Detail: `research/notes/freetoken/202609-freetoken-upstream-research.md` section 12.4.
+
+**2026-09-26** (base `d1713b75`, merge `origin/main` `0d652e73` + two PRs):
+
+- `origin/main` `0d652e73` (4 commits). **#546** (overlap token limits / cache safety) was
+  already carried in this fork -- scheduler `hit_length` used the `max_device_len` form,
+  `OffloadMoeCache` already zero-filled `bank_caches` (with the more detailed
+  ``0 * NaN`` rationale, kept), and `cache_status._swa` already reported the usable
+  floors; the merge conflicts there were context drift and resolved to our side.
+  **#548** extracts the PLE disk row store into `kernel/row_store.py` and renames the
+  compiled extension `_ple_store` -> `_row_store` (behavior-preserving; rebuilt
+  in-place, `tests/kernels/test_row_store.py` + `test_ple_disk.py` pass on GPU).
+  **#132** ROCm RDNA3/RDNA4 runtime foundation: taken now that it is upstream, mostly
+  additive and guarded (user decision). Two conflicts resolved by keeping ours:
+  `pynccl.py` keeps the NCCL-wheel absolute-path logic over their bare `-lnccl`, and
+  `test_pinned_tensor.py` keeps the measured 2xL20 UVA contract (the raw
+  `host_device_ptr` rejects pageable memory even under UVA) over #132's
+  degenerate-identity assumption. #545 (pin flashinfer) came along with the merge.
+- **#551** higher uv install timeout/retries. Install-only, one line.
+- **#553** cumulative prefill/decode timing on `/v1/stats` (cherry-picked, `stats.py`
+  conflict resolved as a union): a poller can now diff two polls into speeds, which the
+  5 s sliding windows cannot express. Its `cached_prompt_tokens_total` mirrors this
+  fork's existing `cached_tokens_total` (same `UserReply.cached_tokens` source); both
+  names are emitted so fork tooling and upstream alignment both hold.
+
+Tests after the sync: CPU 10 passed (`test_rocm_arch`, `test_stats_timing`,
+`test_rocm_launch_kwargs` skips off-ROCm); GPU 15 passed (`test_row_store`,
+`test_ple_disk`, `test_pinned_tensor`), 0 Xid; regression `tests/moe+engine+utils+server`
+1316 passed / 128 skipped / 0 failed.

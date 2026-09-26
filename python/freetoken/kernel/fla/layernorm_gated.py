@@ -261,4 +261,70 @@ def rms_norm_gated(
     return y.reshape(x_shape_og)
 
 
-__all__ = ["rms_norm_gated"]
+def warmup_gated_rms_norm(model, x_dtype: torch.dtype = torch.bfloat16) -> int:
+    """Pre-compile every (M, ROWS_PER_BLOCK) bucket of the fused gated RMSNorm kernel.
+
+    Concept port of vllm #54251 (``qwen_triton_warmup``). ``Engine._warmup_prefill``
+    only exercises prefill lengths below ``2 * sm_count`` (plus a few %16-aligned large
+    lens), so the ROWS_PER_BLOCK=2 bucket — and the non-%16 M class at
+    ROWS_PER_BLOCK=4 — used to JIT-compile mid-request on the first large prefill.
+    Triton re-specializes integer args on {==1, %16==0, other} and this kernel derives
+    ROWS_PER_BLOCK from M via ``calc_rows_per_block`` (flips at M > 2*sm and M > 4*sm),
+    so one dummy launch per (M class x rows-per-block) cell covers the whole compile
+    space for a given (dim, activation, weight dtype) combo.
+
+    Zero numerical impact: dummy inputs, outputs discarded. Returns the number of
+    distinct GatedRMSNorm geometries warmed. Must run AFTER weights are loaded
+    (``BaseOP.load_state_dict`` replaces the placeholder tensor, fixing dtype/device).
+    """
+    if not torch.cuda.is_available():
+        return 0
+    from freetoken.layers.norm import GatedRMSNorm  # lazy: layers.norm imports this module
+
+    seen_objects: set[int] = set()
+    combos: dict[tuple, torch.Tensor] = {}
+
+    def visit(value) -> None:
+        value_id = id(value)
+        if value_id in seen_objects:
+            return
+        seen_objects.add(value_id)
+        if isinstance(value, GatedRMSNorm):
+            w = value.weight
+            if isinstance(w, torch.Tensor) and w.is_cuda:
+                combos[(w.shape[0], value.activation, w.dtype, w.device)] = w
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+            return
+        if hasattr(value, "__dict__"):
+            for name, item in vars(value).items():
+                if not name.startswith("_"):
+                    visit(item)
+
+    visit(model)
+    if not combos:
+        return 0
+
+    for (n, activation, _dtype, device), weight in sorted(combos.items(), key=str):
+        sm2 = 2 * _get_sm_count(device)
+        # (M class in {==1, %16==0, other}) x (ROWS_PER_BLOCK in {1, 2, 4}):
+        # rpb=1 below sm2, rpb=2 on (sm2, 2*sm2], rpb=4 above 2*sm2
+        ms = {1, 16, 17, sm2 + 1, 2 * sm2, 2 * sm2 + 1, 4 * sm2}
+        x = torch.empty((max(ms), n), dtype=x_dtype, device=device)
+        z = torch.empty((max(ms), n), dtype=x_dtype, device=device)
+        for m in sorted(ms):
+            rms_norm_gated(
+                x=x[:m], weight=weight, bias=None, z=z[:m], eps=1e-6,
+                is_rms_norm=True, norm_before_gate=True, activation=activation,
+            )
+    torch.cuda.synchronize()
+    return len(combos)
+
+
+__all__ = ["rms_norm_gated", "warmup_gated_rms_norm"]

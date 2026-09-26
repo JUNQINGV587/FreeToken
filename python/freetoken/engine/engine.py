@@ -596,6 +596,13 @@ class Engine:
         # accumulation with every step. No warning is needed and graphs must not be disabled
         # for it.
         if config.prefill_warmup:
+            from freetoken.kernel.fla.layernorm_gated import warmup_gated_rms_norm
+
+            warmed = warmup_gated_rms_norm(self.model)
+            if warmed:
+                logger.info_rank0(
+                    f"Pre-compiled gated RMSNorm kernel buckets for {warmed} norm geometries"
+                )
             self._warmup_prefill()
 
     def _make_distributed_store(self, config: EngineConfig) -> torch.distributed.Store:

@@ -290,3 +290,39 @@ def test_output_gate_comes_from_the_config():
     torch.testing.assert_close(out_sig.float(), _ref_out(ref_sig, hidden[0]), rtol=RTOL, atol=ATOL)
 
     assert (out_sig.float() - out_silu.float()).abs().max().item() > 10 * ATOL
+
+
+def test_packed_decode_beta_stays_fp32():
+    """Regression: the packed decode kernel must not round-trip sigmoid(beta) through bf16.
+
+    With a zero initial state the recurrence collapses to ``ht = beta * v (x) k``,
+    so the fp32 state reads beta back directly; a bf16 round-trip lands ~1e-3
+    away, far outside the fp32 tolerance used here.
+    """
+    from freetoken.kernel.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_packed_decode,
+    )
+
+    torch.manual_seed(23)
+    B, H, HV, K, V = 2, 1, 1, 128, 128
+    q = torch.zeros(B, H * K, device=DEV, dtype=torch.bfloat16)
+    k = torch.zeros(B, H * K, device=DEV, dtype=torch.bfloat16)
+    q[:, 0] = k[:, 0] = 1.0
+    v = torch.rand(B, HV * V, device=DEV, dtype=torch.bfloat16) + 0.5
+    mixed_qkv = torch.cat([q, k, v], dim=1)
+    a = torch.randn(B, HV, device=DEV, dtype=torch.bfloat16)
+    b = torch.randn(B, HV, device=DEV, dtype=torch.bfloat16) * 2
+    A_log = torch.zeros(HV, device=DEV, dtype=torch.float32)
+    dt_bias = torch.zeros(HV, device=DEV, dtype=torch.float32)
+    state = torch.zeros(3, HV, V, K, device=DEV, dtype=torch.float32)
+    out = torch.empty(B, 1, HV, V, device=DEV, dtype=torch.bfloat16)
+    idx = torch.tensor([1, 2], dtype=torch.int32, device=DEV)
+
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv, a, b, A_log, dt_bias, 1.0, state, out, idx
+    )
+
+    beta = b.float().sigmoid()
+    for i, slot in enumerate((1, 2)):
+        ref = beta[i, 0] * v[i].float()[:, None] * k[i].float()[None, :]
+        torch.testing.assert_close(state[slot, 0], ref, rtol=1e-5, atol=1e-6)

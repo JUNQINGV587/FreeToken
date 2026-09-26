@@ -32,6 +32,7 @@ from freetoken.mm import restore_placeholder
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
 from freetoken.kernel.triton.ple_gate import fused_gate_enabled
+from freetoken.kernel.triton.ple_conv import fused_conv_enabled
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -728,6 +729,8 @@ class PLELayer(BaseOP):
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
+        if R.is_cuda and fused_conv_enabled():
+            return self._short_conv_fused(x, meta, states, gated)
         return gated + self._short_conv(x, meta, states)
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
@@ -763,6 +766,29 @@ class PLELayer(BaseOP):
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
         return self._prefill_conv(x, meta, states)
+
+    def _short_conv_fused(
+        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        """vllm #54517 fused conv: silu(conv) added into ``residual`` in place, state rolled.
+
+        Returns ``residual``. Not bit-identical to the eager path (tap accumulation
+        order), deterministic per run; see kernel/triton/ple_conv.py.
+        """
+        from freetoken.kernel.triton.ple_conv import ple_conv
+
+        ple_conv(
+            x,
+            residual,
+            states,
+            self.conv1d.weight.squeeze(1),
+            meta.state_slots,
+            mode="decode" if meta.is_decode else "prefill",
+            dilation=self.dilation,
+            query_start_loc=None if meta.is_decode else meta.cu_seqlens,
+            has_initial_states=None if meta.fresh_slots is None else ~meta.fresh_slots,
+        )
+        return residual
 
     def _decode_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor

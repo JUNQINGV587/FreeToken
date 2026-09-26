@@ -532,3 +532,38 @@ def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
     assert len(cache.bank_sources["gate_up"]) == L
     assert sum(t.shape[0] for t in cache.bank_sources["gate_up"]) == total
     assert cache.gate_up_alpha.shape == (total,)
+
+
+@marlin
+@cuda
+def test_marlin_nan_canary(monkeypatch):
+    """FREETOKEN_MARLIN_NAN_CANARY=1 turns a NaN marlin MoE output into a hard error
+    (vllm #45660 stale-c_tmp guard); default off and silent."""
+    import vllm.model_executor.layers.fused_moe.fused_marlin_moe as fmm_mod
+    from freetoken.layers.quantization.moe.nvfp4 import marlin_fused_experts
+
+    def fake_marlin(*args, **kwargs):
+        return torch.full((4, H), float("nan"), device="cuda", dtype=torch.bfloat16)
+
+    monkeypatch.setattr(fmm_mod, "fused_marlin_moe", fake_marlin)
+    dev = torch.device("cuda")
+    kw = dict(
+        hidden_states=torch.empty(4, H, device=dev),
+        gate_up_q=torch.empty(E, 1, device=dev),
+        gate_up_s=torch.empty(1, device=dev),
+        gate_up_alpha=torch.zeros(E, device=dev),
+        down_q=torch.empty(E, 1, device=dev),
+        down_s=torch.empty(1, device=dev),
+        down_alpha=torch.zeros(E, device=dev),
+        topk_weights=torch.empty(4, TOPK, device=dev),
+        topk_ids=torch.empty(4, TOPK, device=dev, dtype=torch.int32),
+        activation="silu",
+        apply_router_weight_on_input=False,
+    )
+
+    monkeypatch.delenv("FREETOKEN_MARLIN_NAN_CANARY", raising=False)
+    assert torch.isnan(marlin_fused_experts(**kw)).all()  # off: passthrough
+
+    monkeypatch.setenv("FREETOKEN_MARLIN_NAN_CANARY", "1")
+    with pytest.raises(RuntimeError, match="45660"):
+        marlin_fused_experts(**kw)

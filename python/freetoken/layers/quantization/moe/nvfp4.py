@@ -17,6 +17,7 @@ experts into a GPU slot cache. Rules every kernel here follows:
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -151,6 +152,8 @@ def _marlin_pack_proj(
     )
 
     assert size_n % 64 == 0, f"Marlin requires N % 64 == 0, got {size_n}"
+    # group_size 16 on K: a non-multiple silently truncates the scale layout.
+    assert size_k % 16 == 0, f"NVFP4 group_size 16 requires K % 16 == 0, got {size_k}"
     qweight = ops.gptq_marlin_repack(
         b_q_weight=packed.view(torch.int32).T.contiguous(),
         perm=torch.empty(0, dtype=torch.int, device=packed.device),
@@ -202,7 +205,7 @@ def marlin_fused_experts(
     from vllm.scalar_type import scalar_types
 
     assert activation == "silu", "Marlin NVFP4 backend supports gated silu only"
-    return fused_marlin_moe(
+    out = fused_marlin_moe(
         hidden_states,
         gate_up_q,
         down_q,
@@ -224,6 +227,15 @@ def marlin_fused_experts(
         global_scale1=gate_up_alpha.float(),
         global_scale2=down_alpha.float(),
     )
+    # vllm #45660 canary: unpatched marlin c_tmp may read stale pool bytes under
+    # CUDA graph pool sharing and emit NaN; opt-in via FREETOKEN_MARLIN_NAN_CANARY=1.
+    # Skipped while capturing (host sync is capture-illegal), so it guards eager runs.
+    if os.environ.get("FREETOKEN_MARLIN_NAN_CANARY") == "1" and not torch.cuda.is_current_stream_capturing():
+        if torch.isnan(out).any().item():
+            raise RuntimeError(
+                "marlin nvfp4 moe emitted NaN; possible vllm #45660 stale c_tmp accumulator"
+            )
+    return out
 
 
 class MarlinNvfp4MoEKernel(MoEKernel):

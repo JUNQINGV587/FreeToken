@@ -188,6 +188,12 @@ class Nvfp4DiskIndex:
     per segment.
     """
 
+    # Banks whose row content is a per-expert fp32 SCALAR (weight_scale_2 ->
+    # fp16 broadcast). A 4-byte scalar must never cost a 4 KiB-aligned disk
+    # read per expert per fetch: DiskTier preloads them once (P0-3 port of
+    # colibri's read-batch economics).
+    scalar_banks = frozenset({2, 5})
+
     def __init__(self, model_dir: str, config, spec) -> None:
         from freetoken.models.nvfp4_banks import _num_moe_layers
         from freetoken.utils.hf import download_hf_weight
@@ -216,6 +222,8 @@ class Nvfp4DiskIndex:
         shard_idx = {s: i for i, s in enumerate(shards)}
 
         E = config.num_experts
+        self.num_layers = num_layers
+        self.num_experts = E
         seg_size = struct.calcsize("<iqq")  # (shard_idx, offset, nbytes)
         self.entries: list[list[bytes]] = []  # [bank][layer] -> packed segments per expert
         for bank_idx in range(len(_NVP4_BANK_SEGS)):
@@ -288,6 +296,10 @@ class DiskTier:
         self._fds: dict[int, tuple[int, bool]] = {}
         self._fetches = 0
         self._fetch_bytes = 0
+        self._preadv_calls = 0
+        self._scalar_preload_reads = 0
+        self._scalars: dict | None = None
+        self._scalars_lock = threading.Lock()
         self._decode_verify_steps = 0
         self._map_verify_steps = 0
         self._cache = cache
@@ -343,6 +355,63 @@ class DiskTier:
             self._staging.ring = ring
         return ring
 
+    def _scalar_blob(self, layer: int, bank_idx: int) -> bytes:
+        sc = self._scalars
+        if sc is None:
+            with self._scalars_lock:
+                if self._scalars is None:
+                    self._scalars = self._preload_scalars()
+                sc = self._scalars
+        return sc[(layer, bank_idx)]
+
+    def _preload_scalars(self) -> dict:
+        """Read every expert's scalar-bank (weight_scale_2) values ONCE, merging
+        exactly-adjacent file runs to keep startup syscalls low. One fp32 scalar
+        per segment; blob layout per (layer, bank): expert-major, each expert's
+        segments concatenated in index order."""
+        scalar_banks = getattr(self._index, "scalar_banks", ())
+        out: dict = {}
+        if not scalar_banks:
+            return out
+        fds = [os.open(p, os.O_RDONLY) for p in self._index.shard_paths]
+        try:
+            for layer in range(self._index.num_layers):
+                for bank_idx in scalar_banks:
+                    stride = sum(nb for _, _, nb in
+                                 self._index.row_segments(bank_idx, layer, 0))
+                    blob = bytearray(stride * self._index.num_experts)
+                    flat = []  # (shard_idx, file_off, nbytes, blob_pos)
+                    for e in range(self._index.num_experts):
+                        pos = e * stride
+                        for (shard_idx, off, nb) in self._index.row_segments(
+                                bank_idx, layer, e):
+                            flat.append((shard_idx, off, nb, pos))
+                            pos += nb
+                    flat.sort()
+                    i = 0
+                    while i < len(flat):
+                        shard_idx, off, nb, dst = flat[i]
+                        end = off + nb
+                        run = [(dst, nb)]
+                        j = i + 1
+                        while (j < len(flat) and flat[j][0] == shard_idx
+                               and flat[j][1] == end):
+                            run.append((flat[j][3], flat[j][2]))
+                            end += flat[j][2]
+                            j += 1
+                        data = os.pread(fds[shard_idx], end - off, off)
+                        self._scalar_preload_reads += 1
+                        p = 0
+                        for dst, nb in run:
+                            blob[dst:dst + nb] = data[p:p + nb]
+                            p += nb
+                        i = j
+                    out[(layer, bank_idx)] = bytes(blob)
+        finally:
+            for fd in fds:
+                os.close(fd)
+        return out
+
     # ---------------------------------------------------------------- fetch
     def _fetch_expert(self, layer: int, expert: int, slot: int) -> None:
         # The server runs under inference_mode; the fetch pool threads do not,
@@ -353,10 +422,49 @@ class DiskTier:
     def _fetch_expert_inner(self, layer: int, expert: int, slot: int) -> None:
         ring = self._staging_ring()
         ri = getattr(self._staging, "ri", 0)
+        scalar_banks = getattr(self._index, "scalar_banks", ())
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
             row = gpu_cache[slot]
             segs = self._index.row_segments(bank_idx, layer, expert)
-            for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
+            if bank_idx in scalar_banks:
+                # Global-scale banks: the checkpoint stores a per-expert fp32
+                # SCALAR (weight_scale_2); the bank row is that value as fp16
+                # broadcast across the row. Values were preloaded at first
+                # fetch -- no disk read, no staging, convert + fill only.
+                stride = sum(nb for _, _, nb in segs)
+                blob = self._scalar_blob(layer, bank_idx)
+                base = expert * stride
+                for k, (d0, d1) in enumerate(self._dst_slices[bank_idx]):
+                    val = struct.unpack_from("<f", blob, base + 4 * k)[0]
+                    row[d0:d1].fill_(val)
+                continue
+            # Sort by file position and merge EXACTLY adjacent segments into
+            # ONE preadv (P0-3 port of colibri's adjacent-offset merging; the
+            # safetensors data section packs tensors densely, so gate|up pairs
+            # are adjacent in the checkpoint). Exact adjacency keeps the merged
+            # span within row_bytes + 2*ALIGN -- the staging-size bound.
+            runs = []
+            for (d0, d1), (shard_idx, off, nbytes) in zip(
+                    self._dst_slices[bank_idx], segs):
+                fd, direct = self._fd(shard_idx)
+                if direct:
+                    a0 = off & ~(_ALIGN - 1)
+                    a1 = (off + nbytes + _ALIGN - 1) & ~(_ALIGN - 1)
+                else:
+                    a0, a1 = off, off + nbytes
+                runs.append((shard_idx, a0, a1, off, nbytes, d0, d1))
+            runs.sort(key=lambda t: (t[0], t[3]))
+            groups = []  # [shard_idx, a0, a1, [(d0, d1, off, nbytes)], exact_end]
+            for shard_idx, a0, a1, off, nbytes, d0, d1 in runs:
+                if (groups and groups[-1][0] == shard_idx
+                        and groups[-1][4] == off):
+                    groups[-1][2] = max(groups[-1][2], a1)
+                    groups[-1][4] = off + nbytes
+                    groups[-1][3].append((d0, d1, off, nbytes))
+                else:
+                    groups.append([shard_idx, a0, a1,
+                                   [(d0, d1, off, nbytes)], off + nbytes])
+            for shard_idx, a0, a1, members, _exact_end in groups:
                 staging, ev = ring[ri]
                 if ev is not None:
                     # This buffer's last async H2D copy must be done before the
@@ -364,28 +472,19 @@ class DiskTier:
                     ev.synchronize()
                 ri = (ri + 1) % len(ring)
                 fd, direct = self._fd(shard_idx)
-                if direct:
-                    a0 = off & ~(_ALIGN - 1)
-                    slen = (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
-                else:
-                    a0, slen = off, nbytes
+                slen = a1 - a0
                 mv = (ctypes.c_char * slen).from_address(staging.addr)
                 try:
                     os.preadv(fd, [mv], a0)
                 except OSError:
-                    raise _preadv_error(self, staging, shard_idx, off, a0, slen, direct)
-                row_off = off - a0
-                if bank_idx in (2, 5):
-                    # Global-scale banks: the checkpoint stores a per-expert fp32
-                    # SCALAR (weight_scale_2); the bank row is that value as fp16
-                    # broadcast across the row -- convert + fill, no byte copy.
-                    val = staging.tensor[row_off:row_off + 4].view(torch.float32)[0].to(
-                        torch.float16)
-                    row[d0:d1].fill_(val)
-                    continue
-                src = staging.tensor[row_off:row_off + nbytes]
-                dst = row[d0:d1]
-                dst.copy_(src.view(dst.dtype).view(dst.shape), non_blocking=True)
+                    raise _preadv_error(self, staging, shard_idx,
+                                        members[0][2], a0, slen, direct)
+                self._preadv_calls += 1
+                for d0, d1, off, nbytes in members:
+                    src = staging.tensor[off - a0:off - a0 + nbytes]
+                    dst = row[d0:d1]
+                    dst.copy_(src.view(dst.dtype).view(dst.shape),
+                              non_blocking=True)
                 if ev is not None:
                     # Arm: the next reuse of this buffer waits for this copy.
                     ev.record()
@@ -682,4 +781,9 @@ class DiskTier:
         self._cache = cache
 
     def stats(self) -> dict:
-        return {"experts_fetched": self._fetches, "bytes_fetched": self._fetch_bytes}
+        return {
+            "experts_fetched": self._fetches,
+            "bytes_fetched": self._fetch_bytes,
+            "preadv_calls": self._preadv_calls,
+            "scalar_preload_reads": self._scalar_preload_reads,
+        }

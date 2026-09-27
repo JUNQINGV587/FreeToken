@@ -350,3 +350,98 @@ def test_release_bank_tails_unaligned_row_boundary():
     bank2.tensor.fill_(7)
     release_bank_tails({"gate_up_scale": [bank2]}, E, 128)
     assert resident_pages(bank2.addr + 128 * 2048, bank2.nbytes - 128 * 2048) == 0
+
+
+def test_scalar_banks_preloaded_not_read_per_fetch(checkpoint):
+    """weight_scale_2 banks (2/5) are 4-byte scalars per expert; they must be
+    preloaded ONCE instead of costing an aligned disk read on every fetch.
+    The fetched rows must stay bitwise identical to the file bytes."""
+    index = _index(checkpoint)
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache)
+    # Scalars cover every expert (RAM-resident ones included: fetch paths may
+    # touch any slot in tests/materialize) and are read from the same bytes.
+    blob = tier._scalar_blob(0, 2)
+    assert len(blob) == E * 8  # gate + up fp32 scalars per expert
+    for expert in range(E):
+        gate, up = struct.unpack_from("<2f", blob, expert * 8)
+        assert gate == _tensor_for(0, expert, "gate_proj", "weight_scale_2").item()
+        assert up == _tensor_for(0, expert, "up_proj", "weight_scale_2").item()
+    assert tier.stats()["scalar_preload_reads"] > 0
+
+    # A full sweep of fetches: scalar rows correct, and the total preadv count
+    # is strictly below the old one-syscall-per-segment behavior (9 per expert:
+    # 2+2+2+1+1+1). Scalar segments (3 per expert) no longer hit disk at all.
+    for layer in range(L):
+        for expert in range(E):
+            slot = (layer * E + expert) % 8
+            tier._fetch_expert(layer, expert, slot)
+            expected = _expected_rows(layer, expert)
+            for bank_idx, (_host_layer, gpu_cache) in enumerate(cache.banks):
+                got = gpu_cache[slot].contiguous().view(torch.uint8).reshape(-1)
+                assert torch.equal(got, expected[bank_idx]), (bank_idx, layer, expert)
+    st = tier.stats()
+    assert st["experts_fetched"] == L * E
+    assert st["preadv_calls"] <= 6 * L * E, st  # was 9 * L * E before the port
+
+
+_ST_DTYPE = {torch.uint8: "U8", torch.float32: "F32", torch.float16: "F16"}
+
+
+def _write_shard_manual(path, tensors):
+    """Write a safetensors file with data packed in the GIVEN order.
+    safetensors.torch.save_file sorts keys alphabetically, which scatters an
+    expert's weight tensors -- but the REAL NVFP4 checkpoints pack them
+    contiguously per expert (weights block, then scales block)."""
+    header = {}
+    data = bytearray()
+    for name, t in tensors:
+        b = t.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+        header[name] = {"dtype": _ST_DTYPE[t.dtype], "shape": list(t.shape),
+                        "data_offsets": [len(data), len(data) + len(b)]}
+        data += b
+    h = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(h)) + h + bytes(data))
+
+
+def _packed_checkpoint(tmp_path):
+    """Checkpoint reproducing the real Qwen3.8-Flash-NVFP4 on-disk layout: per
+    expert, down|gate|up weights contiguous, then the three scales contiguous,
+    then the scalars (verified against model-00001-of-00010.safetensors)."""
+    by_shard = {s: [] for s in SHARDS}
+    weight_map = {}
+    order = (("down_proj", "weight"), ("gate_proj", "weight"), ("up_proj", "weight"),
+             ("down_proj", "weight_scale"), ("gate_proj", "weight_scale"),
+             ("up_proj", "weight_scale"), ("down_proj", "weight_scale_2"),
+             ("gate_proj", "weight_scale_2"), ("up_proj", "weight_scale_2"))
+    for layer in range(L):
+        for expert in range(E):
+            shard = SHARDS[(layer * E + expert) % 2]
+            for proj, kind in order:
+                name = _name(layer, expert, proj, kind)
+                by_shard[shard].append((name, _tensor_for(layer, expert, proj, kind)))
+                weight_map[name] = shard
+    for shard, tensors in by_shard.items():
+        _write_shard_manual(tmp_path / shard, tensors)
+    with open(tmp_path / "model.safetensors.index.json", "w", encoding="utf-8") as f:
+        json.dump({"weight_map": weight_map, "metadata": None}, f)
+    config = types.SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I,
+                                   num_layers=L, first_k_dense_replace=0)
+    return tmp_path, config
+
+
+def test_adjacent_segments_share_one_preadv(tmp_path):
+    """Real-checkpoint packing makes an expert's gate|up weights (and scales)
+    exactly adjacent, so they merge into one read per bank: banks 0/1/3/4 cost
+    1 preadv each, scalar banks cost 0 -> 4 calls per fetch (was 9)."""
+    checkpoint = _packed_checkpoint(tmp_path)
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache)
+    tier._fetch_expert(0, 0, 0)
+    assert tier.stats()["preadv_calls"] == 4, tier.stats()
+    # The merged reads still land the exact bytes (all 6 banks, both slices).
+    expected = _expected_rows(0, 0)
+    for bank_idx, (_host_layer, gpu_cache) in enumerate(cache.banks):
+        got = gpu_cache[0].contiguous().view(torch.uint8).reshape(-1)
+        assert torch.equal(got, expected[bank_idx]), bank_idx

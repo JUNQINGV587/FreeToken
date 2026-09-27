@@ -1,11 +1,15 @@
 """Disk-backed PLE table (--ple-backend disk): the C++ store hashes n-gram windows and batch-reads rows from the checkpoint's fp8 shard tensors into pinned staging; the captured ``lookup`` is a fixed-shape H2D copy + dequant.
 
 Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hits, restores and COW forks need no bookkeeping); the decode input token lives device-side under overlap scheduling and is read back here.
+
+Fills run on a dedicated worker thread (FREETOKEN_PLE_ASYNC_FILL=0 restores the inline form): the decode fill waits out the NVMe round trip off the engine thread (the graph's flag WAIT orders the consumer), and an eager fill is submitted at batch entry and joined by the first ``lookup`` -- the disk read overlaps the embedding and the layers ahead of the PLE layer instead of gating the launch.
 """
 
 from __future__ import annotations
 
 import os
+import queue
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
@@ -29,8 +33,52 @@ from .weight import (
 
 _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
+_ASYNC_ENV = "FREETOKEN_PLE_ASYNC_FILL"
 
 logger = init_logger(__name__)
+
+
+class _FillJob:
+    """One submitted fill; ``result`` re-raises the worker's failure on the joining thread."""
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+        self._done = threading.Event()
+        self._error: BaseException | None = None
+
+    def run(self) -> None:
+        try:
+            self._fn()
+        except BaseException as e:
+            self._error = e
+        finally:
+            self._done.set()
+
+    def result(self) -> None:
+        self._done.wait()
+        if self._error is not None:
+            raise self._error
+
+
+class _FillWorker:
+    """Single daemon thread draining fill jobs in order; the store stays single-threaded."""
+
+    def __init__(self) -> None:
+        self._q: queue.Queue[_FillJob] = queue.Queue()
+        threading.Thread(target=self._run, name="ple-disk-fill", daemon=True).start()
+
+    def submit(self, fn) -> _FillJob:
+        job = _FillJob(fn)
+        self._q.put(job)
+        return job
+
+    def _run(self) -> None:
+        while True:
+            job = self._q.get()
+            try:
+                job.run()
+            except BaseException:  # run() captures; this guards the thread itself
+                logger.exception("PLE disk fill worker escaping error")
 
 
 def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
@@ -163,8 +211,19 @@ class DiskRowTable:
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
+        self._worker = None if os.getenv(_ASYNC_ENV, "1") == "0" else _FillWorker()
+        # the last submitted async fill; joined by the next host_fill_batch or an eager lookup
+        self._pending: _FillJob | None = None
         sync = "wait-sync" if self._wait_sync else "launch-gating"
-        logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
+        logger.info_rank0(
+            f"PLE disk backend: {self._store.io_backend()}, {sync}, "
+            f"{'async fill' if self._worker is not None else 'inline fill'}"
+        )
+
+    def _join_pending(self) -> None:
+        job, self._pending = self._pending, None
+        if job is not None:
+            job.result()
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
@@ -187,8 +246,17 @@ class DiskRowTable:
             return _context(ids, position, self.eos_token_id)
         return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
 
+    def _submit_fill(self, runs: list[torch.Tensor], *, graph: bool) -> None:
+        """Inline without a worker; otherwise queue the fill and let the consumer join it."""
+        if self._worker is None:
+            self.fill(runs, graph=graph)
+        else:
+            self._pending = self._worker.submit(lambda: self.fill(runs, graph=graph))
+
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
+        # serializes the store against the previous fill and surfaces its failure here
+        self._join_pending()
         eos = self.eos_token_id
         if batch.is_decode:
             reqs = list(batch.reqs)
@@ -197,7 +265,7 @@ class DiskRowTable:
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
-                def _complete() -> None:
+                def _fill_step() -> None:
                     try:
                         self._readback_event.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
@@ -211,12 +279,23 @@ class DiskRowTable:
                         signal(self._flag)
                         raise
 
-                return _complete
+                if self._worker is None:
+                    return _fill_step
+
+                def _enqueue() -> None:
+                    # the NVMe round trip rides the worker; the graph's flag WAIT orders the consumer
+                    self._pending = self._worker.submit(_fill_step)
+
+                return _enqueue
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
             runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
                     for r, t in zip(reqs, tokens)]
-            self.fill(runs, graph=use_graph)
+            # a graphed launch-gating fill IS the ordering; only the eager path may defer to lookup
+            if use_graph:
+                self.fill(runs, graph=True)
+            else:
+                self._submit_fill(runs, graph=False)
             return None
         runs = [
             torch.cat((
@@ -225,7 +304,7 @@ class DiskRowTable:
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        self._submit_fill(runs, graph=False)
         return None
 
     @contextmanager
@@ -242,6 +321,9 @@ class DiskRowTable:
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         rows = row_ids.shape[0]
         capturing = torch.cuda.is_current_stream_capturing()
+        if not capturing:
+            # an eager fill is only submitted at entry; this join is what makes it a prefetch
+            self._join_pending()
         if capturing and self._wait_sync:
             from freetoken.kernel.row_store import wait_reset
 

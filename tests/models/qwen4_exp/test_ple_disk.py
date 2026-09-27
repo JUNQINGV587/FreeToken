@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -332,3 +333,86 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     gated, _, _ = _make_table(tmp_path)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
+
+
+@requires_cuda
+def test_async_fill_eager_prefetch(tmp_path, monkeypatch):
+    """The eager fill is submitted at batch entry and joined by the first lookup, so the disk read overlaps the layers ahead of PLE."""
+    disk, oracle, args = _make_table(tmp_path)
+    if disk._worker is None:
+        pytest.skip("async fill disabled")
+    gate, entered, finished = threading.Event(), threading.Event(), threading.Event()
+    orig_fill = disk.fill
+
+    def gated_fill(runs, *, graph):
+        entered.set()
+        assert gate.wait(10)
+        orig_fill(runs, graph=graph)
+        finished.set()
+
+    monkeypatch.setattr(disk, "fill", gated_fill)
+    prompt = [3, 4, EOS, 5]
+    fresh = SimpleNamespace(input_ids=torch.tensor(prompt, dtype=torch.int32), device_len=4, cached_len=0)
+    disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[fresh]), use_graph=False)
+    assert entered.wait(5), "worker did not pick up the fill"
+    assert not finished.is_set(), "host_fill_batch blocked on the disk fill"
+    gate.set()
+    emb = _embedding()
+    ids = emb.row_ids(_meta([prompt], [[EOS, EOS]])).cuda()
+    assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "async prefill join"
+
+
+@requires_cuda
+def test_async_fill_decode_rides_worker(tmp_path, monkeypatch):
+    """The deferred decode fill is queued on the worker and signals the flag only after staging lands."""
+    disk, oracle, args = _make_table(tmp_path)
+    if not disk._wait_sync or disk._worker is None:
+        pytest.skip("needs flag-sync + async fill")
+    gate, entered = threading.Event(), threading.Event()
+    orig_fill = disk.fill
+
+    def gated_fill(runs, *, graph):
+        entered.set()
+        assert gate.wait(10)
+        orig_fill(runs, graph=graph)
+
+    monkeypatch.setattr(disk, "fill", gated_fill)
+    with disk.forward_host_ctx(_decode_batch([3, 4], 7), use_graph=True):
+        pass
+    assert entered.wait(5), "fill did not move to the worker"
+    assert int(disk._flag[0]) == 0, "flag signaled before the fill completed"
+    gate.set()
+    disk._join_pending()
+    assert int(disk._flag[0]) == 1
+
+
+@requires_cuda
+def test_async_fill_error_surfaces_and_unblocks(tmp_path, monkeypatch):
+    """A failed fill still signals the flag (no stuck graph WAIT) and re-raises at the next batch."""
+    disk, _, _ = _make_table(tmp_path)
+    if not disk._wait_sync or disk._worker is None:
+        pytest.skip("needs flag-sync + async fill")
+
+    def boom(runs, *, graph):
+        raise RuntimeError("injected disk failure")
+
+    monkeypatch.setattr(disk, "fill", boom)
+    with disk.forward_host_ctx(_decode_batch([3, 4], 7), use_graph=True):
+        pass
+    with pytest.raises(RuntimeError, match="injected disk failure"):
+        disk.host_fill_batch(_decode_batch([3, 4], 9), use_graph=False)
+    assert int(disk._flag[0]) == 1, "a failed fill must still release the graph WAIT"
+
+
+@requires_cuda
+def test_async_fill_kill_switch(tmp_path, monkeypatch):
+    """FREETOKEN_PLE_ASYNC_FILL=0 restores the inline fill."""
+    monkeypatch.setenv("FREETOKEN_PLE_ASYNC_FILL", "0")
+    disk, oracle, args = _make_table(tmp_path)
+    assert disk._worker is None
+    prompt = [3, 4, EOS, 5]
+    fresh = SimpleNamespace(input_ids=torch.tensor(prompt, dtype=torch.int32), device_len=4, cached_len=0)
+    disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[fresh]), use_graph=False)
+    emb = _embedding()
+    ids = emb.row_ids(_meta([prompt], [[EOS, EOS]])).cuda()
+    assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "inline fill"

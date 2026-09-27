@@ -140,7 +140,7 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   `python3`, no `python` alias).
 - **Xid watchdog channel**: `/data/ops/gpu_test_guard.sh` reads host dmesg via a
   throwaway `--privileged` container from the **production image** (resolved
-  dynamically from `freetoken-full0913tp2`, fallback newest `sm89-delta*`) — no
+  dynamically from `freetoken`, fallback newest `sm89-delta*`) — no
   separate watchdog container or foreign image since 2026-09-27.
 
 ## Measurement protocol

@@ -355,6 +355,10 @@ class DiskTier:
         # at prefetch_from_routing, which sees every layer's RAW routing in decode.
         self._route_hist = torch.zeros(
             (index.num_layers, index.num_experts), dtype=torch.float64)
+        # LFRU recency clock (per decode token at layer 0) + last-access stamps.
+        self._route_last = torch.zeros(
+            (index.num_layers, index.num_experts), dtype=torch.int64)
+        self._route_clock = 0
         self._hist_since_decay = 0
         self._slab_count = int(os.environ.get("FT_DISK_TIER_PREFETCH_SLABS", "32"))
         # Host mirror of slot occupancy: (layer, slot) -> expert. fetch_pending sees
@@ -834,7 +838,9 @@ class DiskTier:
         flat = expert_ids.reshape(-1).to(torch.int64).cpu()
         self._route_hist[layer_id].scatter_add_(
             0, flat, torch.ones_like(flat, dtype=torch.float64))
+        self._route_last[layer_id, flat] = self._route_clock
         if layer_id == 0:
+            self._route_clock += 1
             self._hist_since_decay += 1
             if self._hist_since_decay >= 256:  # ~256 decode tokens per decay round
                 self._route_hist *= 0.97   # per-round decay: stale heat dies off
@@ -940,6 +946,16 @@ class DiskTier:
                       if b not in getattr(self._index, "scalar_banks", ()))
         return autopin_pinned_count(self._route_hist, budget_bytes,
                                     max(ram_row, row, 1))
+
+    def pin_advice(self, layer_id: int) -> tuple[int, int, int] | None:
+        """LFRU admission (colibri tier.h): which currently pinned expert should
+        yield its RAM row to which hotter non-resident one. None = hysteresis
+        says stay. Decision only -- actuation needs the loader row remap."""
+        from freetoken.moe.tier_admission import heat_u32, pick_lfru
+
+        return pick_lfru(heat_u32(self._route_hist[layer_id]),
+                         self._route_last[layer_id], self._route_clock,
+                         list(range(self._ram)))
 
     def save_histogram(self, path: str) -> None:
         payload = {"layers": self._index.num_layers,

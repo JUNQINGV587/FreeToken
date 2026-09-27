@@ -9,6 +9,13 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
 
 ## What this branch adds over upstream
 
+- `feat(qwen4_exp)`: **SmoothQuant-style attention alpha consumer** (KV8k-style
+  checkpoints): the engine scans safetensors headers for `self_attn.k_alpha` /
+  `v_alpha` and the layer binds them iff present (strict loading fails loudly on a
+  mismatch either way). `v_alpha` scales the raw v_proj output; `k_alpha` applies at
+  `--attn-alpha-apply {pre_norm,post_norm,post_rope}` (default pre_norm, exactly
+  foldable into the k_proj weight rows offline). Consumer side only -- the
+  producer/calibration side waits for real KV8k artifacts. 8 synthetic-alpha tests.
 - `perf(distributed)`: **custom all-reduce donor** (vLLM one-stage kernel) for small decode
   tensors — 22–95 µs → 4–9 µs per [bs≤8, 2560] all-reduce on PCIe-only 2×GPU, bit-identical
   (fp32 accumulation in rank order). Production-measured: single-stream +4–6%, bs=8 +52%.

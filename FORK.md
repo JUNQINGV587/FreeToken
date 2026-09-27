@@ -98,6 +98,27 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   read at cache construction so a test can flip it.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
+## Testing on this fork
+
+- **Test images**: production images ship without pytest; the `*-test` tag is the same
+  image plus `pip install pytest` (e.g. `freetoken:sm89-delta26-test`). Run suites inside
+  the image that will ship, not against a host checkout.
+- **CPU suites** (`tests/models/qwen4_exp tests/engine tests/server tests/moe
+  tests/utils`, `CUDA_VISIBLE_DEVICES=`): expect **all green** (1425 passed at delta26).
+  `tests/models` on CPU skips the model-building weight tests — the
+  `create_model → sgl_kernel common_ops` import chain has no CPU variant — so
+  **210 passed / 293 skipped / 0 failed** is the expected CPU shape there.
+- **GPU suites**: wrap every GPU run in `/data/ops/gpu_test_guard.sh docker run --rm
+  --gpus all ...` (co-residency with production is fine) and check
+  `dmesg | grep -icE "Xid"` afterwards — **0** is the only acceptable value.
+- **Full `tests/models` GPU baseline**: **323 passed / 2 known-failed**
+  (`test_glm_dsa.py::test_indexer_matches_hf_reference` ×2 — the failure is inside the
+  transformers HF reference, not this tree; GLM is not served here). Anything beyond
+  those two is a regression.
+- **Ad-hoc smoke**: the `freetoken-p0test` container (currently `sm89-delta26-test`,
+  repo mounted at `/ft`) is the standing tool box; `docker exec freetoken-p0test ...`
+  with `PYTHONPATH=/ft/python` tests the live checkout.
+
 ## Measurement protocol
 
 A number from this branch is only comparable inside the same boundary and the same

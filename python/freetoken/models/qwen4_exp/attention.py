@@ -202,6 +202,30 @@ class Qwen4ExpAttention(BaseOP):
         )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # SmoothQuant-style per-channel activation multipliers (KV8k-style checkpoints).
+        # Buffers exist iff the engine's checkpoint header scan saw the tensors; they are
+        # persistent so strict loading binds them (and fails loudly on a shape/key
+        # mismatch). Apply point for k is config-driven: pre_norm == on the k_proj output
+        # (exactly foldable into the k_proj weight rows offline), post_norm == after
+        # k_norm, post_rope == after rope right before the cache write. v_alpha always
+        # applies on the raw v_proj output.
+        self.smooth_alpha_apply = getattr(config, "smooth_alpha_apply", "pre_norm")
+        if self.smooth_alpha_apply not in ("pre_norm", "post_norm", "post_rope"):
+            raise ValueError(
+                f"smooth_alpha_apply must be pre_norm/post_norm/post_rope, got {self.smooth_alpha_apply!r}"
+            )
+        kv_dim = self.num_kv * self.head_dim
+        # BaseOP state_dict collects plain tensor attributes (None is skipped), so a
+        # checkpoint with alphas binds them and a stray alpha key without the flag
+        # fails the strict load loudly. torch.ones follows the build-time torch_dtype.
+        if getattr(config, "smooth_alpha_k", False):
+            self.k_alpha = torch.ones(kv_dim)
+        else:
+            self.k_alpha = None
+        if getattr(config, "smooth_alpha_v", False):
+            self.v_alpha = torch.ones(kv_dim)
+        else:
+            self.v_alpha = None
         rotary = config.rotary_config
         self.rotary = get_rope(
             head_dim=self.head_dim,
@@ -230,12 +254,21 @@ class Qwen4ExpAttention(BaseOP):
             gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
             k = k.contiguous().view(-1, self.num_kv, self.head_dim)
             v = v.contiguous()
+            if self.v_alpha is not None:
+                v = v * self.v_alpha
+            if self.k_alpha is not None and self.smooth_alpha_apply == "pre_norm":
+                k = k * self.k_alpha.view(self.num_kv, self.head_dim)
         with prof.phase("attn_norm_rope"):
             self.q_norm.forward_inplace(q)
             self.k_norm.forward_inplace(k)
+            if self.k_alpha is not None and self.smooth_alpha_apply == "post_norm":
+                k = k * self.k_alpha.view(self.num_kv, self.head_dim)
             q, k = self.rotary.forward(
                 batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
             )
+            if self.k_alpha is not None and self.smooth_alpha_apply == "post_rope":
+                # the cache write inside qsa_forward must see the already-scaled k
+                k = k * self.k_alpha
         with prof.phase("attn_index"):
             index = (
                 self.indexer.forward_qk(index_qk)

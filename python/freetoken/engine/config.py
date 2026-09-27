@@ -113,6 +113,10 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     distributed_port: int = 2333
     use_dummy_weight: bool = False
+    # Where a checkpoint's SmoothQuant-style k_alpha is applied (qwen4_exp, KV8k-style
+    # exports): pre_norm | post_norm | post_rope. Only read when the checkpoint header
+    # scan actually finds alpha tensors; v_alpha always applies on the raw v_proj output.
+    attn_alpha_apply: str = "pre_norm"
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
@@ -166,7 +170,21 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
+        model_config = replace(model_config, quant=quant)
+        # SmoothQuant-style attention alphas (KV8k-style qwen4_exp checkpoints): the
+        # header scan decides whether the layers register k_alpha/v_alpha buffers, so
+        # strict loading binds them iff the checkpoint actually ships them.
+        if not self.use_dummy_weight and model_config.model_type == "qwen4_exp":
+            from freetoken.models.qwen4_exp.weight import checkpoint_smooth_alpha
+
+            alpha_k, alpha_v = checkpoint_smooth_alpha(self.model_path)
+            model_config = replace(
+                model_config,
+                smooth_alpha_k=alpha_k,
+                smooth_alpha_v=alpha_v,
+                smooth_alpha_apply=self.attn_alpha_apply,
+            )
+        return model_config
 
     @property
     def max_seq_len(self) -> int:

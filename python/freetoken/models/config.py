@@ -290,6 +290,17 @@ class ModelConfig:
     lm_head_quant: str = "none"
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
+    # SmoothQuant-style per-channel activation multipliers on qwen4_exp attention k/v rows
+    # (KV8k-style checkpoints ship them as ``self_attn.k_alpha`` / ``self_attn.v_alpha``).
+    # False = the checkpoint carries no such tensor: no buffer is registered and a stray
+    # alpha key fails strict loading loudly. Set by the engine's checkpoint header scan.
+    smooth_alpha_k: bool = False
+    smooth_alpha_v: bool = False
+    # Where k_alpha is applied: "pre_norm" (on the k_proj output; this case is exactly
+    # foldable into the k_proj weight rows offline), "post_norm" (after k_norm, before
+    # rope), "post_rope" (after rope, right before the KV-cache write). v_alpha always
+    # applies on the raw v_proj output. Overridable with --attn-alpha-apply.
+    smooth_alpha_apply: str = "pre_norm"
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
     # The first ``first_k_dense_replace`` decoder layers use a dense MLP instead of the
     # sparse MoE block (GLM-4: 3). Experts (and the offload cache) therefore only exist

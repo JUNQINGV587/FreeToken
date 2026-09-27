@@ -960,6 +960,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--attn-alpha-apply",
+        default=ServerArgs.attn_alpha_apply,
+        choices=["pre_norm", "post_norm", "post_rope"],
+        help=(
+            "Where a checkpoint's SmoothQuant-style k_alpha is applied (qwen4_exp "
+            "KV8k-style exports): on the k_proj output before k_norm (default; this case "
+            "is exactly foldable into the k_proj weight rows offline), after k_norm "
+            "before rope, or after rope right before the KV-cache write. Only read when "
+            "the checkpoint actually ships k_alpha/v_alpha tensors."
+        ),
+    )
+
+    parser.add_argument(
         "--cors-origins",
         type=str,
         default=ServerArgs.cors_origins,

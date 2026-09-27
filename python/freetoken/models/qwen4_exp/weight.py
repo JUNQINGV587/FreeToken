@@ -214,6 +214,13 @@ def shard_qwen4_exp_dense_tensor(
             tensor, num_heads=config.num_kv_heads, rows_per_head=config.head_dim,
             rank=rank, world_size=world_size, allow_replicate=True,
         )
+    if key.endswith((".self_attn.k_alpha", ".self_attn.v_alpha")):
+        # SmoothQuant-style per-channel multipliers: 1-D [num_kv*head_dim] with the same
+        # head-row layout as the k/v_proj weight rows, so they shard identically.
+        return _shard_head_rows(
+            tensor, num_heads=config.num_kv_heads, rows_per_head=config.head_dim,
+            rank=rank, world_size=world_size, allow_replicate=True,
+        )
     if key.endswith(".self_attn.o_proj.weight"):
         return _shard_dim1(tensor, rank=rank, world_size=world_size)
 
@@ -590,6 +597,31 @@ def _safetensors_header(path: str) -> tuple[dict, int]:
     with open(path, "rb") as fh:
         n = struct.unpack("<Q", fh.read(8))[0]
         return json.loads(fh.read(n)), 8 + n
+
+
+def checkpoint_smooth_alpha(model_path: str) -> tuple[bool, bool]:
+    """Header-only scan: does the checkpoint ship SmoothQuant-style attention alphas?
+
+    Returns ``(has_k_alpha, has_v_alpha)``. Reads only the safetensors JSON headers
+    (a few KiB per shard), so it is cheap enough to run on every engine startup. The
+    engine feeds the flags into ModelConfig.smooth_alpha_{k,v} so the attention layer
+    registers its buffers exactly when the checkpoint provides them (strict loading
+    fails loudly on a mismatch either way).
+    """
+    has_k = has_v = False
+    names = sorted(
+        n for n in os.listdir(model_path) if n.endswith(".safetensors")
+    )
+    for name in names:
+        header, _ = _safetensors_header(os.path.join(model_path, name))
+        for key in header:
+            if key.endswith(".self_attn.k_alpha"):
+                has_k = True
+            elif key.endswith(".self_attn.v_alpha"):
+                has_v = True
+        if has_k and has_v:
+            break
+    return has_k, has_v
 
 
 def _ple_table_files(folder: str) -> list[str]:

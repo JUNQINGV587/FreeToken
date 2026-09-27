@@ -103,8 +103,10 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
 - **`origin` = upstream FreeToken (read-only for us). `fork` = our fork — the only
   remote we push to.** Repo `AGENTS.md` forbids pushing or PR-ing to upstream on the
   user's behalf; upstream-bound contributions are the user's own decision.
-- Production mainline branch: **`sm89-moe-offload`** on `fork`. Local experiment/work
-  branches get pushed as `<local>:sm89-moe-offload` when they become the mainline.
+- Production mainline branch: **`sm89-moe-offload`** on `fork`. **It is the only working
+  branch (2026-09-27 user decision): work directly on it and push to `fork`; do not create
+  `exp/*` or other work branches unless the user explicitly asks.** The legacy `exp/*`
+  branches still on `fork` are frozen history, not active lines.
 - Cherry-picks keep the original author; our own commits use the fork identity
   (see /data/AGENTS.md for the exact `user.name`/`user.email` and the vault-backed
   credential helper).

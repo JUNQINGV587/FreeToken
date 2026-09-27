@@ -332,6 +332,11 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        if cache.disk_tier_enabled:
+            # PILOT (P0-4): issue the next layer's predicted disk prefetch BEFORE
+            # this layer's ensure rewrites topk_ids to slot ids -- the raw routing
+            # is the predictor. Stash hits let L+1 skip its NVMe round trip.
+            cache._disk_tier.prefetch_from_routing(self.layer_id, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         if (cache.disk_tier_enabled and self.layer_id == 0

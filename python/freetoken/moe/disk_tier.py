@@ -303,6 +303,32 @@ class DiskTier:
         self._decode_verify_steps = 0
         self._map_verify_steps = 0
         self._cache = cache
+        # ---- PILOT prefetch (P0-4 port of colibri's router-guided cross-layer
+        # prefetch): at layer L the decode path hands us L's raw routing; we read
+        # the predicted experts for L+1 into pinned host SLABS. A stash entry never
+        # touches a GPU slot, so it cannot evict the current demand set (P0-1) and
+        # its (layer, expert) key suppresses duplicate reads vs the on-demand path
+        # (P0-2 reservation). Layer L+1's fetch_pending consumes stash hits with a
+        # fast pinned->slot H2D instead of an NVMe round trip.
+        self._prefetch_window = int(os.environ.get("FT_DISK_TIER_PREFETCH", "0"))
+        self._prefetch_pool = (
+            ThreadPoolExecutor(max_workers=2, thread_name_prefix="disk-tier-pf")
+            if self._prefetch_window > 0 else None
+        )
+        self._stash: dict = {}            # (layer, expert) -> _StashEntry
+        self._stash_lock = threading.Lock()
+        self._slab_free: list = []        # [(slab tensor, cuda event|None)]
+        self._slabs_allocated = 0
+        self._slab_count = int(os.environ.get("FT_DISK_TIER_PREFETCH_SLABS", "32"))
+        # Host mirror of slot occupancy: (layer, slot) -> expert. fetch_pending sees
+        # every miss->slot assignment, which is enough to keep this exact; used to
+        # skip prefetching experts that are already slot-resident.
+        self._slot_owner: dict = {}
+        self._resident_disk: list[set] = [set() for _ in range(index.num_layers)]
+        self._pf_issued = 0
+        self._pf_hits = 0
+        self._pf_wasted = 0
+        self._pf_skipped_resident = 0
 
     # ------------------------------------------------------------------ fds
     def _fd(self, shard_idx: int) -> tuple[int, bool]:
@@ -413,6 +439,46 @@ class DiskTier:
         return out
 
     # ---------------------------------------------------------------- fetch
+    def _fill_scalar_row(self, bank_idx: int, layer: int, expert: int,
+                         row: torch.Tensor) -> None:
+        """Global-scale banks (weight_scale_2): fill the row from the preloaded
+        per-expert fp32 scalar blob -- no disk read, no staging."""
+        segs = self._index.row_segments(bank_idx, layer, expert)
+        stride = sum(nb for _, _, nb in segs)
+        blob = self._scalar_blob(layer, bank_idx)
+        base = expert * stride
+        for k, (d0, d1) in enumerate(self._dst_slices[bank_idx]):
+            val = struct.unpack_from("<f", blob, base + 4 * k)[0]
+            row[d0:d1].fill_(val)
+
+    def _group_runs(self, bank_idx: int, layer: int, expert: int):
+        """Merged preadv groups for one non-scalar bank: [(shard, a0, a1,
+        [(d0, d1, off, nbytes)])]. Sorts by file position and merges EXACTLY
+        adjacent segments into one read (P0-3)."""
+        segs = self._index.row_segments(bank_idx, layer, expert)
+        runs = []
+        for (d0, d1), (shard_idx, off, nbytes) in zip(
+                self._dst_slices[bank_idx], segs):
+            fd, direct = self._fd(shard_idx)
+            if direct:
+                a0 = off & ~(_ALIGN - 1)
+                a1 = (off + nbytes + _ALIGN - 1) & ~(_ALIGN - 1)
+            else:
+                a0, a1 = off, off + nbytes
+            runs.append((shard_idx, a0, a1, off, nbytes, d0, d1))
+        runs.sort(key=lambda t: (t[0], t[3]))
+        groups = []  # [shard_idx, a0, a1, [(d0, d1, off, nbytes)], exact_end]
+        for shard_idx, a0, a1, off, nbytes, d0, d1 in runs:
+            if (groups and groups[-1][0] == shard_idx
+                    and groups[-1][4] == off):
+                groups[-1][2] = max(groups[-1][2], a1)
+                groups[-1][4] = off + nbytes
+                groups[-1][3].append((d0, d1, off, nbytes))
+            else:
+                groups.append([shard_idx, a0, a1,
+                               [(d0, d1, off, nbytes)], off + nbytes])
+        return groups
+
     def _fetch_expert(self, layer: int, expert: int, slot: int) -> None:
         # The server runs under inference_mode; the fetch pool threads do not,
         # so the H2D writes into the (inference) slot cache need their own scope.
@@ -425,45 +491,10 @@ class DiskTier:
         scalar_banks = getattr(self._index, "scalar_banks", ())
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
             row = gpu_cache[slot]
-            segs = self._index.row_segments(bank_idx, layer, expert)
             if bank_idx in scalar_banks:
-                # Global-scale banks: the checkpoint stores a per-expert fp32
-                # SCALAR (weight_scale_2); the bank row is that value as fp16
-                # broadcast across the row. Values were preloaded at first
-                # fetch -- no disk read, no staging, convert + fill only.
-                stride = sum(nb for _, _, nb in segs)
-                blob = self._scalar_blob(layer, bank_idx)
-                base = expert * stride
-                for k, (d0, d1) in enumerate(self._dst_slices[bank_idx]):
-                    val = struct.unpack_from("<f", blob, base + 4 * k)[0]
-                    row[d0:d1].fill_(val)
+                self._fill_scalar_row(bank_idx, layer, expert, row)
                 continue
-            # Sort by file position and merge EXACTLY adjacent segments into
-            # ONE preadv (P0-3 port of colibri's adjacent-offset merging; the
-            # safetensors data section packs tensors densely, so gate|up pairs
-            # are adjacent in the checkpoint). Exact adjacency keeps the merged
-            # span within row_bytes + 2*ALIGN -- the staging-size bound.
-            runs = []
-            for (d0, d1), (shard_idx, off, nbytes) in zip(
-                    self._dst_slices[bank_idx], segs):
-                fd, direct = self._fd(shard_idx)
-                if direct:
-                    a0 = off & ~(_ALIGN - 1)
-                    a1 = (off + nbytes + _ALIGN - 1) & ~(_ALIGN - 1)
-                else:
-                    a0, a1 = off, off + nbytes
-                runs.append((shard_idx, a0, a1, off, nbytes, d0, d1))
-            runs.sort(key=lambda t: (t[0], t[3]))
-            groups = []  # [shard_idx, a0, a1, [(d0, d1, off, nbytes)], exact_end]
-            for shard_idx, a0, a1, off, nbytes, d0, d1 in runs:
-                if (groups and groups[-1][0] == shard_idx
-                        and groups[-1][4] == off):
-                    groups[-1][2] = max(groups[-1][2], a1)
-                    groups[-1][4] = off + nbytes
-                    groups[-1][3].append((d0, d1, off, nbytes))
-                else:
-                    groups.append([shard_idx, a0, a1,
-                                   [(d0, d1, off, nbytes)], off + nbytes])
+            groups = self._group_runs(bank_idx, layer, expert)
             for shard_idx, a0, a1, members, _exact_end in groups:
                 staging, ev = ring[ri]
                 if ev is not None:
@@ -738,6 +769,120 @@ class DiskTier:
         cache.id_of_slot[disk] = flat
         cache.usage[disk] = cache.step
 
+    # ------------------------------------------------------------- PILOT prefetch
+    def _slab_bytes(self) -> int:
+        """Pinned slab size for one prefetched expert: every non-scalar bank's
+        merged reads land in one slab."""
+        total = 0
+        scalar_banks = getattr(self._index, "scalar_banks", ())
+        for bank_idx in range(len(self._banks)):
+            if bank_idx in scalar_banks:
+                continue
+            total += self._row_bytes[bank_idx] + 2 * _ALIGN
+        return total
+
+    def _new_slab(self) -> torch.Tensor:
+        try:
+            return torch.zeros(self._slab_bytes(), dtype=torch.uint8,
+                               pin_memory=True)
+        except (RuntimeError, TypeError):
+            return torch.zeros(self._slab_bytes(), dtype=torch.uint8)
+
+    def prefetch_from_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """PILOT trigger: called by the decode path at layer L with L's RAW routing
+        (before ensure_experts rewrites it). Identity-map prediction -- colibri
+        measured 62.3% top-8 overlap between adjacent layers on DSv4 -- so L's
+        routed experts are the prefetch set for L+1..L+window."""
+        if self._prefetch_window <= 0:
+            return
+        ids = {int(e) for e in expert_ids.reshape(-1).tolist()}
+        for target in range(layer_id + 1,
+                            min(layer_id + 1 + self._prefetch_window,
+                                self._index.num_layers)):
+            with self._stash_lock:
+                for e in sorted(ids):
+                    if e < self._ram:
+                        continue  # RAM-resident: PCIe fallback is already fast
+                    if e in self._resident_disk[target]:
+                        self._pf_skipped_resident += 1
+                        continue
+                    key = (target, e)
+                    if key in self._stash:
+                        continue  # reservation: already in flight / stashed
+                    slab_ent = self._slab_free.pop() if self._slab_free else None
+                    if slab_ent is None:
+                        if self._slabs_allocated >= self._slab_count:
+                            continue  # slab pool exhausted; degrade gracefully
+                        slab_ent = (self._new_slab(), None)
+                        self._slabs_allocated += 1
+                    slab, ev = slab_ent
+                    if ev is not None:
+                        ev.synchronize()  # pending H2D out of this slab
+                    entry = {"slab": slab, "future": None, "groups": None}
+                    self._stash[key] = entry
+                    self._pf_issued += 1
+                    entry["future"] = self._prefetch_pool.submit(
+                        self._prefetch_one, target, e, entry)
+
+    def _prefetch_one(self, layer: int, expert: int, entry: dict) -> None:
+        """Pool task: read one expert's merged groups into its slab. Pure host
+        work -- no CUDA, no slot cache -- so it is safe to run behind the GEMM."""
+        slab = entry["slab"]
+        scalar_banks = getattr(self._index, "scalar_banks", ())
+        groups = []
+        slab_off = 0
+        for bank_idx in range(len(self._banks)):
+            if bank_idx in scalar_banks:
+                continue
+            for shard_idx, a0, a1, members in [
+                    (g[0], g[1], g[2], g[3])
+                    for g in self._group_runs(bank_idx, layer, expert)]:
+                slen = a1 - a0
+                mv = (ctypes.c_char * slen).from_address(
+                    slab.data_ptr() + slab_off)
+                fd, _direct = self._fd(shard_idx)
+                os.preadv(fd, [mv], a0)
+                self._preadv_calls += 1
+                groups.append((slab_off, a0, bank_idx, members))
+                slab_off += slen
+        entry["groups"] = groups
+
+    def _stash_to_slot(self, entry: dict, layer: int, expert: int,
+                       slot: int) -> None:
+        """Stash hit: copy the slab's bytes into the slot rows (pinned H2D instead
+        of an NVMe read), then recycle the slab."""
+        with torch.inference_mode():
+            slab = entry["slab"]
+            scalar_banks = getattr(self._index, "scalar_banks", ())
+            for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
+                row = gpu_cache[slot]
+                if bank_idx in scalar_banks:
+                    self._fill_scalar_row(bank_idx, layer, expert, row)
+                    continue
+            for slab_off, a0, bank_idx, members in entry["groups"]:
+                row = self._banks[bank_idx][1][slot]
+                for d0, d1, off, nbytes in members:
+                    src = slab[slab_off + (off - a0):
+                               slab_off + (off - a0) + nbytes]
+                    dst = row[d0:d1]
+                    dst.copy_(src.view(dst.dtype).view(dst.shape),
+                              non_blocking=True)
+        ev = None
+        if self._banks[0][1].device.type == "cuda":
+            # Arm: the next prefetch into this slab waits for these async H2D
+            # copies (same pinned-reuse race as the staging ring).
+            ev = torch.cuda.Event()
+            ev.record()
+        with self._stash_lock:
+            self._slab_free.append((slab, ev))
+
+    def prefetch_from_routing_cpu(self, layer_id: int, ids) -> None:
+        """Test hook: prefetch with a plain iterable of ids (no GPU tensor)."""
+        if self._prefetch_window <= 0:
+            return
+        self.prefetch_from_routing(layer_id, torch.tensor(sorted(ids),
+                                                          dtype=torch.int32))
+
     def fetch_pending(self, cache, layer_id: int) -> None:
         """Fetch this layer's disk-resident misses into their slots; shrink the miss
         list to the RAM-resident remainder for the existing PCIe copy path."""
@@ -746,16 +891,39 @@ class DiskTier:
             return
         src = cache.src_indices[:n].cpu()
         slots = cache.evict_slots[:n].cpu()
+        # Keep the host slot-occupancy mirror exact: this list is EVERY miss->slot
+        # assignment for the layer, so retiring the old owner of each slot plus
+        # recording the new one tracks residency precisely.
+        for i in range(n):
+            s = int(slots[i])
+            old = self._slot_owner.pop((layer_id, s), None)
+            if old is not None and old >= self._ram:
+                self._resident_disk[layer_id].discard(old)
+            e = int(src[i])
+            self._slot_owner[(layer_id, s)] = e
+            if e >= self._ram:
+                self._resident_disk[layer_id].add(e)
         disk = [i for i in range(n) if int(src[i]) >= self._ram]
         if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0:
             print(f"[fetch-pend] layer=0 n={n} ndisk={len(disk)} "
                   f"src_head={src[:4].tolist()}", flush=True)
         if not disk:
             return
-        futures = [
-            self._pool.submit(self._fetch_expert, layer_id, int(src[i]), int(slots[i]))
-            for i in disk
-        ]
+        futures = []
+        for i in disk:
+            expert, slot = int(src[i]), int(slots[i])
+            entry = None
+            if self._prefetch_window > 0:
+                with self._stash_lock:
+                    entry = self._stash.pop((layer_id, expert), None)
+            if entry is not None:
+                entry["future"].result()  # slab read done? (usually long done)
+                futures.append(self._pool.submit(
+                    self._stash_to_slot, entry, layer_id, expert, slot))
+                self._pf_hits += 1
+            else:
+                futures.append(self._pool.submit(
+                    self._fetch_expert, layer_id, expert, slot))
         for f in futures:
             f.result()
         self._sync_fetches()
@@ -767,6 +935,21 @@ class DiskTier:
                       f"expert={int(src[i])} slot={int(slots[i])} ndisk={len(disk)}", flush=True)
                 self._verify_slot(cache, layer_id, int(src[i]), int(slots[i]),
                                   phase="decode")
+        # Wasted prefetches: stashed for THIS layer but never routed. Recycle
+        # their slabs once the read finishes so the pool stays available.
+        if self._prefetch_window > 0:
+            with self._stash_lock:
+                stale = [k for k in self._stash if k[0] <= layer_id]
+                for k in stale:
+                    entry = self._stash.pop(k)
+                    self._pf_wasted += 1
+                    fut = entry["future"]
+
+                    def _recycle(fut=fut, slab=entry["slab"]):
+                        fut.result()  # prefetch read done; no H2D was enqueued
+                        with self._stash_lock:
+                            self._slab_free.append((slab, None))
+                    self._prefetch_pool.submit(_recycle)
         disk_set = set(disk)
         ram = [i for i in range(n) if i not in disk_set]
         if ram:
@@ -779,6 +962,23 @@ class DiskTier:
         """Rebind the slot-cache references after a runtime cache rebuild."""
         self._banks = list(cache.banks)
         self._cache = cache
+        # Slots were reallocated: the occupancy mirror and any stashed prefetch
+        # are stale. Dropping stash entries leaks their slabs back via _recycle
+        # only if they were read; simplest correct move is to drain everything.
+        self._slot_owner.clear()
+        for s in self._resident_disk:
+            s.clear()
+        if self._prefetch_window > 0:
+            with self._stash_lock:
+                for key, entry in self._stash.items():
+                    fut = entry["future"]
+
+                    def _recycle(fut=fut, slab=entry["slab"]):
+                        fut.result()
+                        with self._stash_lock:
+                            self._slab_free.append((slab, None))
+                    self._prefetch_pool.submit(_recycle)
+                self._stash.clear()
 
     def stats(self) -> dict:
         return {
@@ -786,4 +986,8 @@ class DiskTier:
             "bytes_fetched": self._fetch_bytes,
             "preadv_calls": self._preadv_calls,
             "scalar_preload_reads": self._scalar_preload_reads,
+            "prefetch_issued": self._pf_issued,
+            "prefetch_hits": self._pf_hits,
+            "prefetch_wasted": self._pf_wasted,
+            "prefetch_skipped_resident": self._pf_skipped_resident,
         }

@@ -445,3 +445,101 @@ def test_adjacent_segments_share_one_preadv(tmp_path):
     for bank_idx, (_host_layer, gpu_cache) in enumerate(cache.banks):
         got = gpu_cache[0].contiguous().view(torch.uint8).reshape(-1)
         assert torch.equal(got, expected[bank_idx]), bank_idx
+
+
+# ------------------------------------------------------------- PILOT prefetch (P0-4)
+
+def _tier_prefetch(checkpoint, cache, ram_experts=2, window=1, monkeypatch=None):
+    import os
+    os.environ["FT_DISK_TIER_PREFETCH"] = str(window)
+    try:
+        return _tier(checkpoint, cache, ram_experts=ram_experts)
+    finally:
+        os.environ.pop("FT_DISK_TIER_PREFETCH", None)
+
+
+def _flush_stash(tier):
+    """Wait for every in-flight prefetch read."""
+    for entry in list(tier._stash.values()):
+        entry["future"].result()
+
+
+def test_prefetch_hit_skips_demand_disk_read(checkpoint):
+    cache = _fake_cache()
+    tier = _tier_prefetch(checkpoint, cache, ram_experts=2, window=1)
+    # Layer 0 routes experts {2, 3} -> identity-prefetch them for layer 1.
+    tier.prefetch_from_routing(0, torch.tensor([2, 3], dtype=torch.int32))
+    _flush_stash(tier)
+    reads_after_prefetch = tier._preadv_calls
+    assert reads_after_prefetch > 0
+    assert tier.stats()["prefetch_issued"] == 2
+
+    # Layer 1 really does miss expert 2 (stash hit) but not 3 (wasted).
+    cache.src_indices[:1] = torch.tensor([2], dtype=torch.int32)
+    cache.evict_slots[:1] = torch.tensor([5], dtype=torch.int32)
+    cache.num_indices.fill_(1)
+    tier.fetch_pending(cache, 1)
+
+    # The demand path did NO new disk reads: the slab covered it.
+    assert tier._preadv_calls == reads_after_prefetch
+    assert tier.stats()["prefetch_hits"] == 1
+    assert tier.stats()["prefetch_wasted"] == 1
+    # Slot 5 holds expert 2's bytes on every bank.
+    expected = _expected_rows(1, 2)
+    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
+        assert torch.equal(
+            gpu_cache[5].contiguous().view(torch.uint8).reshape(-1),
+            expected[bank_idx])
+    assert cache.num_indices.item() == 0  # all misses were disk; list cleared
+
+
+def test_prefetch_skips_slot_resident_expert(checkpoint):
+    cache = _fake_cache()
+    tier = _tier_prefetch(checkpoint, cache, ram_experts=2, window=1)
+    # Make expert 2 slot-resident at layer 1 via a real demand fetch.
+    cache.src_indices[:1] = torch.tensor([2], dtype=torch.int32)
+    cache.evict_slots[:1] = torch.tensor([7], dtype=torch.int32)
+    cache.num_indices.fill_(1)
+    tier.fetch_pending(cache, 1)
+    assert 2 in tier._resident_disk[1]
+    assert tier._slot_owner[(1, 7)] == 2
+    # PILOT at layer 0 predicts expert 2 for layer 1: already resident -> skip.
+    tier.prefetch_from_routing(0, torch.tensor([2], dtype=torch.int32))
+    assert tier.stats()["prefetch_skipped_resident"] == 1
+    assert tier.stats()["prefetch_issued"] == 0
+    assert not tier._stash
+
+
+def test_prefetch_reservation_suppresses_duplicate(checkpoint):
+    cache = _fake_cache()
+    tier = _tier_prefetch(checkpoint, cache, ram_experts=2, window=1)
+    tier.prefetch_from_routing(0, torch.tensor([3], dtype=torch.int32))
+    tier.prefetch_from_routing(0, torch.tensor([3], dtype=torch.int32))
+    _flush_stash(tier)
+    assert tier.stats()["prefetch_issued"] == 1  # second call was a no-op
+
+
+def test_prefetch_window_zero_disables(checkpoint):
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)  # env unset -> window 0
+    tier.prefetch_from_routing(0, torch.tensor([2, 3], dtype=torch.int32))
+    assert tier.stats()["prefetch_issued"] == 0
+    assert not tier._stash
+
+
+def test_slot_mirror_tracks_eviction(checkpoint):
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)
+    # Slot 5 first takes disk expert 2...
+    cache.src_indices[:1] = torch.tensor([2], dtype=torch.int32)
+    cache.evict_slots[:1] = torch.tensor([5], dtype=torch.int32)
+    cache.num_indices.fill_(1)
+    tier.fetch_pending(cache, 1)
+    assert 2 in tier._resident_disk[1]
+    # ...then layer 1 reuses slot 5 for RAM expert 1 -> mirror drops expert 2.
+    cache.src_indices[:1] = torch.tensor([1], dtype=torch.int32)
+    cache.evict_slots[:1] = torch.tensor([5], dtype=torch.int32)
+    cache.num_indices.fill_(1)
+    tier.fetch_pending(cache, 1)
+    assert 2 not in tier._resident_disk[1]
+    assert tier._slot_owner[(1, 5)] == 1

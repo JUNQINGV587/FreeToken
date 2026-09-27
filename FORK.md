@@ -9,6 +9,21 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
 
 ## What this branch adds over upstream
 
+- `fix(utils)`: **msgpack IPC hardening** (`69fce2ba`) — the shared `_CoalescedUnpacker`
+  gets an explicit 1 GiB `max_buffer_size` (`FREETOKEN_MSGPACK_MAX_BUFFER` overrides;
+  invalid/non-positive falls back to the default) and `feed()` catches `BufferFull`,
+  logs the oversized frame, and swaps in a fresh unpacker: the frame is dropped, the
+  worker process survives. Root-caused from a production incident (2026-09-26): a
+  ~258k-token request built a >100 MiB IPC frame, past msgpack's default 100 MiB
+  ceiling, and the uncaught `BufferFull` killed `tokenize_worker`. The same DoS exists
+  upstream. 4 unit tests (`tests/utils/test_mp_coalesced.py::TestOversizedFrames`).
+- `fix(moe)`: **offload stats semantics for non-hybrid decode targets** (`557b6fdd`) —
+  `stat_fetched` only accumulates on the two hybrid decode paths, so with
+  `decode_target=gpu` (the production default) `/v1/stats` reported
+  `fetched_per_layer` as a constant 0 and the idle log showed the misleading
+  `cpu_per_layer == missing_per_layer`. New `_effective_fetched(missing)`: gpu target
+  counts every miss as one H2D fetch (`fetch_rate` 1.0), cpu target counts none,
+  hybrid keeps the real PCIe/CPU split. 3 unit tests.
 - `feat(qwen4_exp)`: **SmoothQuant-style attention alpha consumer** (KV8k-style
   checkpoints): the engine scans safetensors headers for `self_attn.k_alpha` /
   `v_alpha` and the layer binds them iff present (strict loading fails loudly on a

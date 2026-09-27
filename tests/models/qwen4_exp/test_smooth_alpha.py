@@ -95,6 +95,45 @@ def test_shard_alpha_matches_kv_weight_rows():
     )
 
 
+def test_tp_sharded_alpha_applies_to_the_matching_k_slice():
+    """The TP contract, at tensor level: rank r's sharded alpha must multiply exactly
+    the k slice that rank r's sharded k_proj rows produce — i.e.
+    (k_full * alpha_full)[rank slice] == k_full[rank slice] * alpha_shard_r.
+    Both use head-row indexing, so this pins the index alignment numerically."""
+    from types import SimpleNamespace
+
+    from freetoken.models.qwen4_exp.weight import shard_qwen4_exp_dense_tensor
+
+    config = SimpleNamespace(
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=8,
+        linear_attention_group=lambda: None,
+    )
+    gen = torch.Generator().manual_seed(11)
+    alpha = torch.rand(4 * 8, generator=gen) + 0.5
+    k_full = torch.randn(6, 4 * 8, generator=gen)  # [tokens, num_kv*head_dim]
+    key = "model.layers.0.self_attn.k_alpha"
+    k_weight_key = "model.layers.0.self_attn.k_proj.weight"
+    k_weight = torch.randn(4 * 8, 3, generator=gen)  # rows = num_kv*head_dim
+
+    for world_size in (2, 4):
+        for rank in range(world_size):
+            a_shard = shard_qwen4_exp_dense_tensor(
+                key, alpha, config=config, rank=rank, world_size=world_size
+            )
+            w_shard = shard_qwen4_exp_dense_tensor(
+                k_weight_key, k_weight, config=config, rank=rank, world_size=world_size
+            )
+            # the rank's k slice is defined by its k_proj shard's row range
+            row0 = rank * (4 * 8 // world_size)
+            row1 = row0 + 4 * 8 // world_size
+            want = (k_full * alpha)[:, row0:row1]
+            got = k_full[:, row0:row1] * a_shard
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+            assert w_shard.shape[0] == row1 - row0  # alpha and weight agree on width
+
+
 # ------------------------------------------------------------- GPU: module behaviour
 
 

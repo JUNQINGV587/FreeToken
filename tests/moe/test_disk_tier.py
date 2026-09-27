@@ -643,3 +643,37 @@ def test_disk_tier_pin_advice_uses_telemetry(checkpoint):
     # Expert 2 dominates routing mass -> it should be advised into a RAM row,
     # evicting the colder of the pinned {0, 1}.
     assert advice is not None and advice[1] == 2 and advice[0] in (0, 1)
+
+
+def test_hits_bitmap_and_turn_persistence(checkpoint, tmp_path, monkeypatch):
+    """HITS telemetry: source classification + per-turn JSONL persistence."""
+    tele = tmp_path / "telemetry.jsonl"
+    monkeypatch.setenv("FT_DISK_TIER_TELEMETRY", str(tele))
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)
+    # Layer 0 misses: expert 1 (RAM-resident) + expert 3 (disk read).
+    cache.src_indices[:2] = torch.tensor([1, 3], dtype=torch.int32)
+    cache.evict_slots[:2] = torch.tensor([0, 1], dtype=torch.int32)
+    cache.num_indices.fill_(2)
+    tier.fetch_pending(cache, 0)
+    assert tier._turn_src[0, 1].item() == 0  # RAM bank over PCIe
+    assert tier._turn_src[0, 3].item() == 2  # disk read
+    rec = tier.end_turn()
+    assert rec["served_ram"] == 1 and rec["served_disk"] == 1
+    assert (tier._turn_src == -1).all()  # reset after end_turn
+    line = json.loads(tele.read_text().strip())
+    assert line["turn"] == 0 and "0" in line["layers"]
+    assert tier.end_turn()["turn"] == 1
+
+
+def test_hits_bitmap_stash_classification(checkpoint):
+    """Stash hits classify as 1 in the HITS map."""
+    cache = _fake_cache()
+    tier = _tier_prefetch(checkpoint, cache, ram_experts=2, window=1)
+    tier.prefetch_from_routing(0, torch.tensor([3], dtype=torch.int32))
+    _flush_stash(tier)
+    cache.src_indices[:1] = torch.tensor([3], dtype=torch.int32)
+    cache.evict_slots[:1] = torch.tensor([5], dtype=torch.int32)
+    cache.num_indices.fill_(1)
+    tier.fetch_pending(cache, 1)
+    assert tier._turn_src[1, 3].item() == 1  # stash hit

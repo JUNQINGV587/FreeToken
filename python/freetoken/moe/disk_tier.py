@@ -370,6 +370,14 @@ class DiskTier:
         self._pf_hits = 0
         self._pf_wasted = 0
         self._pf_skipped_resident = 0
+        # HITS telemetry (colibri 7.7): per-turn bitmap of which experts were
+        # served and from WHERE -- 0=RAM resident, 1=stash hit, 2=disk read.
+        # -1 = not routed this turn. end_turn() snapshots+resets it and, when
+        # FT_DISK_TIER_TELEMETRY=<jsonl path> is set, appends the turn record.
+        self._turn_src = torch.full(
+            (index.num_layers, index.num_experts), -1, dtype=torch.int8)
+        self._turn = 0
+        self._telemetry_path = os.environ.get("FT_DISK_TIER_TELEMETRY") or None
 
     # ------------------------------------------------------------------ fds
     def _fd(self, shard_idx: int) -> tuple[int, bool]:
@@ -829,6 +837,31 @@ class DiskTier:
         except (RuntimeError, TypeError):
             return torch.zeros(self._slab_bytes(), dtype=torch.uint8)
 
+    def end_turn(self) -> dict:
+        """Close the current telemetry turn: snapshot the HITS bitmap, persist
+        one JSONL record when FT_DISK_TIER_TELEMETRY is set, and reset."""
+        import numpy as np
+        src = self._turn_src
+        hit = src >= 0
+        record = {
+            "turn": self._turn,
+            "served_ram": int((src == 0).sum()),
+            "served_stash": int((src == 1).sum()),
+            "served_disk": int((src == 2).sum()),
+            "pf_hits": self._pf_hits,
+            "pf_wasted": self._pf_wasted,
+            "layers": {
+                str(l): np.packbits(hit[l].numpy()).tobytes().hex()
+                for l in range(src.shape[0]) if bool(hit[l].any())
+            },
+        }
+        self._turn += 1
+        self._turn_src.fill_(-1)
+        if self._telemetry_path:
+            with open(self._telemetry_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        return record
+
     def prefetch_from_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """PILOT trigger: called by the decode path at layer L with L's RAW routing
         (before ensure_experts rewrites it). Identity-map prediction -- colibri
@@ -991,6 +1024,8 @@ class DiskTier:
             self._slot_owner[(layer_id, s)] = e
             if e >= self._ram:
                 self._resident_disk[layer_id].add(e)
+        # RAM-classified misses are served from the host bank over PCIe.
+        self._turn_src[layer_id][src[src < self._ram].long()] = 0
         disk = [i for i in range(n) if int(src[i]) >= self._ram]
         if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0:
             print(f"[fetch-pend] layer=0 n={n} ndisk={len(disk)} "
@@ -1009,9 +1044,11 @@ class DiskTier:
                 futures.append(self._pool.submit(
                     self._stash_to_slot, entry, layer_id, expert, slot))
                 self._pf_hits += 1
+                self._turn_src[layer_id, expert] = 1
             else:
                 futures.append(self._pool.submit(
                     self._fetch_expert, layer_id, expert, slot))
+                self._turn_src[layer_id, expert] = 2
         for f in futures:
             f.result()
         self._sync_fetches()

@@ -264,13 +264,15 @@ class DiskRowTable:
                 bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
+                # snapshot the window context here: the worker runs after the engine has
+                # advanced the requests for the next step, so req fields read there tear
+                windows = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
 
                 def _fill_step() -> None:
                     try:
                         self._readback_event.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
+                        runs = [torch.tensor([*w, t], dtype=torch.int64) for w, t in zip(windows, tokens)]
                         self.fill(runs, graph=True)
                     except BaseException:
                         from freetoken.kernel.row_store import signal

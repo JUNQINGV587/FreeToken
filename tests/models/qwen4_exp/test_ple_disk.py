@@ -416,3 +416,38 @@ def test_async_fill_kill_switch(tmp_path, monkeypatch):
     emb = _embedding()
     ids = emb.row_ids(_meta([prompt], [[EOS, EOS]])).cuda()
     assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "inline fill"
+
+
+@requires_cuda
+def test_async_fill_snapshots_window_at_entry(tmp_path):
+    """The flag-sync decode fill reads the window context at batch entry: the engine advancing
+    req.device_len for the next step before the worker drains the fill must neither crash nor
+    change the rows (e2e 2026-09-27: the deferred read tore and killed the backend worker)."""
+    disk, oracle, args = _make_table(tmp_path)
+    if not disk._wait_sync or disk._worker is None:
+        pytest.skip("needs flag-sync + async fill")
+    gate = threading.Event()
+    disk._worker.submit(lambda: gate.wait(10))  # occupy the worker so the fill drains after the mutation
+    batch = _decode_batch([3, 4], 7)
+    req = batch.reqs[0]
+    with disk.forward_host_ctx(batch, use_graph=True):
+        pass
+    req.device_len += 1  # the next step's value, input_ids not yet extended: the torn state
+    gate.set()
+    disk._join_pending()
+    assert int(disk._flag[0]) == 1
+    # rows must come from the entry snapshot (window [3, 4], token 7), not the mutated request
+    emb = _embedding()
+    row_ids = torch.zeros((1, args.num_ngram_heads), dtype=torch.int64, device="cuda")
+    out = torch.empty((1, args.num_ngram_heads * disk.head_dim), dtype=disk.dtype, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            disk.lookup(row_ids, out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph.replay()
+    torch.cuda.synchronize()
+    ids = emb.row_ids(_meta([[7]], [[3, 4]], decode=True)).cuda()
+    assert _bitwise_equal(out, oracle.lookup(ids)), "fill must use the entry-time window"

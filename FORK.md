@@ -115,9 +115,13 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
 
 ## Testing on this fork
 
-- **Test images**: production images ship without pytest; the `*-test` tag is the same
-  image plus `pip install pytest` (e.g. `freetoken:sm89-delta26-test`). Run suites inside
-  the image that will ship, not against a host checkout.
+- **Test images**: since 2026-09-27 pytest ships **in** the image (base
+  `/data/build/ftcontainer/full0913/Dockerfile` installs it; decision: merge the
+  test toolbox and Xid watchdog roles into the production image chain instead of
+  maintaining separate images). Until the next full rebuild, overlays keep
+  building a `*-test` tag (same image plus `pip install pytest`, e.g.
+  `freetoken:sm89-delta27-test`) and the production tag stays pytest-free.
+  Run suites inside the image that will ship, not against a host checkout.
 - **CPU suites** (`tests/models/qwen4_exp tests/engine tests/server tests/moe
   tests/utils`, `CUDA_VISIBLE_DEVICES=`): expect **all green** (1425 passed at delta26).
   `tests/models` on CPU skips the model-building weight tests — the
@@ -130,9 +134,14 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   (`test_glm_dsa.py::test_indexer_matches_hf_reference` ×2 — the failure is inside the
   transformers HF reference, not this tree; GLM is not served here). Anything beyond
   those two is a regression.
-- **Ad-hoc smoke**: the `freetoken-p0test` container (currently `sm89-delta26-test`,
+- **Ad-hoc smoke**: the `freetoken-p0test` container (currently `sm89-delta27-test`,
   repo mounted at `/ft`) is the standing tool box; `docker exec freetoken-p0test ...`
-  with `PYTHONPATH=/ft/python` tests the live checkout.
+  with `PYTHONPATH=/ft/python` tests the live checkout (note: the bare binary is
+  `python3`, no `python` alias).
+- **Xid watchdog channel**: `/data/ops/gpu_test_guard.sh` reads host dmesg via a
+  throwaway `--privileged` container from the **production image** (resolved
+  dynamically from `freetoken-full0913tp2`, fallback newest `sm89-delta*`) — no
+  separate watchdog container or foreign image since 2026-09-27.
 
 ## Measurement protocol
 

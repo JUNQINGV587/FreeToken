@@ -179,6 +179,38 @@ def _read_safetensors_offsets(path: str) -> dict[str, tuple[int, int]]:
     }
 
 
+
+def autopin_pinned_count(route_hist: "torch.Tensor", budget_bytes: int,
+                         ram_row_bytes: int) -> int:
+    """P1 AUTOPIN (colibri tier.h): pinned share = 0.5 x budget x
+    min(1, observations/200000), then the largest contiguous expert prefix
+    [0, K) whose measured routing mass fits that share.
+
+    route_hist: (L, E) float routing-mass histogram (decayed counts).
+    The prefix constraint matches the host-bank layout (RAM rows are a
+    contiguous prefix); arbitrary-set pinning needs a loader row remap and
+    is deliberately out of scope here.
+    """
+    import torch as _t
+    E = route_hist.shape[-1]
+    total_obs = float(route_hist.sum())
+    if total_obs <= 0 or ram_row_bytes <= 0:
+        return 0
+    pinned_budget = 0.5 * budget_bytes * min(1.0, total_obs / 200000.0)
+    k_max = min(E, int(pinned_budget // ram_row_bytes))
+    if k_max <= 0:
+        return 0
+    # Per-expert mass averaged over layers; prefix coverage of [0, K).
+    mass = route_hist.sum(dim=0) / route_hist.shape[0]
+    coverage = _t.cumsum(mass, dim=0) / mass.sum().clamp(min=1e-9)
+    # Pick the largest K <= k_max that still improves coverage meaningfully;
+    # beyond the mass knee extra pins buy nothing.
+    k = k_max
+    while k > 1 and float(coverage[k - 1]) - float(coverage[k - 2]) < 1e-4:
+        k -= 1
+    return k
+
+
 class Nvfp4DiskIndex:
     """(bank, layer, expert) -> per-segment (shard_idx, offset, nbytes) locations.
 
@@ -319,6 +351,11 @@ class DiskTier:
         self._stash_lock = threading.Lock()
         self._slab_free: list = []        # [(slab tensor, cuda event|None)]
         self._slabs_allocated = 0
+        # P1 telemetry (EMAP): decayed per-(layer, expert) routing mass. Observed
+        # at prefetch_from_routing, which sees every layer's RAW routing in decode.
+        self._route_hist = torch.zeros(
+            (index.num_layers, index.num_experts), dtype=torch.float64)
+        self._hist_since_decay = 0
         self._slab_count = int(os.environ.get("FT_DISK_TIER_PREFETCH_SLABS", "32"))
         # Host mirror of slot occupancy: (layer, slot) -> expert. fetch_pending sees
         # every miss->slot assignment, which is enough to keep this exact; used to
@@ -793,9 +830,18 @@ class DiskTier:
         (before ensure_experts rewrites it). Identity-map prediction -- colibri
         measured 62.3% top-8 overlap between adjacent layers on DSv4 -- so L's
         routed experts are the prefetch set for L+1..L+window."""
+        # Telemetry first (runs even with the prefetch window disabled).
+        flat = expert_ids.reshape(-1).to(torch.int64).cpu()
+        self._route_hist[layer_id].scatter_add_(
+            0, flat, torch.ones_like(flat, dtype=torch.float64))
+        if layer_id == 0:
+            self._hist_since_decay += 1
+            if self._hist_since_decay >= 256:  # ~256 decode tokens per decay round
+                self._route_hist *= 0.97   # per-round decay: stale heat dies off
+                self._hist_since_decay = 0
         if self._prefetch_window <= 0:
             return
-        ids = {int(e) for e in expert_ids.reshape(-1).tolist()}
+        ids = {int(e) for e in flat.tolist()}
         for target in range(layer_id + 1,
                             min(layer_id + 1 + self._prefetch_window,
                                 self._index.num_layers)):
@@ -882,6 +928,32 @@ class DiskTier:
             return
         self.prefetch_from_routing(layer_id, torch.tensor(sorted(ids),
                                                           dtype=torch.int32))
+
+    def route_histogram(self) -> torch.Tensor:
+        """Decayed (L, E) routing-mass snapshot for placement decisions."""
+        return self._route_hist.clone()
+
+    def autopin_advice(self, budget_bytes: int) -> int:
+        """Recommended contiguous RAM prefix K from measured routing mass."""
+        row = self._row_bytes[0] + 2 * _ALIGN if len(self._row_bytes) else 0
+        ram_row = sum(self._row_bytes[b] for b in range(len(self._banks))
+                      if b not in getattr(self._index, "scalar_banks", ()))
+        return autopin_pinned_count(self._route_hist, budget_bytes,
+                                    max(ram_row, row, 1))
+
+    def save_histogram(self, path: str) -> None:
+        payload = {"layers": self._index.num_layers,
+                   "experts": self._index.num_experts,
+                   "hist": self._route_hist.tolist()}
+        with open(path, "w") as f:
+            json.dump(payload, f)
+
+    def load_histogram(self, path: str) -> None:
+        with open(path) as f:
+            payload = json.load(f)
+        hist = torch.tensor(payload["hist"], dtype=torch.float64)
+        if hist.shape == self._route_hist.shape:
+            self._route_hist.copy_(hist)
 
     def fetch_pending(self, cache, layer_id: int) -> None:
         """Fetch this layer's disk-resident misses into their slots; shrink the miss
@@ -990,4 +1062,5 @@ class DiskTier:
             "prefetch_hits": self._pf_hits,
             "prefetch_wasted": self._pf_wasted,
             "prefetch_skipped_resident": self._pf_skipped_resident,
+            "route_hist_total": float(self._route_hist.sum()),
         }

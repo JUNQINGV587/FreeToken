@@ -543,3 +543,58 @@ def test_slot_mirror_tracks_eviction(checkpoint):
     tier.fetch_pending(cache, 1)
     assert 2 not in tier._resident_disk[1]
     assert tier._slot_owner[(1, 5)] == 1
+
+
+# ---------------------------------------------------------------- P1 telemetry / AUTOPIN
+def test_route_histogram_observes_routing_and_decays(checkpoint):
+    from freetoken.moe.disk_tier import DiskTier
+
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache)  # window=0: telemetry must still count
+    tier.prefetch_from_routing(0, torch.tensor([0, 2, 2, 3], dtype=torch.int32))
+    tier.prefetch_from_routing(1, torch.tensor([2, 3], dtype=torch.int32))
+    hist = tier.route_histogram()
+    assert hist[0].tolist() == [1.0, 0.0, 2.0, 1.0]
+    assert hist[1].tolist() == [0.0, 0.0, 1.0, 1.0]
+    # Decay fires after 256 layer-0 observations (one per decode token).
+    for _ in range(256):
+        tier.prefetch_from_routing(0, torch.tensor([0], dtype=torch.int32))
+    hist = tier.route_histogram()
+    assert hist[0, 0] < 1.0 + 256  # old mass decayed by 0.97
+    assert abs(hist[0, 2] - 2.0 * 0.97) < 1e-9
+    assert tier.stats()["route_hist_total"] > 0
+
+
+def test_autopin_pinned_count_respects_budget_and_mass():
+    from freetoken.moe.disk_tier import autopin_pinned_count
+
+    # E=8, all routing mass on experts 0..1 -> tiny K even with a huge budget.
+    hist = torch.zeros((2, 8), dtype=torch.float64)
+    hist[:, 0] = 1000.0
+    hist[:, 1] = 1000.0
+    k = autopin_pinned_count(hist, budget_bytes=1 << 30, ram_row_bytes=1 << 20)
+    assert k == 2  # coverage knee: pinning beyond expert 1 buys nothing
+
+    # Uniform mass: K limited by the 0.5*budget*min(1, obs/200000) share.
+    hist = torch.ones((2, 8), dtype=torch.float64) * 1000.0  # 16000 obs
+    k = autopin_pinned_count(hist, budget_bytes=1 << 30, ram_row_bytes=1 << 20)
+    # share = 0.5 * 1GiB * 16000/200000 = ~40 MiB -> 40 rows, capped by E=8.
+    assert k == 8
+    hist = torch.ones((2, 8), dtype=torch.float64) * 10.0  # 160 obs -> cold
+    k = autopin_pinned_count(hist, budget_bytes=1 << 30, ram_row_bytes=1 << 20)
+    assert k == 0  # min(1, 160/200000) shrinks the share below one row
+
+    # No observations -> no pins.
+    assert autopin_pinned_count(torch.zeros((2, 8)), 1 << 30, 1 << 20) == 0
+
+
+def test_autopin_advice_and_histogram_persistence(checkpoint, tmp_path):
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache)
+    tier.prefetch_from_routing(0, torch.tensor([0, 1, 1], dtype=torch.int32))
+    assert 0 <= tier.autopin_advice(budget_bytes=1 << 30) <= 4
+    p = tmp_path / "hist.json"
+    tier.save_histogram(str(p))
+    tier2 = _tier(checkpoint, _fake_cache())
+    tier2.load_histogram(str(p))
+    assert torch.equal(tier.route_histogram(), tier2.route_histogram())

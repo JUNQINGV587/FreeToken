@@ -98,6 +98,19 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   read at cache construction so a test can flip it.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 
+## Working on this fork (git)
+
+- **`origin` = upstream FreeToken (read-only for us). `fork` = our fork — the only
+  remote we push to.** Repo `AGENTS.md` forbids pushing or PR-ing to upstream on the
+  user's behalf; upstream-bound contributions are the user's own decision.
+- Production mainline branch: **`sm89-moe-offload`** on `fork`. Local experiment/work
+  branches get pushed as `<local>:sm89-moe-offload` when they become the mainline.
+- Cherry-picks keep the original author; our own commits use the fork identity
+  (see /data/AGENTS.md for the exact `user.name`/`user.email` and the vault-backed
+  credential helper).
+- Never rewrite pushed history on `sm89-moe-offload` — production images pin commit
+  markers (`/opt/FREETOKEN-DEPLOYED-COMMIT`) that must stay reachable.
+
 ## Testing on this fork
 
 - **Test images**: production images ship without pytest; the `*-test` tag is the same

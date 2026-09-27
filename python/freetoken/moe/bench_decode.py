@@ -12,6 +12,10 @@ So this loads the actual model and generates.
     ft bench decode --model DIR
     ft bench decode --model DIR --compare moe-backend=hybrid,offload
     ft bench decode --model DIR --compare moe-cache-rate=0.1,0.25,0.5 --cycles 3
+    ft bench decode --model DIR --compare env:FREETOKEN_PLE_ASYNC_FILL=0,1
+
+``env:NAME`` variants set a process env var in the worker instead of an engine kwarg,
+for toggles that are env-only (rollback switches, diagnostics).
 
 Two things it does that a hand-rolled loop usually does not:
 
@@ -147,18 +151,22 @@ def _measure_in_subprocess(spec: dict, quiet: bool) -> dict:
     return out
 
 
-def _variants(compare: str | None, extra: list[str]) -> list[tuple[str, dict]]:
+def _variants(compare: str | None, extra: list[str]) -> list[tuple[str, dict, dict]]:
     base = {}
     for kv in extra:
         k, _, v = kv.partition("=")
         base[k.strip().lstrip("-").replace("-", "_")] = _coerce(v)
     if not compare:
-        return [("baseline", base)]
+        return [("baseline", base, {})]
     flag, _, values = compare.partition("=")
     if not values:
         raise SystemExit("--compare wants FLAG=value1,value2")
-    key = flag.strip().lstrip("-").replace("-", "_")
-    return [(f"{flag}={v}", {**base, key: _coerce(v)}) for v in values.split(",")]
+    flag = flag.strip()
+    if flag.startswith("env:"):
+        name = flag[4:]
+        return [(f"{name}={v}", dict(base), {name: v}) for v in values.split(",")]
+    key = flag.lstrip("-").replace("-", "_")
+    return [(f"{flag}={v}", {**base, key: _coerce(v)}, {}) for v in values.split(",")]
 
 
 def main(argv: list[str] | None = None, prog: str = "ft bench decode") -> int:
@@ -191,17 +199,17 @@ def main(argv: list[str] | None = None, prog: str = "ft bench decode") -> int:
         raise SystemExit(f"--model must be a local directory (got {ns.model!r})")
 
     variants = _variants(ns.compare, ns.set)
-    results: dict[str, list[float]] = {name: [] for name, _ in variants}
+    results: dict[str, list[float]] = {name: [] for name, _, _ in variants}
     print(f"  {len(variants)} variant(s) x {ns.cycles} cycle(s), "
           f"{ns.samples} timed generations of {ns.tokens} tokens each"
           + (f", {ns.concurrency} streams at once" if ns.concurrency > 1 else ""))
     print("  each measurement reloads the model in a fresh process\n")
 
     for cycle in range(1, ns.cycles + 1):
-        for name, kwargs in variants:
+        for name, kwargs, env in variants:
             spec = {"model": ns.model, "kwargs": kwargs, "prompt": ns.prompt,
                     "tokens": ns.tokens, "samples": ns.samples,
-                    "concurrency": ns.concurrency}
+                    "concurrency": ns.concurrency, "env": env}
             t0 = time.perf_counter()
             out = _measure_in_subprocess(spec, ns.quiet)
             dt = time.perf_counter() - t0

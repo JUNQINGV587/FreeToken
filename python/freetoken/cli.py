@@ -16,6 +16,7 @@ Commands:
   daemon      Run the FreeToken supervisor (persistent engine service)
   launch      Configure and launch an agent against a FreeToken server
   checkpoint  Convert an HF safetensors checkpoint to FTW
+  doctor      Read-only deployment health check (JSON for CI)
   bench       Run a benchmark ("bench bw" = bandwidth, "bench decode" = tokens/s)
 
 Use "ft <command> --help" for command-specific options.
@@ -53,6 +54,12 @@ def _run_ctl(argv: list[str]) -> int:
     from freetoken.control_cli import main
 
     return main(argv, prog="ft ctl")
+
+
+def _run_doctor(argv: list[str]) -> int:
+    from freetoken.doctor import main
+
+    return main(argv, prog="ft doctor")
 
 
 def _run_daemon(argv: list[str]) -> int:
@@ -102,6 +109,7 @@ COMMANDS = {
     "daemon": "_run_daemon",
     "launch": "_run_launch",
     "checkpoint": "_run_checkpoint",
+    "doctor": "_run_doctor",
     "bench": "_run_bench",
 }
 

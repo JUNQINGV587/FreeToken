@@ -323,6 +323,15 @@ class IoUringBatchReader final : public BatchReader {
     entries_ = p.sq_entries;
     lens_.assign(entries_, 0);
     sq_shadow_tail_ = *sq_tail_;
+    // colibri c/uring.h lesson: bound the io-wq worker pool or a deep queue of
+    // IOSQE_ASYNC reads can spawn a kernel worker per request under load. Best
+    // effort -- older kernels reject IORING_REGISTER_IOWQ_MAX_WORKERS, which is
+    // not fatal to correctness.
+    {
+      unsigned workers = entries_ < 8 ? entries_ : 8;
+      unsigned limits[2] = {workers, workers};  /* bounded, unbounded io-wq workers */
+      (void)syscall(__NR_io_uring_register, fd_, IORING_REGISTER_IOWQ_MAX_WORKERS, limits, 2);
+    }
     return true;
   }
 
@@ -338,9 +347,19 @@ class IoUringBatchReader final : public BatchReader {
 
   void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
               int64_t off) override {
+    // Defensive contract checks (colibri c/uring.h): a silent SQE wrap would
+    // corrupt an unsubmitted slot, and a truncated uint32_t len a wrong read.
+    if (in_flight_ >= entries_) throw std::runtime_error("io_uring submit: ring full");
+    if (len <= 0 || (uint64_t)len > UINT32_MAX)
+      throw std::runtime_error("io_uring submit: bad read length");
+    if (tag >= entries_) throw std::runtime_error("io_uring submit: tag out of range");
     io_uring_sqe *sqe = &sqes_[sq_shadow_tail_ & *sq_mask_];
     std::memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_READ;
+    // colibri c/uring.h lesson: force IOSQE_ASYNC. Without it the kernel may
+    // execute a cold read inline during io_uring_enter, serializing the
+    // submitter and destroying the I/O/compute overlap this ring exists for.
+    sqe->flags = IOSQE_ASYNC;
     sqe->fd = fd;
     sqe->addr = (uint64_t)(uintptr_t)buf;
     sqe->len = (uint32_t)len;

@@ -134,8 +134,8 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   (`test_glm_dsa.py::test_indexer_matches_hf_reference` ×2 — the failure is inside the
   transformers HF reference, not this tree; GLM is not served here). Anything beyond
   those two is a regression.
-- **Ad-hoc smoke**: the `freetoken-p0test` container (currently `sm89-delta27-test`,
-  repo mounted at `/ft`) is the standing tool box; `docker exec freetoken-p0test ...`
+- **Ad-hoc smoke**: the `freetoken-testbox` container (renamed from freetoken-p0test 2026-09-27; currently `sm89-delta27-test`,
+  repo mounted at `/ft`) is the standing tool box; `docker exec freetoken-testbox ...`
   with `PYTHONPATH=/ft/python` tests the live checkout (note: the bare binary is
   `python3`, no `python` alias).
 - **Xid watchdog channel**: `/data/ops/gpu_test_guard.sh` reads host dmesg via a

@@ -519,9 +519,10 @@ def test_prefetch_reservation_suppresses_duplicate(checkpoint):
     assert tier.stats()["prefetch_issued"] == 1  # second call was a no-op
 
 
-def test_prefetch_window_zero_disables(checkpoint):
+def test_prefetch_window_zero_disables(checkpoint, monkeypatch):
+    monkeypatch.setenv("FT_DISK_TIER_PREFETCH", "0")  # default is 1 (on) since 2026-09-28
     cache = _fake_cache()
-    tier = _tier(checkpoint, cache, ram_experts=2)  # env unset -> window 0
+    tier = _tier(checkpoint, cache, ram_experts=2)
     tier.prefetch_from_routing(0, torch.tensor([2, 3], dtype=torch.int32))
     assert tier.stats()["prefetch_issued"] == 0
     assert not tier._stash

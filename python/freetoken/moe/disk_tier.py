@@ -342,7 +342,10 @@ class DiskTier:
         # its (layer, expert) key suppresses duplicate reads vs the on-demand path
         # (P0-2 reservation). Layer L+1's fetch_pending consumes stash hits with a
         # fast pinned->slot H2D instead of an NVMe round trip.
-        self._prefetch_window = int(os.environ.get("FT_DISK_TIER_PREFETCH", "0"))
+        # Default ON (user decision 2026-09-28): the e2e consistency gate proves
+        # token-identical output with window=1, and stash entries can never evict
+        # the demand set. Set FT_DISK_TIER_PREFETCH=0 to disable explicitly.
+        self._prefetch_window = int(os.environ.get("FT_DISK_TIER_PREFETCH", "1"))
         self._prefetch_pool = (
             ThreadPoolExecutor(max_workers=2, thread_name_prefix="disk-tier-pf")
             if self._prefetch_window > 0 else None

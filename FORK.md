@@ -120,7 +120,7 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   test toolbox and Xid watchdog roles into the production image chain instead of
   maintaining separate images). Until the next full rebuild, overlays keep
   building a `*-test` tag (same image plus `pip install pytest`, e.g.
-  `freetoken:sm89-delta27-test`) and the production tag stays pytest-free.
+  `freetoken:sm89-delta28-test`) and the production tag stays pytest-free.
   Run suites inside the image that will ship, not against a host checkout.
 - **CPU suites** (`tests/models/qwen4_exp tests/engine tests/server tests/moe
   tests/utils`, `CUDA_VISIBLE_DEVICES=`): expect **all green** (1425 passed at delta26).
@@ -134,7 +134,7 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   (`test_glm_dsa.py::test_indexer_matches_hf_reference` ×2 — the failure is inside the
   transformers HF reference, not this tree; GLM is not served here). Anything beyond
   those two is a regression.
-- **Ad-hoc smoke**: the `freetoken-testbox` container (renamed from freetoken-p0test 2026-09-27; currently `sm89-delta27-test`,
+- **Ad-hoc smoke**: the `freetoken-testbox` container (renamed from freetoken-p0test 2026-09-27; currently `sm89-delta28-test`,
   repo mounted at `/ft`) is the standing tool box; `docker exec freetoken-testbox ...`
   with `PYTHONPATH=/ft/python` tests the live checkout (note: the bare binary is
   `python3`, no `python` alias).

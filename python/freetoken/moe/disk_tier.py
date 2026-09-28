@@ -558,18 +558,26 @@ class DiskTier:
                                [(d0, d1, off, nbytes)], off + nbytes])
         return groups
 
-    def _fetch_expert(self, layer: int, expert: int, slot: int) -> None:
+    def _fetch_expert(self, layer: int, expert: int, slot: int,
+                      dst_buffers: list | None = None, buffer_id: int = 0) -> None:
         # The server runs under inference_mode; the fetch pool threads do not,
         # so the H2D writes into the (inference) slot cache need their own scope.
         with torch.inference_mode():
-            self._fetch_expert_inner(layer, expert, slot)
+            self._fetch_expert_inner(layer, expert, slot, dst_buffers, buffer_id)
 
-    def _fetch_expert_inner(self, layer: int, expert: int, slot: int) -> None:
+    def _fetch_expert_inner(self, layer: int, expert: int, slot: int,
+                            dst_buffers: list | None = None,
+                            buffer_id: int = 0) -> None:
         ring = self._staging_ring()
         ri = getattr(self._staging, "ri", 0)
         scalar_banks = getattr(self._index, "scalar_banks", ())
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
-            row = gpu_cache[slot]
+            if dst_buffers is None:
+                row = gpu_cache[slot]
+            else:
+                # Overlap prefill: write directly into the borrowed buffer row
+                # (position == expert id); the identity slots are untouched.
+                row = dst_buffers[bank_idx][buffer_id][expert]
             if bank_idx in scalar_banks:
                 self._fill_scalar_row(bank_idx, layer, expert, row)
                 continue
@@ -833,6 +841,21 @@ class DiskTier:
         preserved, so the prefill GEMM is unchanged."""
         from freetoken.moe.offload_kernels import _materialize_layer_gpu
 
+        _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram)
+        self.fetch_routed(cache, layer_id, expert_ids)
+
+    def fetch_routed(self, cache, layer_id: int,
+                     expert_ids: torch.Tensor) -> torch.Tensor:
+        """Fetch the ROUTED disk-resident experts of one layer into their identity
+        slots (slot row == expert id) and return them as a device int32 tensor.
+
+        Shared by the legacy prefill (``materialize_layer``) and the overlap
+        prefill, whose ring already streamed the RAM prefix into a borrowed
+        buffer and only needs the disk rows patched in. ``expert_ids`` is the
+        layer's routing (GLOBAL ids under owner-EP; renumbered to local rows
+        here). Bookkeeping (slot_for_id/id_of_slot/usage) matches the
+        materialize kernel so the decode LRU sees the fetched experts.
+        """
         # Prefill identity mapping owns ALL of slots [0, E) for this layer, but
         # the kernel only scans slots < materialize_count, so the disk slots
         # [ram, E) that still hold a previous layer's experts (previous prefill
@@ -845,19 +868,13 @@ class DiskTier:
         seg[valid] = -1
         cache.usage[self._ram:cache.num_experts][valid] = 0
 
-        _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram)
-        routed = expert_ids.reshape(-1)
-        if self._g0 or self._local_num != self._index.num_experts:
-            # Owner-local EP: routing arrives GLOBAL; renumber to local rows and
-            # drop the experts this rank does not own.
-            routed = routed - self._g0
-            routed = routed[(routed >= 0) & (routed < self._local_num)]
-        disk = torch.unique(routed[routed >= self._ram])
+        routed = self._routed_disk(expert_ids)
+        disk = routed
         if os.environ.get("FT_DISK_TIER_DEBUG") and layer_id < 3:
-            print(f"[disk-tier dbg] layer={layer_id} routed={routed.numel()} "
+            print(f"[disk-tier dbg] layer={layer_id} routed={expert_ids.numel()} "
                   f"unique_disk={disk.numel()} disk={disk.tolist()[:12]}", flush=True)
         if disk.numel() == 0:
-            return
+            return disk.to(dtype=torch.int32)
         # cache.step was already incremented by the kernel; assign the 0-d tensor
         # device-side (same dtype/device as usage) instead of .item()-ing it, which
         # would sync the stream once per layer on the prefill/decode path.
@@ -879,6 +896,57 @@ class DiskTier:
         cache.slot_for_id[layer_id, disk] = disk
         cache.id_of_slot[disk] = flat
         cache.usage[disk] = cache.step
+        return disk.to(dtype=torch.int32)
+
+    def _routed_disk(self, expert_ids: torch.Tensor) -> torch.Tensor:
+        """Unique disk-resident rows in this layer's routing (GLOBAL ids under
+        owner-EP; renumbered to local rows, unowned experts dropped)."""
+        routed = expert_ids.reshape(-1)
+        if self._g0 or self._local_num != self._index.num_experts:
+            # Owner-local EP: routing arrives GLOBAL; renumber to local rows and
+            # drop the experts this rank does not own.
+            routed = routed - self._g0
+            routed = routed[(routed >= 0) & (routed < self._local_num)]
+        return torch.unique(routed[routed >= self._ram])
+
+    def fetch_routed_into(self, cache, layer_id: int,
+                          expert_ids: torch.Tensor, buffer_id: int) -> int:
+        """Overlap-prefill fetch: write the routed disk-resident experts directly
+        into the borrowed buffer rows (position == expert id), bypassing the
+        identity slots. The overlap ring borrows the slot cache's first
+        ``depth * E`` rows as buffers, so the identity slots ARE buffer rows --
+        fetching into them would scribble on a neighbouring buffer whose GEMM
+        may still be reading it. The buffer's tail rows were never copied by
+        the ring (prefix-only copy), so no ring-copy/pool-write race either.
+
+        Slot bookkeeping is untouched: the buffer rows' map entries are owned
+        by the overlap ring (``_invalidate_prefill_buffer``), and decode never
+        sees a phantom hit. Returns the fetched-expert count.
+        """
+        disk = self._routed_disk(expert_ids)
+        if disk.numel() == 0:
+            return 0
+        device = self._banks[0][1].device
+        if device.type == "cuda":
+            # Order the pool threads' H2D writes (default stream) behind ALL
+            # compute enqueued so far -- this layer's ring-copy wait
+            # (wait_prefill_layer) and the previous occupants' GEMMs. The NVMe
+            # preadv below still overlaps the in-flight compute; only the PCIe
+            # writes wait.
+            gate = torch.cuda.Event()
+            gate.record()
+            torch.cuda.default_stream(device).wait_event(gate)
+        buffers = cache.prefill_bank_buffers
+        futures = [
+            self._pool.submit(self._fetch_expert, layer_id, int(e), -1,
+                              buffers, buffer_id)
+            for e in disk.tolist()
+        ]
+        for f in futures:
+            f.result()
+        self._sync_fetches()
+        self._dbg_fetched[layer_id] = {int(e) for e in disk.tolist()}
+        return disk.numel()
 
     # ------------------------------------------------------------- PILOT prefetch
     def _slab_bytes(self) -> int:

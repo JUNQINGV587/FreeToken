@@ -76,11 +76,14 @@ def _worker(args: argparse.Namespace) -> None:
         moe_cache_size=int(os.environ.get("FREETOKEN_TEST_MOE_CACHE_SIZE", "512")),
         # Prefill overlap borrows 2*num_experts slots; a 512-slot cache on a
         # 512-expert model leaves nothing for decode. The gate targets the
-        # decode read path, so overlap stays off here.
-        moe_prefill_overlap=False,
+        # decode read path, so overlap stays off unless --overlap asks for it
+        # (which also grows the cache to fit the ring plus decode slack).
+        moe_prefill_overlap=bool(args.overlap),
         moe_disk_tier=args.disk_tier,
         cuda_graph_max_bs=1,
     )
+    if args.overlap:
+        kwargs["moe_cache_size"] = 2 * 512 + 256
     if args.disk_tier != "off":
         kwargs["expert_ram_experts"] = args.ram_experts
         # engine.py:857 -- disk-tier v0 requires cuda graphs disabled.
@@ -144,11 +147,14 @@ def _worker_owner(args: argparse.Namespace) -> None:
            "--moe-ep-size", str(args.ep_size),
            "--moe-strategy", "offload", "--moe-cache-policy", "lru",
            "--moe-cache-size", os.environ.get("FREETOKEN_TEST_MOE_CACHE_SIZE", "512"),
-           "--disable-moe-prefill-overlap",
            # Graphs stay at the same setting in reference and test configs so
            # the tier is the only difference between them.
            "--cuda-graph-max-bs", str(args.graph_bs),
            "--max-running-requests", "1"]
+    if not args.overlap:
+        # Overlap defaults on (config.py); keep the historical gate behaviour
+        # unless --overlap opts in.
+        cmd.append("--disable-moe-prefill-overlap")
     if args.disk_tier != "off":
         cmd += ["--moe-disk-tier", "on",
                 "--expert-ram-experts", str(args.ram_experts)]
@@ -197,14 +203,15 @@ def _worker_owner(args: argparse.Namespace) -> None:
 
 def _run_config(model_path: Path, disk_tier: str, ram_experts: int,
                 prefetch_window: int, ep_size: int = 1,
-                graph_bs: int = 0) -> dict:
+                graph_bs: int = 0, overlap: int = 0) -> dict:
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2] / "python"))
     proc = subprocess.run(
         [sys.executable, __file__, "--worker",
          "--model", str(model_path), "--disk-tier", disk_tier,
          "--ram-experts", str(ram_experts), "--prefetch", str(prefetch_window),
-         "--ep-size", str(ep_size), "--graph-bs", str(graph_bs)],
+         "--ep-size", str(ep_size), "--graph-bs", str(graph_bs),
+         "--overlap", str(overlap)],
         capture_output=True, text=True, timeout=1800, env=env)
     for line in proc.stdout.splitlines():
         if line.startswith(MARK):
@@ -228,6 +235,13 @@ def gate_results() -> dict:
         "baseline": _run_config(model_path, "off", ram_experts=0, prefetch_window=0),
         "disk": _run_config(model_path, "on", ram_experts, prefetch_window=0),
         "prefetch": _run_config(model_path, "on", ram_experts, prefetch_window=1),
+        # Prefill-overlap × disk tier: the ring streams only the pinned RAM
+        # prefix and the routed disk rows are patched into the borrowed buffer
+        # at layer entry (DiskTier.fetch_routed_into). TP1 reference is the
+        # tier with overlap off (same topology, so greedy tokens are
+        # comparable).
+        "disk_overlap": _run_config(
+            model_path, "on", ram_experts, prefetch_window=0, overlap=1),
     }
     if torch.cuda.device_count() >= 2:
         # Owner-local EP (TP2+EP2): each rank's tier serves only its owned
@@ -249,6 +263,15 @@ def gate_results() -> dict:
         results["owner_graph"] = _run_config(
             model_path, "on", ram_experts, prefetch_window=1, ep_size=2,
             graph_bs=graph_bs)
+        # Full production stack: owner-EP + CUDA graphs + prefill overlap, with
+        # and without the disk tier. Same TP2 topology both sides, so the
+        # greedy tokens must be byte-identical.
+        results["owner_full_ref"] = _run_config(
+            model_path, "off", ram_experts=0, prefetch_window=0, ep_size=2,
+            graph_bs=graph_bs, overlap=1)
+        results["owner_full"] = _run_config(
+            model_path, "on", ram_experts, prefetch_window=1, ep_size=2,
+            graph_bs=graph_bs, overlap=1)
     return results
 
 
@@ -318,6 +341,41 @@ def test_disk_tier_cuda_graphs_greedy_matches_graphed_reference(gate_results):
         "graphed owner-EP warm decode", owner["warm"], base)
 
 
+@pytest.mark.needs_weights
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="disk-tier gate needs CUDA")
+def test_disk_tier_overlap_greedy_matches_tier_only(gate_results):
+    """Prefill overlap ON with the disk tier (TP1): the overlap ring streams
+    only the pinned RAM prefix and DiskTier.fetch_routed_into patches the
+    routed disk rows into the borrowed buffer at layer entry. Tokens must be
+    identical to the same tiered topology with overlap off (a ring-buffer
+    scribble or a missing disk-row patch corrupts the prefill)."""
+    disk = gate_results["disk"]
+    overlap = gate_results["disk_overlap"]
+    assert overlap["cold"] == disk["cold"], _diff(
+        "overlap cold prefill (buffer rows stale / disk rows missing?)",
+        overlap["cold"], disk["cold"])
+    assert overlap["warm"] == disk["cold"], _diff(
+        "overlap warm decode", overlap["warm"], disk["cold"])
+
+
+@pytest.mark.needs_weights
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="disk-tier gate needs CUDA")
+def test_disk_tier_full_stack_greedy_matches_reference(gate_results):
+    """The production stack -- owner-EP (TP2) + CUDA graphs + prefill overlap +
+    disk tier -- must be token-identical to the same topology with the tier
+    off. This is the config the production server would actually run."""
+    owner = gate_results.get("owner_full")
+    owner_ref = gate_results.get("owner_full_ref")
+    if owner is None or owner_ref is None:
+        pytest.skip("full-stack gate needs >= 2 GPUs")
+    base = owner_ref["cold"]
+    assert owner["cold"] == base, _diff(
+        "full-stack cold decode (overlap buffer patch or doorbell wrong?)",
+        owner["cold"], base)
+    assert owner["warm"] == base, _diff(
+        "full-stack warm decode", owner["warm"], base)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker", action="store_true")
@@ -328,6 +386,8 @@ if __name__ == "__main__":
     ap.add_argument("--ep-size", type=int, default=1)
     ap.add_argument("--graph-bs", type=int, default=0,
                     help="cuda-graph max bs (0 = graphs disabled)")
+    ap.add_argument("--overlap", type=int, default=0,
+                    help="1 = keep prefill overlap on (default strips it)")
     ns = ap.parse_args()
     if ns.worker:
         _worker(ns)

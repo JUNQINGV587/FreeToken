@@ -851,8 +851,10 @@ class Engine:
             if decode_target != "gpu":
                 problems.append(
                     "--moe-disk-tier v0 requires the gpu decode path (--moe-strategy offload)")
-            if config.moe_prefill_overlap:
-                problems.append("--moe-disk-tier v0 requires --disable-moe-prefill-overlap")
+            # Prefill overlap is supported: the ring streams only the pinned RAM
+            # prefix (prefix-only copy in prefetch_prefill_layer) and the routed
+            # disk rows are patched into the borrowed buffer at layer entry
+            # (DiskTier.fetch_routed_into via fetch_into_prefill_buffer).
             # CUDA graphs are supported: capture records graph-doorbell fetch
             # kernels (moe/graph_fetch.py) and a host service thread performs
             # the actual disk reads at replay time.

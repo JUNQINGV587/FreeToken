@@ -236,6 +236,7 @@ def test_mid_chunk_exception_aborts_the_chunk():
     calls: list[str] = []
     cache = SimpleNamespace(
         prefill_overlap=True,
+        disk_tier_enabled=False,
         alphas_for_layer=lambda layer: None,
         release_prefill_layer=lambda layer: calls.append("release"),
         abort_prefill_chunk=lambda: calls.append("abort"),
@@ -255,6 +256,7 @@ def test_clean_layer_releases_without_abort():
     calls: list[str] = []
     cache = SimpleNamespace(
         prefill_overlap=True,
+        disk_tier_enabled=False,
         alphas_for_layer=lambda layer: None,
         release_prefill_layer=lambda layer: calls.append("release"),
         abort_prefill_chunk=lambda: calls.append("abort"),

@@ -797,8 +797,19 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
+            # Disk tier: only the RAM-resident prefix is pinned/backed in the host
+            # banks; the released tail reads as zeros. Stream just the prefix --
+            # the routed disk rows are patched into the buffer at layer entry
+            # (DiskTier.fetch_routed_into), and unrouted tail rows are never
+            # gathered by the grouped GEMM.
+            tier = self._disk_tier
+            n = tier._ram if tier is not None else None
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                if n is None:
+                    buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                else:
+                    buffer[buffer_id][:n].copy_(per_layer[layer_id][:n],
+                                                non_blocking=True)
 
         if self._prefill_hit_d2d_active:
             with self._prof.phase("stage_split"):
@@ -828,6 +839,11 @@ class OffloadMoeCache:
 
         if self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
             reason = "prefill overlap buffers are not initialized for this device"
+        elif self._disk_tier is not None:
+            # Slot snapshot rows [ram, E) are disk-tier scratch, not residency;
+            # the split's hit classification would misread them. The legacy
+            # copy is prefix-only under a tier (see prefetch_prefill_layer).
+            reason = "disk tier is on (slot snapshot does not reflect residency)"
         elif _skip_fast_index_copy_enabled():
             reason = "FREETOKEN_SKIP_FAST_INDEX_COPY is set (the hit gather would be a no-op)"
         elif not self._copy_fused_ok:
@@ -1094,6 +1110,22 @@ class OffloadMoeCache:
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
 
+    def fetch_into_prefill_buffer(self, layer_id: int,
+                                  expert_ids: torch.Tensor) -> int:
+        """Disk-tier overlap prefill: after ``wait_prefill_layer`` (the ring
+        streamed the RAM prefix into this layer's borrowed buffer), fetch the
+        ROUTED disk-resident experts directly into the buffer rows
+        (``position == expert id``, so the prefill GEMM is unchanged).
+
+        Called between wait_prefill_layer and the GEMM; host-blocking (NVMe
+        reads), same as the non-overlap disk-tier prefill fetch. No-op without
+        a disk tier. Returns the fetched-expert count.
+        """
+        if self._disk_tier is None:
+            return 0
+        return self._disk_tier.fetch_routed_into(
+            self, layer_id, expert_ids, buffer_id=layer_id % self._prefill_depth)
+
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 
@@ -1335,7 +1367,10 @@ class OffloadMoeCache:
 
         assert self.decode_target == "gpu", "disk tier v0 supports the gpu (offload) path only"
         assert self.quant_format == "nvfp4", f"disk tier v0 supports native nvfp4 banks (got {self.quant_format!r})"
-        assert not self.prefill_overlap, "disk tier v0 does not support prefill overlap"
+        # Prefill overlap is supported: the overlap ring streams only the pinned
+        # RAM prefix (prefix-only copy in prefetch_prefill_layer) and the routed
+        # disk rows are patched into the borrowed buffer at layer entry
+        # (DiskTier.fetch_routed_into via fetch_into_prefill_buffer).
         self._disk_tier = DiskTier(index, self, ram_experts, workers=workers,
                                    ownership=ownership)
         if graph_k_max:

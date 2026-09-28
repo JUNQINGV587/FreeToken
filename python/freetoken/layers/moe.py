@@ -514,6 +514,10 @@ class OffloadMoELayer(MoELayer):
             return self._prefill_owner(hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
+            if cache.disk_tier_enabled:
+                # The ring streamed only the pinned RAM prefix; patch the routed
+                # disk-resident rows into this layer's buffer before the GEMM.
+                cache.fetch_into_prefill_buffer(self.layer_id, topk_ids)
             try:
                 with prefill_profile.get_profiler().phase("moe_gemm"):
                     out = self._expert_gemm(
@@ -579,6 +583,11 @@ class OffloadMoELayer(MoELayer):
             for i in range(owner.prefill_depth):
                 owner.prefetch_prefill_layer(self.layer_id + i)
             views = owner.wait_prefill_layer(self.layer_id)
+            if owner.disk_tier_enabled:
+                # Same disk-row patch as the global-ID overlap path: the ring
+                # streamed only the owner-local pinned RAM prefix (for a rank
+                # owning only disk-resident experts that is nothing at all).
+                owner.fetch_into_prefill_buffer(self.layer_id, topk_ids)
         else:
             owner.materialize_layer(self.layer_id, buffer_id=0, expert_ids=topk_ids)
             views = owner.bank_views(owner.num_experts)

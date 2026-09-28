@@ -57,6 +57,9 @@ def _num_experts(model_path: Path) -> int:
 
 def _worker(args: argparse.Namespace) -> None:
     """Runs in a fresh process: build one LLM, generate twice, print JSON."""
+    if args.ep_size > 1:
+        _worker_owner(args)
+        return
     from freetoken.core import SamplingParams
     from freetoken.llm import LLM
 
@@ -82,10 +85,6 @@ def _worker(args: argparse.Namespace) -> None:
         kwargs["expert_ram_experts"] = args.ram_experts
         # engine.py:857 -- disk-tier v0 requires cuda graphs disabled.
         kwargs["cuda_graph_max_bs"] = 0
-    if args.ep_size > 1:
-        # Owner-local EP: the tier must translate local<->global expert rows.
-        kwargs["tensor_parallel_size"] = args.ep_size
-        kwargs["moe_ep_size"] = args.ep_size
     llm = LLM(**kwargs)
     try:
         sampling = SamplingParams(
@@ -97,6 +96,103 @@ def _worker(args: argparse.Namespace) -> None:
         print(MARK + json.dumps({"cold": cold, "warm": warm}))
     finally:
         llm.shutdown()
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _post_json(base: str, path: str, payload: dict, timeout: float):
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(
+        base + path, data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def _worker_owner(args: argparse.Namespace) -> None:
+    """Owner-local EP config: the offline LLM class is hardwired single-rank
+    (tp_info=DistributedInfo(0, 1)), so boot the real server with TP/EP and
+    drive greedy /v1/completions over HTTP -- same topology as production."""
+    import tempfile
+    import time
+    import urllib.error
+    import urllib.request
+
+    repo_python = Path(__file__).resolve().parents[2] / "python"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_python)
+    if args.prefetch > 0:
+        env["FT_DISK_TIER_PREFETCH"] = str(args.prefetch)
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    log = tempfile.NamedTemporaryFile(
+        mode="w", prefix="owner-gate-", suffix=".log", delete=False)
+    cmd = [sys.executable, "-m", "freetoken",
+           "--model-path", args.model,
+           "--served-model-name", "owner-gate",
+           "--host", "127.0.0.1", "--port", str(port),
+           "--tensor-parallel-size", str(args.ep_size),
+           "--moe-ep-size", str(args.ep_size),
+           "--moe-strategy", "offload", "--moe-cache-policy", "lru",
+           "--moe-cache-size", os.environ.get("FREETOKEN_TEST_MOE_CACHE_SIZE", "512"),
+           "--disable-moe-prefill-overlap",
+           # Keep graphs off in BOTH owner configs so the tier is the only
+           # difference between reference and test.
+           "--cuda-graph-max-bs", "0",
+           "--max-running-requests", "1"]
+    if args.disk_tier != "off":
+        cmd += ["--moe-disk-tier", "on",
+                "--expert-ram-experts", str(args.ram_experts)]
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+
+    def _serving(deadline: float) -> None:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                log.flush()
+                raise RuntimeError(
+                    f"owner-gate server exited early (rc={proc.returncode}); "
+                    f"log tail:\n{Path(log.name).read_text()[-3000:]}")
+            try:
+                with urllib.request.urlopen(base + "/v1/cache/status", timeout=10) as r:
+                    if json.loads(r.read())["state"] == "serving":
+                        return
+            except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError):
+                pass
+            time.sleep(2.0)
+        raise TimeoutError("owner-gate server never reached the serving state")
+
+    max_tokens = int(os.environ.get("FREETOKEN_TEST_MAX_TOKENS", "48"))
+
+    def _gen(prompt: str) -> str:
+        code, body = _post_json(
+            base, "/v1/completions",
+            {"model": "owner-gate", "prompt": prompt,
+             "temperature": 0.0, "max_tokens": max_tokens},
+            timeout=600)
+        if code != 200:
+            raise RuntimeError(f"completion failed ({code}): {body}")
+        return str(body["choices"][0]["text"])
+
+    try:
+        _serving(time.monotonic() + 1200)
+        cold = [_gen(p) for p in PROMPTS]
+        warm = [_gen(p) for p in PROMPTS]
+        print(MARK + json.dumps({"cold": cold, "warm": warm}))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 def _run_config(model_path: Path, disk_tier: str, ram_experts: int,
@@ -134,7 +230,12 @@ def gate_results() -> dict:
     }
     if torch.cuda.device_count() >= 2:
         # Owner-local EP (TP2+EP2): each rank's tier serves only its owned
-        # experts, translated from the global checkpoint rows.
+        # experts, translated from the global checkpoint rows. The reference
+        # must be the SAME TP2 topology with the tier off -- TP changes
+        # all-reduce summation order, so a TP1 baseline legitimately diverges
+        # from TP2 under greedy decoding.
+        results["owner_ref"] = _run_config(
+            model_path, "off", ram_experts=0, prefetch_window=0, ep_size=2)
         results["owner"] = _run_config(
             model_path, "on", ram_experts, prefetch_window=1, ep_size=2)
     return results
@@ -173,12 +274,14 @@ def test_disk_tier_prefetch_greedy_matches_baseline(gate_results):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="disk-tier gate needs CUDA")
 def test_disk_tier_owner_ep_greedy_matches_baseline(gate_results):
     """Owner-local EP (TP2+EP2) with the disk tier must be token-identical to
-    the single-rank all-RAM baseline: a namespace slip would fetch a remote
-    rank's expert rows and corrupt the tokens."""
+    the SAME TP2 topology with the tier off: a namespace slip would fetch a
+    remote rank's expert rows and corrupt the tokens. (TP1-vs-TP2 comparison
+    is invalid -- all-reduce order legitimately diverges under greedy.)"""
     owner = gate_results.get("owner")
-    if owner is None:
+    owner_ref = gate_results.get("owner_ref")
+    if owner is None or owner_ref is None:
         pytest.skip("owner-EP gate needs >= 2 GPUs")
-    base = gate_results["baseline"]["cold"]
+    base = owner_ref["cold"]
     assert owner["cold"] == base, _diff(
         "owner-EP cold decode (local<->global translation wrong?)",
         owner["cold"], base)

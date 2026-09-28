@@ -344,8 +344,9 @@ class DiskTier:
         self._scalar_preload_reads = 0
         self._scalars: dict | None = None
         self._scalars_lock = threading.Lock()
-        self._decode_verify_steps = 0
-        self._map_verify_steps = 0
+        self._decode_verify_steps = {}  # layer_id -> verified step count
+        self._map_verify_steps = {}  # layer_id -> verified step count
+        self._dbg_fetched = {}  # layer_id -> set of experts disk-fetched on the latest call
         self._cache = cache
         # ---- PILOT prefetch (P0-4 port of colibri's router-guided cross-layer
         # prefetch): at layer L the decode path hands us L's raw routing; we read
@@ -753,25 +754,49 @@ class DiskTier:
         print(f"[identify] L{layer} B{bank_idx} n={flat_cpu.numel()} "
               f"source={found if found else 'UNKNOWN'}", flush=True)
 
-    def verify_decode_mapping(self, cache, layer_id: int, topk_ids: torch.Tensor) -> None:
+    def verify_decode_mapping(self, cache, layer_id: int, topk_ids: torch.Tensor,
+                              routed_experts: torch.Tensor | None = None) -> None:
         """Debug: after the LRU rewrite + fetch/copy, check that every slot the GEMM
         will read actually holds the expert the bookkeeping says it holds. Gated on
-        FT_DISK_TIER_VERIFY; first 4 decode steps only."""
-        if self._map_verify_steps >= 4:
+        FT_DISK_TIER_VERIFY; FT_DISK_TIER_VERIFY_STEPS caps steps (default 4);
+        FT_DISK_TIER_VERIFY_ALL_LAYERS=1 checks every layer, else layer 0 callers only.
+
+        When ``routed_experts`` (the local expert ids aligned with ``topk_ids``) is
+        given, the check is route satisfaction: the bytes at each slot must equal the
+        ROUTED expert's reference row, and ``id_of_slot`` is diagnostic only. Without
+        it (legacy), the reference expert is taken from ``id_of_slot`` itself -- that
+        only proves bookkeeping<->bytes consistency, which a wrong-but-consistent
+        assignment passes."""
+        cap = int(os.environ.get("FT_DISK_TIER_VERIFY_STEPS", "4"))
+        steps_done = self._map_verify_steps.get(layer_id, 0)
+        if steps_done >= cap:
             return
-        self._map_verify_steps += 1
-        slots = torch.unique(topk_ids.reshape(-1))
+        self._map_verify_steps[layer_id] = steps_done + 1
+        map_step = steps_done + 1
+        banks = self._banks if os.environ.get(
+            "FT_DISK_TIER_VERIFY_ALL_BANKS") else self._banks[:1]
+        if routed_experts is not None:
+            pairs = torch.stack(
+                (topk_ids.reshape(-1).long(), routed_experts.reshape(-1).long()),
+                dim=1).unique(dim=0)
+            checks = [(int(s), int(e)) for s, e in pairs.tolist()]
+        else:
+            checks = [(int(s), None)
+                      for s in torch.unique(topk_ids.reshape(-1)).tolist()]
         nbad = 0
-        for s in slots.tolist():
-            s = int(s)
+        for s, routed in checks:
             flat_id = int(cache.id_of_slot[s].item())
-            if flat_id < 0:
-                print(f"[verify-map] step={self._map_verify_steps} slot={s} id_of_slot=-1",
+            if routed is None and flat_id < 0:
+                print(f"[verify-map] step={map_step} L{layer_id} slot={s} id_of_slot=-1",
                       flush=True)
                 nbad += 1
                 continue
-            expert = flat_id % cache.num_experts
-            for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
+            expert = routed if routed is not None else flat_id % cache.num_experts
+            fetched = (routed is not None
+                       and int(routed) in self._dbg_fetched.get(layer_id, set()))
+            diag = (f" routed={routed} id_of_slot={flat_id} fetched={fetched}"
+                    if routed is not None else "")
+            for bank_idx, (_host_layer, gpu_cache) in enumerate(banks):
                 slot_row = gpu_cache[s].contiguous()
                 flat = slot_row.view(torch.uint8).reshape(-1)
                 ref = self._ref_row(bank_idx, layer_id, expert, flat.numel(),
@@ -781,11 +806,11 @@ class DiskTier:
                 if not bool(torch.equal(flat.cpu(), ref)):
                     nbad += 1
                     if nbad <= 8:
-                        print(f"[verify-map] step={self._map_verify_steps} slot={s} "
-                              f"expert={expert} bank={bank_idx} MISMATCH "
+                        print(f"[verify-map] step={map_step} L{layer_id} slot={s} "
+                              f"expert={expert} bank={bank_idx} MISMATCH{diag} "
                               f"slot_head={flat[:8].tolist()} ref_head={ref[:8].tolist()}",
                               flush=True)
-        print(f"[verify-map] step={self._map_verify_steps} slots={slots.numel()} bad={nbad}",
+        print(f"[verify-map] step={map_step} L{layer_id} slots={len(checks)} bad={nbad}",
               flush=True)
 
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -831,7 +856,9 @@ class DiskTier:
         for f in futures:
             f.result()
         self._sync_fetches()
-        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id in (0, 20) and disk.numel() > 0:
+        if os.environ.get("FT_DISK_TIER_VERIFY") and disk.numel() > 0 and (
+                layer_id in (0, 20)
+                or os.environ.get("FT_DISK_TIER_VERIFY_ALL_LAYERS")):
             limit = disk.numel() if layer_id == 0 else 6  # layer 0: ALL experts (race hunt)
             for e in disk.tolist()[:limit]:
                 self._verify_slot(cache, layer_id, int(e), phase="prefill")
@@ -1055,8 +1082,9 @@ class DiskTier:
         # RAM-classified misses are served from the host bank over PCIe.
         self._turn_src[layer_id][src[src < self._ram].long()] = 0
         disk = [i for i in range(n) if int(src[i]) >= self._ram]
-        if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0:
-            print(f"[fetch-pend] layer=0 n={n} ndisk={len(disk)} "
+        if os.environ.get("FT_DISK_TIER_VERIFY") and (
+                layer_id == 0 or os.environ.get("FT_DISK_TIER_VERIFY_ALL_LAYERS")):
+            print(f"[fetch-pend] layer={layer_id} n={n} ndisk={len(disk)} "
                   f"src_head={src[:4].tolist()}", flush=True)
         if not disk:
             return
@@ -1080,11 +1108,15 @@ class DiskTier:
         for f in futures:
             f.result()
         self._sync_fetches()
-        if (os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0
-                and self._decode_verify_steps < 3):
-            self._decode_verify_steps += 1
+        if os.environ.get("FT_DISK_TIER_VERIFY"):
+            self._dbg_fetched[layer_id] = {int(src[i]) for i in disk}
+        if (os.environ.get("FT_DISK_TIER_VERIFY")
+                and (layer_id == 0 or os.environ.get("FT_DISK_TIER_VERIFY_ALL_LAYERS"))
+                and self._decode_verify_steps.get(layer_id, 0) < 3):
+            dec_step = self._decode_verify_steps.get(layer_id, 0) + 1
+            self._decode_verify_steps[layer_id] = dec_step
             for i in disk[:8]:
-                print(f"[verify-decode] step={self._decode_verify_steps} "
+                print(f"[verify-decode] step={dec_step} L{layer_id} "
                       f"expert={int(src[i])} slot={int(slots[i])} ndisk={len(disk)}", flush=True)
                 self._verify_slot(cache, layer_id, int(src[i]), int(slots[i]),
                                   phase="decode")

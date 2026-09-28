@@ -378,6 +378,14 @@ class OffloadMoELayer(MoELayer):
         else:
             update = owner.ensure_route(self.layer_id, topk_weights, topk_ids)
         owner.copy_missing()
+        inner = owner._cache
+        if (inner.disk_tier_enabled
+                and os.environ.get("FT_DISK_TIER_VERIFY")
+                and (self.layer_id == 0
+                     or os.environ.get("FT_DISK_TIER_VERIFY_ALL_LAYERS"))):
+            inner._disk_tier.verify_decode_mapping(
+                inner, self.layer_id, update.slot_ids[update.owned_mask],
+                update.local_ids[update.owned_mask])
         out = self._expert_gemm(
             owner,
             hidden_states,

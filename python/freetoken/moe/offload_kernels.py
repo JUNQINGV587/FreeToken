@@ -292,6 +292,11 @@ def _materialize_layer_kernel(
     same_layer = slot_mask & (old_id >= base) & (old_id < base + num_experts)
     tl.store(id_of_slot_ptr + slot, -1, mask=same_layer)
     tl.store(usage_ptr + slot, 0, mask=same_layer)
+    # Clear the forward entries too: with materialize_count < num_experts (disk tier)
+    # the identity store below only covers the prefix, so a stale slot_for_id for one
+    # of THIS layer's experts would otherwise survive and become a phantom decode hit
+    # against whatever later occupies that slot.
+    tl.store(slot_for_id_ptr + old_id, -1, mask=same_layer)
 
     old_valid = expert_mask & (old_id >= 0) & (~same_layer)
     tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid)

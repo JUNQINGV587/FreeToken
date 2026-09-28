@@ -164,6 +164,16 @@ class GraphRunner:
         )
         self._reset_moe_offload_cache()
 
+        # Disk-tier graph fetch (moe/graph_fetch.py): the doorbell must stay
+        # OFF through every capture below (spin kernels no-op, the request
+        # writes they make are ignored) and is armed only once all graphs are
+        # replay-ready. Runtime rebuilds re-enter this method, so the same
+        # disable/enable pair keeps them safe too.
+        tier = getattr(self.moe_offload_cache, "_disk_tier", None)
+        bridge = getattr(tier, "_graph_bridge", None) if tier is not None else None
+        if bridge is not None:
+            bridge.disable()
+
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
             desc="Preparing for capturing CUDA graphs...",
@@ -199,6 +209,10 @@ class GraphRunner:
             self.graph_map[bs] = graph
 
         self._reset_moe_offload_cache()
+        if bridge is not None:
+            # All graphs replay-ready: service thread starts (ignoring every
+            # sequence written during capture) and spin kernels go live.
+            bridge.enable()
         # Boot-time guard for the custom-AR donor's sequence-paired barriers (see
         # distributed.impl.verify_ar_sequence_boot): no-op when the donor is inactive.
         from freetoken.distributed.impl import verify_ar_sequence_boot

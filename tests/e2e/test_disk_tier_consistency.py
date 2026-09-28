@@ -145,9 +145,9 @@ def _worker_owner(args: argparse.Namespace) -> None:
            "--moe-strategy", "offload", "--moe-cache-policy", "lru",
            "--moe-cache-size", os.environ.get("FREETOKEN_TEST_MOE_CACHE_SIZE", "512"),
            "--disable-moe-prefill-overlap",
-           # Keep graphs off in BOTH owner configs so the tier is the only
-           # difference between reference and test.
-           "--cuda-graph-max-bs", "0",
+           # Graphs stay at the same setting in reference and test configs so
+           # the tier is the only difference between them.
+           "--cuda-graph-max-bs", str(args.graph_bs),
            "--max-running-requests", "1"]
     if args.disk_tier != "off":
         cmd += ["--moe-disk-tier", "on",
@@ -196,21 +196,22 @@ def _worker_owner(args: argparse.Namespace) -> None:
 
 
 def _run_config(model_path: Path, disk_tier: str, ram_experts: int,
-                prefetch_window: int, ep_size: int = 1) -> dict:
+                prefetch_window: int, ep_size: int = 1,
+                graph_bs: int = 0) -> dict:
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2] / "python"))
     proc = subprocess.run(
         [sys.executable, __file__, "--worker",
          "--model", str(model_path), "--disk-tier", disk_tier,
          "--ram-experts", str(ram_experts), "--prefetch", str(prefetch_window),
-         "--ep-size", str(ep_size)],
+         "--ep-size", str(ep_size), "--graph-bs", str(graph_bs)],
         capture_output=True, text=True, timeout=1800, env=env)
     for line in proc.stdout.splitlines():
         if line.startswith(MARK):
             return json.loads(line[len(MARK):])
     raise AssertionError(
         f"worker for disk_tier={disk_tier} prefetch={prefetch_window} ep={ep_size} "
-        f"produced no result (rc={proc.returncode}):\n"
+        f"graph_bs={graph_bs} produced no result (rc={proc.returncode}):\n"
         f"stdout tail:\n{proc.stdout[-2000:]}\nstderr tail:\n{proc.stderr[-2000:]}")
 
 
@@ -238,6 +239,16 @@ def gate_results() -> dict:
             model_path, "off", ram_experts=0, prefetch_window=0, ep_size=2)
         results["owner"] = _run_config(
             model_path, "on", ram_experts, prefetch_window=1, ep_size=2)
+        # CUDA-graph variants of the same pair: the tiered config exercises the
+        # graph-doorbell fetch path (moe/graph_fetch.py) recorded into the
+        # decode graphs; the reference is the same topology, tier off.
+        graph_bs = int(os.environ.get("FREETOKEN_TEST_GRAPH_BS", "8"))
+        results["owner_graph_ref"] = _run_config(
+            model_path, "off", ram_experts=0, prefetch_window=0, ep_size=2,
+            graph_bs=graph_bs)
+        results["owner_graph"] = _run_config(
+            model_path, "on", ram_experts, prefetch_window=1, ep_size=2,
+            graph_bs=graph_bs)
     return results
 
 
@@ -288,6 +299,25 @@ def test_disk_tier_owner_ep_greedy_matches_baseline(gate_results):
     assert owner["warm"] == base, _diff("owner-EP warm decode", owner["warm"], base)
 
 
+@pytest.mark.needs_weights
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="disk-tier gate needs CUDA")
+def test_disk_tier_cuda_graphs_greedy_matches_graphed_reference(gate_results):
+    """CUDA graphs ON: the disk-tiered owner-EP engine (graph-doorbell fetch,
+    moe/graph_fetch.py) must be token-identical to the same graphed topology
+    with the tier off. A doorbell/staging/install bug would surface here as
+    wrong expert bytes under replay; a capture-time bug fails the boot."""
+    owner = gate_results.get("owner_graph")
+    owner_ref = gate_results.get("owner_graph_ref")
+    if owner is None or owner_ref is None:
+        pytest.skip("owner-EP graph gate needs >= 2 GPUs")
+    base = owner_ref["cold"]
+    assert owner["cold"] == base, _diff(
+        "graphed owner-EP cold decode (doorbell fetch wrong?)",
+        owner["cold"], base)
+    assert owner["warm"] == base, _diff(
+        "graphed owner-EP warm decode", owner["warm"], base)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker", action="store_true")
@@ -296,6 +326,8 @@ if __name__ == "__main__":
     ap.add_argument("--ram-experts", type=int, default=0)
     ap.add_argument("--prefetch", type=int, default=0)
     ap.add_argument("--ep-size", type=int, default=1)
+    ap.add_argument("--graph-bs", type=int, default=0,
+                    help="cuda-graph max bs (0 = graphs disabled)")
     ns = ap.parse_args()
     if ns.worker:
         _worker(ns)

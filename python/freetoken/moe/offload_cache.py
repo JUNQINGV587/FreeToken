@@ -1323,7 +1323,7 @@ class OffloadMoeCache:
         return out
 
     def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,
-                         ownership=None) -> None:
+                         ownership=None, graph_k_max: int | None = None) -> None:
         """Enable the NVMe tier: disk-resident slot-cache misses are fetched from the
         original checkpoint before the PCIe copy path (see moe/disk_tier.py).
 
@@ -1338,6 +1338,10 @@ class OffloadMoeCache:
         assert not self.prefill_overlap, "disk tier v0 does not support prefill overlap"
         self._disk_tier = DiskTier(index, self, ram_experts, workers=workers,
                                    ownership=ownership)
+        if graph_k_max:
+            # CUDA-graph decode: record doorbell-fetch kernels during capture,
+            # serve the disk reads from a host thread at replay time.
+            self._disk_tier.init_graph_bridge(self, graph_k_max)
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
@@ -1356,7 +1360,14 @@ class OffloadMoeCache:
         if self._disk_tier is not None:
             # Fetch this layer's disk-resident misses into their slots, then shrink the
             # miss list to the RAM-resident remainder for the PCIe copy below.
-            self._disk_tier.fetch_pending(self, layer_id)
+            if torch.cuda.is_current_stream_capturing():
+                # Graph-doorbell fetch: record request/spin/install kernels;
+                # the disk reads themselves are served by the host service
+                # thread at replay time (preadv is not capturable).
+                if not os.environ.get("FT_GRAPH_FETCH_OFF"):
+                    self._disk_tier.graph_stage_fetch(self, layer_id)
+            else:
+                self._disk_tier.fetch_pending(self, layer_id)
         elif layer_id in self._unpinned_layers:
             if not whole_layer:
                 raise RuntimeError(
@@ -1595,13 +1606,15 @@ class OwnerOffloadMoeCache:
             "raw ensure_experts would admit remote global IDs"
         )
 
-    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
+    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,
+                         graph_k_max: int | None = None) -> None:
         """Attach the NVMe tier with the owner geometry, so the fetch path
         translates between the local slot-cache namespace and the global
         checkpoint rows (see DiskTier). Overrides the __getattr__ forward, which
         would otherwise build a DiskTier that misreads remote rows as local."""
         self._cache.attach_disk_tier(index, ram_experts, workers=workers,
-                                     ownership=self.geometry.ownership)
+                                     ownership=self.geometry.ownership,
+                                     graph_k_max=graph_k_max)
 
     def ensure_experts_hybrid(self, *_args, **_kwargs) -> None:
         raise NotImplementedError(

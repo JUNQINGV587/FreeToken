@@ -853,9 +853,9 @@ class Engine:
                     "--moe-disk-tier v0 requires the gpu decode path (--moe-strategy offload)")
             if config.moe_prefill_overlap:
                 problems.append("--moe-disk-tier v0 requires --disable-moe-prefill-overlap")
-            if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
-                problems.append(
-                    "--moe-disk-tier v0 requires --cuda-graph-max-bs 0 (cuda graphs disabled)")
+            # CUDA graphs are supported: capture records graph-doorbell fetch
+            # kernels (moe/graph_fetch.py) and a host service thread performs
+            # the actual disk reads at replay time.
             if ownership is not None:
                 # Supported: OwnerOffloadMoeCache attaches the tier with its
                 # ownership geometry; DiskTier translates local<->global at the
@@ -993,9 +993,15 @@ class Engine:
         cache.cpu_layer_ids = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
         if banks.disk_index is not None:
+            graph_k_max = None
+            if config.cuda_graph_max_bs is not None and config.cuda_graph_max_bs >= 1:
+                # Worst-case disk misses in one graphed decode layer: every
+                # routed expert of every token in the largest captured batch.
+                graph_k_max = (config.cuda_graph_max_bs
+                               * config.model_config.num_experts_per_tok)
             cache.attach_disk_tier(
                 banks.disk_index, banks.disk_ram_experts,
-                workers=config.disk_fetch_workers)
+                workers=config.disk_fetch_workers, graph_k_max=graph_k_max)
             logger.info_rank0(
                 f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
                 f"experts/layer pinned in RAM; the rest fetched from "

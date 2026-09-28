@@ -306,6 +306,7 @@ class DiskTier:
         self._local_num = (ownership.local_num_experts if ownership is not None
                            else index.num_experts)
         self._ram = min(self._local_num, max(0, ram_experts - self._g0))
+        self._graph_bridge = None
         self._banks = list(cache.banks)  # [(per_layer_host, gpu_cache)] in schema order
         self._row_bytes = [
             b[0][0][0].numel() * b[0][0][0].element_size() for b in self._banks
@@ -422,6 +423,17 @@ class DiskTier:
     # The depth only needs to cover one copy's DMA time in host-side preadv time;
     # the per-slot CUDA event below makes any shallower lap correct, just slower.
     _STAGING_RING = 8
+
+    def init_graph_bridge(self, cache, k_max: int) -> None:
+        """Allocate the graph-doorbell fetch bridge (CUDA-graph decode with the
+        tier on). k_max bounds disk misses per layer = max graph bs x topk."""
+        from .graph_fetch import GraphFetchBridge
+        self._graph_bridge = GraphFetchBridge(self, cache, k_max)
+
+    def graph_stage_fetch(self, cache, layer_id: int) -> None:
+        """Capture-time only: record request+spin+install kernels so replay can
+        fetch disk-resident experts via the host service thread."""
+        self._graph_bridge.stage_fetch(cache, layer_id)
 
     def _staging_ring(self) -> list:
         ring = getattr(self._staging, "ring", None)

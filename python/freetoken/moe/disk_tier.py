@@ -291,9 +291,21 @@ class Nvfp4DiskIndex:
 class DiskTier:
     """Runtime fetcher: disk-resident slot-cache misses -> staging -> GPU slot."""
 
-    def __init__(self, index: Nvfp4DiskIndex, cache, ram_experts: int, workers: int = 8) -> None:
+    def __init__(self, index: Nvfp4DiskIndex, cache, ram_experts: int, workers: int = 8,
+                 ownership=None) -> None:
         self._index = index
-        self._ram = ram_experts
+        # Owner-local EP: the slot cache (and therefore every miss/fetch/slot
+        # identifier below) lives in the LOCAL expert namespace
+        # [0, ownership.local_num_experts), while the disk index spans the GLOBAL
+        # checkpoint rows [0, index.num_experts). ``_g0`` is the local->global
+        # offset applied at every index access; ``_ram`` is the RAM prefix
+        # expressed in the LOCAL namespace (global ``ram_experts`` clamped onto
+        # this rank's owned range). With ownership=None both collapse to the
+        # identity (global) mapping.
+        self._g0 = ownership.global_start if ownership is not None else 0
+        self._local_num = (ownership.local_num_experts if ownership is not None
+                           else index.num_experts)
+        self._ram = min(self._local_num, max(0, ram_experts - self._g0))
         self._banks = list(cache.banks)  # [(per_layer_host, gpu_cache)] in schema order
         self._row_bytes = [
             b[0][0][0].numel() * b[0][0][0].element_size() for b in self._banks
@@ -318,7 +330,7 @@ class DiskTier:
                 for bi in range(len(self._banks))
             ]
             print(f"[disk-tier-init] tp_rank={getattr(tp, 'rank', '?')}/{getattr(tp, 'size', '?')} "
-                  f"ram={ram_experts} host_row_shapes={host_shapes} "
+                  f"ram={self._ram} g0={self._g0} local_num={self._local_num} host_row_shapes={host_shapes} "
                   f"host_row_bytes={self._row_bytes} disk_row_bytes={disk_bytes}", flush=True)
         max_row = max(self._row_bytes)
         self._staging_size = ((max_row + _ALIGN - 1) // _ALIGN + 2) * _ALIGN
@@ -378,7 +390,7 @@ class DiskTier:
         # -1 = not routed this turn. end_turn() snapshots+resets it and, when
         # FT_DISK_TIER_TELEMETRY=<jsonl path> is set, appends the turn record.
         self._turn_src = torch.full(
-            (index.num_layers, index.num_experts), -1, dtype=torch.int8)
+            (index.num_layers, self._local_num), -1, dtype=torch.int8)
         self._turn = 0
         self._telemetry_path = os.environ.get("FT_DISK_TIER_TELEMETRY") or None
 
@@ -495,6 +507,7 @@ class DiskTier:
                          row: torch.Tensor) -> None:
         """Global-scale banks (weight_scale_2): fill the row from the preloaded
         per-expert fp32 scalar blob -- no disk read, no staging."""
+        expert = expert + self._g0  # local (slot-cache) id -> global checkpoint row
         segs = self._index.row_segments(bank_idx, layer, expert)
         stride = sum(nb for _, _, nb in segs)
         blob = self._scalar_blob(layer, bank_idx)
@@ -507,6 +520,7 @@ class DiskTier:
         """Merged preadv groups for one non-scalar bank: [(shard, a0, a1,
         [(d0, d1, off, nbytes)])]. Sorts by file position and merges EXACTLY
         adjacent segments into one read (P0-3)."""
+        expert = expert + self._g0  # local (slot-cache) id -> global checkpoint row
         segs = self._index.row_segments(bank_idx, layer, expert)
         runs = []
         for (d0, d1), (shard_idx, off, nbytes) in zip(
@@ -624,6 +638,7 @@ class DiskTier:
     def _ref_row(self, bank_idx: int, layer: int, expert: int, row_bytes: int,
                  row_el: int, row_leading: int) -> torch.Tensor:
         """Reference row bytes for (bank, layer, expert) straight from the checkpoint."""
+        expert = expert + self._g0  # local (slot-cache) id -> global checkpoint row
         ref = torch.zeros(row_bytes, dtype=torch.uint8)
         segs = self._index.row_segments(bank_idx, layer, expert)
         for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
@@ -795,6 +810,11 @@ class DiskTier:
 
         _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram)
         routed = expert_ids.reshape(-1)
+        if self._g0 or self._local_num != self._index.num_experts:
+            # Owner-local EP: routing arrives GLOBAL; renumber to local rows and
+            # drop the experts this rank does not own.
+            routed = routed - self._g0
+            routed = routed[(routed >= 0) & (routed < self._local_num)]
         disk = torch.unique(routed[routed >= self._ram])
         if os.environ.get("FT_DISK_TIER_DEBUG") and layer_id < 3:
             print(f"[disk-tier dbg] layer={layer_id} routed={routed.numel()} "
@@ -884,6 +904,11 @@ class DiskTier:
         if self._prefetch_window <= 0:
             return
         ids = {int(e) for e in flat.tolist()}
+        if self._g0 or self._local_num != self._index.num_experts:
+            # Owner-local EP: routing arrives GLOBAL; keep only this rank's owned
+            # experts and renumber into the local slot-cache namespace.
+            lo, hi = self._g0, self._g0 + self._local_num
+            ids = {e - lo for e in ids if lo <= e < hi}
         for target in range(layer_id + 1,
                             min(layer_id + 1 + self._prefetch_window,
                                 self._index.num_layers)):

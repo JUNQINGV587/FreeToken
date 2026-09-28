@@ -143,18 +143,18 @@ def test_index_segments_match_file_bytes(checkpoint):
                     assert nbytes == tensor.numel() * tensor.element_size()
 
 
-def _fake_cache():
+def _fake_cache(num_experts=E):
     """CPU stand-in for OffloadMoeCache: banks in schema order + miss-list tensors."""
     banks = [
         (
-            [torch.zeros(E, *shape, dtype=dtype) for _ in range(L)],
+            [torch.zeros(num_experts, *shape, dtype=dtype) for _ in range(L)],
             torch.full((8, *shape), 0xFF, dtype=dtype),
         )
         for shape, dtype in zip(BANK_SHAPES, BANK_DTYPES)
     ]
     cache = type("FakeCache", (), {})()
     cache.banks = banks
-    cache.num_experts = E
+    cache.num_experts = num_experts
     cache.num_layers = L
     cache.num_indices = torch.tensor([0], dtype=torch.int64)
     cache.src_indices = torch.zeros(64, dtype=torch.int32)
@@ -162,9 +162,10 @@ def _fake_cache():
     return cache
 
 
-def _tier(checkpoint, cache, ram_experts=2):
+def _tier(checkpoint, cache, ram_experts=2, ownership=None):
     index = _index(checkpoint)
-    tier = DiskTier(index, cache, ram_experts=ram_experts, workers=2)
+    tier = DiskTier(index, cache, ram_experts=ram_experts, workers=2,
+                    ownership=ownership)
     # Staging must hold the largest bank row's O_DIRECT super-block (a size
     # regression here overflows the buffer -> EFAULT/segfault at fetch time).
     max_row = max(
@@ -678,3 +679,95 @@ def test_hits_bitmap_stash_classification(checkpoint):
     cache.num_indices.fill_(1)
     tier.fetch_pending(cache, 1)
     assert tier._turn_src[1, 3].item() == 1  # stash hit
+
+
+# ------------------------------------------------------------- owner-local EP
+def _ownership(rank, world=2):
+    from freetoken.moe.ownership import ExpertOwnership
+
+    return ExpertOwnership(global_num_experts=E, world_size=world, rank=rank)
+
+
+def test_owner_ram_prefix_clamps(checkpoint):
+    """ram_experts is a GLOBAL count; each rank clamps it to its owned prefix."""
+    # rank 0 owns global {0,1}: global ram=3 -> local ram = 2 (everything RAM).
+    tier0 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=3,
+                  ownership=_ownership(0))
+    assert (tier0._g0, tier0._local_num, tier0._ram) == (0, 2, 2)
+    # rank 1 owns global {2,3}: local ram = 3 - 2 = 1.
+    tier1 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=3,
+                  ownership=_ownership(1))
+    assert (tier1._g0, tier1._local_num, tier1._ram) == (2, 2, 1)
+    # global ram=1 stops before rank 1's range -> rank 1 has NO RAM experts.
+    tier2 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=1,
+                  ownership=_ownership(1))
+    assert tier2._ram == 0
+
+
+def test_owner_fetch_reads_global_rows(checkpoint):
+    """The slot cache names LOCAL rows; the tier must read the owning rank's
+    GLOBAL checkpoint rows."""
+    ownership = _ownership(rank=1)  # global {2,3} as local {0,1}
+    cache = _fake_cache(num_experts=2)
+    tier = _tier(checkpoint, cache, ram_experts=3, ownership=ownership)
+    for layer in range(L):
+        for local in range(2):
+            slot = (layer * 2 + local) % 8
+            tier._fetch_expert(layer, local, slot)
+            expected = _expected_rows(layer, 2 + local)
+            for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
+                got = gpu_cache[slot].contiguous().view(torch.uint8).reshape(-1)
+                assert torch.equal(got, expected[bank_idx]), (bank_idx, layer, local)
+
+
+def test_owner_fetch_pending_local_namespace(checkpoint):
+    """fetch_pending classifies RAM/disk against the LOCAL clamped prefix."""
+    ownership = _ownership(rank=1)
+    cache = _fake_cache(num_experts=2)
+    tier = _tier(checkpoint, cache, ram_experts=3, ownership=ownership)  # local ram = 1
+    # Miss list (LOCAL ids): local 0 (global 2, RAM), local 1 (global 3, disk).
+    cache.src_indices[:2] = torch.tensor([0, 1], dtype=torch.int32)
+    cache.evict_slots[:2] = torch.tensor([5, 6], dtype=torch.int32)
+    cache.num_indices.fill_(2)
+    tier.fetch_pending(cache, 1)
+    # local 1 fetched from GLOBAL row 3...
+    expected = _expected_rows(1, 3)
+    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
+        assert torch.equal(
+            gpu_cache[6].contiguous().view(torch.uint8).reshape(-1),
+            expected[bank_idx])
+    # ...and the miss list shrank to the RAM-resident local 0.
+    assert cache.num_indices.item() == 1
+    assert cache.src_indices[0].item() == 0
+    assert cache.evict_slots[0].item() == 5
+
+
+def test_owner_prefetch_filters_to_owned(checkpoint):
+    """PILOT routing arrives GLOBAL: remote experts must be dropped and owned
+    ones renumbered to local rows before stash/demand bookkeeping."""
+    import os
+
+    os.environ["FT_DISK_TIER_PREFETCH"] = "1"
+    try:
+        ownership = _ownership(rank=1)
+        cache = _fake_cache(num_experts=2)
+        tier = _tier(checkpoint, cache, ram_experts=3, ownership=ownership)
+    finally:
+        os.environ.pop("FT_DISK_TIER_PREFETCH", None)
+    # Global routing {0 (remote), 2 (owned, RAM local 0), 3 (owned, disk local 1)}:
+    # exactly ONE prefetch (local 1) is issued.
+    tier.prefetch_from_routing(0, torch.tensor([0, 2, 3], dtype=torch.int32))
+    _flush_stash(tier)
+    assert tier.stats()["prefetch_issued"] == 1
+    # Demand miss on local 1 hits the stash with GLOBAL row 3's bytes.
+    cache.src_indices[:1] = torch.tensor([1], dtype=torch.int32)
+    cache.evict_slots[:1] = torch.tensor([5], dtype=torch.int32)
+    cache.num_indices.fill_(1)
+    tier.fetch_pending(cache, 1)
+    expected = _expected_rows(1, 3)
+    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
+        assert torch.equal(
+            gpu_cache[5].contiguous().view(torch.uint8).reshape(-1),
+            expected[bank_idx])
+    assert tier.stats()["prefetch_hits"] == 1
+    assert cache.num_indices.item() == 0

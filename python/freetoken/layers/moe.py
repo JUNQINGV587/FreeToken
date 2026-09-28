@@ -572,7 +572,7 @@ class OffloadMoELayer(MoELayer):
                 owner.prefetch_prefill_layer(self.layer_id + i)
             views = owner.wait_prefill_layer(self.layer_id)
         else:
-            owner.materialize_layer(self.layer_id, buffer_id=0)
+            owner.materialize_layer(self.layer_id, buffer_id=0, expert_ids=topk_ids)
             views = owner.bank_views(owner.num_experts)
         local_ids, owned = owner.geometry.global_to_local(topk_ids)
         prof = prefill_profile.get_profiler()

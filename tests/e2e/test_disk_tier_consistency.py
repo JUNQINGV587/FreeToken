@@ -82,6 +82,10 @@ def _worker(args: argparse.Namespace) -> None:
         kwargs["expert_ram_experts"] = args.ram_experts
         # engine.py:857 -- disk-tier v0 requires cuda graphs disabled.
         kwargs["cuda_graph_max_bs"] = 0
+    if args.ep_size > 1:
+        # Owner-local EP: the tier must translate local<->global expert rows.
+        kwargs["tensor_parallel_size"] = args.ep_size
+        kwargs["moe_ep_size"] = args.ep_size
     llm = LLM(**kwargs)
     try:
         sampling = SamplingParams(
@@ -96,20 +100,21 @@ def _worker(args: argparse.Namespace) -> None:
 
 
 def _run_config(model_path: Path, disk_tier: str, ram_experts: int,
-                prefetch_window: int) -> dict:
+                prefetch_window: int, ep_size: int = 1) -> dict:
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2] / "python"))
     proc = subprocess.run(
         [sys.executable, __file__, "--worker",
          "--model", str(model_path), "--disk-tier", disk_tier,
-         "--ram-experts", str(ram_experts), "--prefetch", str(prefetch_window)],
+         "--ram-experts", str(ram_experts), "--prefetch", str(prefetch_window),
+         "--ep-size", str(ep_size)],
         capture_output=True, text=True, timeout=1800, env=env)
     for line in proc.stdout.splitlines():
         if line.startswith(MARK):
             return json.loads(line[len(MARK):])
     raise AssertionError(
-        f"worker for disk_tier={disk_tier} prefetch={prefetch_window} produced "
-        f"no result (rc={proc.returncode}):\n"
+        f"worker for disk_tier={disk_tier} prefetch={prefetch_window} ep={ep_size} "
+        f"produced no result (rc={proc.returncode}):\n"
         f"stdout tail:\n{proc.stdout[-2000:]}\nstderr tail:\n{proc.stderr[-2000:]}")
 
 
@@ -122,11 +127,17 @@ def gate_results() -> dict:
         pytest.skip(f"model is not downloaded: {model_path}")
     n_experts = _num_experts(model_path)
     ram_experts = n_experts // 2  # half the experts resolve from NVMe
-    return {
+    results = {
         "baseline": _run_config(model_path, "off", ram_experts=0, prefetch_window=0),
         "disk": _run_config(model_path, "on", ram_experts, prefetch_window=0),
         "prefetch": _run_config(model_path, "on", ram_experts, prefetch_window=1),
     }
+    if torch.cuda.device_count() >= 2:
+        # Owner-local EP (TP2+EP2): each rank's tier serves only its owned
+        # experts, translated from the global checkpoint rows.
+        results["owner"] = _run_config(
+            model_path, "on", ram_experts, prefetch_window=1, ep_size=2)
+    return results
 
 
 def _diff(name: str, got: list[str], want: list[str]) -> str:
@@ -158,6 +169,22 @@ def test_disk_tier_prefetch_greedy_matches_baseline(gate_results):
     assert pf["warm"] == base, _diff("PILOT warm decode", pf["warm"], base)
 
 
+@pytest.mark.needs_weights
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="disk-tier gate needs CUDA")
+def test_disk_tier_owner_ep_greedy_matches_baseline(gate_results):
+    """Owner-local EP (TP2+EP2) with the disk tier must be token-identical to
+    the single-rank all-RAM baseline: a namespace slip would fetch a remote
+    rank's expert rows and corrupt the tokens."""
+    owner = gate_results.get("owner")
+    if owner is None:
+        pytest.skip("owner-EP gate needs >= 2 GPUs")
+    base = gate_results["baseline"]["cold"]
+    assert owner["cold"] == base, _diff(
+        "owner-EP cold decode (local<->global translation wrong?)",
+        owner["cold"], base)
+    assert owner["warm"] == base, _diff("owner-EP warm decode", owner["warm"], base)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker", action="store_true")
@@ -165,6 +192,7 @@ if __name__ == "__main__":
     ap.add_argument("--disk-tier", choices=["off", "on"], required=True)
     ap.add_argument("--ram-experts", type=int, default=0)
     ap.add_argument("--prefetch", type=int, default=0)
+    ap.add_argument("--ep-size", type=int, default=1)
     ns = ap.parse_args()
     if ns.worker:
         _worker(ns)

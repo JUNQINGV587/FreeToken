@@ -1322,15 +1322,22 @@ class OffloadMoeCache:
                 pass
         return out
 
-    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
+    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,
+                         ownership=None) -> None:
         """Enable the NVMe tier: disk-resident slot-cache misses are fetched from the
-        original checkpoint before the PCIe copy path (see moe/disk_tier.py)."""
+        original checkpoint before the PCIe copy path (see moe/disk_tier.py).
+
+        ``ownership`` (owner-local EP): the cache's expert namespace is the local
+        [0, local_num_experts) range; the disk tier translates local<->global at
+        its boundaries. Never attach a disk tier built without ownership to an
+        owner-local cache -- the index would read the wrong checkpoint rows."""
         from freetoken.moe.disk_tier import DiskTier
 
         assert self.decode_target == "gpu", "disk tier v0 supports the gpu (offload) path only"
         assert self.quant_format == "nvfp4", f"disk tier v0 supports native nvfp4 banks (got {self.quant_format!r})"
         assert not self.prefill_overlap, "disk tier v0 does not support prefill overlap"
-        self._disk_tier = DiskTier(index, self, ram_experts, workers=workers)
+        self._disk_tier = DiskTier(index, self, ram_experts, workers=workers,
+                                   ownership=ownership)
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
@@ -1587,6 +1594,14 @@ class OwnerOffloadMoeCache:
             "owner-local cache requires ensure_route(weights, global_expert_ids); "
             "raw ensure_experts would admit remote global IDs"
         )
+
+    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
+        """Attach the NVMe tier with the owner geometry, so the fetch path
+        translates between the local slot-cache namespace and the global
+        checkpoint rows (see DiskTier). Overrides the __getattr__ forward, which
+        would otherwise build a DiskTier that misreads remote rows as local."""
+        self._cache.attach_disk_tier(index, ram_experts, workers=workers,
+                                     ownership=self.geometry.ownership)
 
     def ensure_experts_hybrid(self, *_args, **_kwargs) -> None:
         raise NotImplementedError(
@@ -1924,8 +1939,14 @@ This variant never changes the shape.  Remote entries are remapped to a row that
     def abort_prefill_chunk(self) -> None:
         self._cache.abort_prefill_chunk()
 
-    def materialize_layer(self, layer_id: int, buffer_id: int = 0) -> torch.Tensor:
-        """Materialize all local rows using the legacy prefill choreography."""
+    def materialize_layer(self, layer_id: int, buffer_id: int = 0,
+                          expert_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Materialize all local rows using the legacy prefill choreography.
+
+        With the disk tier attached the host banks only hold the RAM prefix, so
+        the whole-layer stream must be split: RAM prefix over PCIe plus the
+        ROUTED disk-resident experts fetched from the checkpoint. ``expert_ids``
+        (the layer's GLOBAL routing) is required in that mode."""
         if self.geometry.prefill_overlap:
             if buffer_id != layer_id % self._cache._prefill_depth:
                 raise ValueError(
@@ -1936,7 +1957,15 @@ This variant never changes the shape.  Remote entries are remapped to a row that
         else:
             if buffer_id != 0:
                 raise ValueError("owner prefill overlap is disabled; buffer_id must be 0")
-            self._cache.materialize_layer(layer_id)
+            if self._cache.disk_tier_enabled:
+                if expert_ids is None:
+                    raise ValueError(
+                        "owner disk-tier prefill needs the layer's global routing "
+                        "(expert_ids) to fetch the routed disk-resident experts"
+                    )
+                self._cache.materialize_layer(layer_id, expert_ids)
+            else:
+                self._cache.materialize_layer(layer_id)
             # materialize_layer only stages the whole-layer copy in the legacy cache;
             # complete it before owner GEMM reads the local bank rows.
             self.copy_missing()

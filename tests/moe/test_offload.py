@@ -1835,7 +1835,8 @@ def test_owner_layer_prefill_remaps_global_ids_to_local_rows(monkeypatch):
     topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
     topk_ids = torch.tensor([[1, 6]], dtype=torch.int32)  # 1 = rank0, 6 = local row 2
     calls = {}
-    monkeypatch.setattr(owner, "materialize_layer", lambda layer_id, buffer_id=0: None)
+    monkeypatch.setattr(owner, "materialize_layer",
+                        lambda layer_id, buffer_id=0, expert_ids=None: None)
     monkeypatch.setattr(owner, "bank_views", lambda n=None: (torch.empty(8, 32, 8), torch.empty(8, 8, 16)))
 
     layer._prefill_routed(torch.randn(1, 8), topk_weights, topk_ids)

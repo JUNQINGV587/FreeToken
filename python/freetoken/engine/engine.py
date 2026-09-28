@@ -857,10 +857,10 @@ class Engine:
                 problems.append(
                     "--moe-disk-tier v0 requires --cuda-graph-max-bs 0 (cuda graphs disabled)")
             if ownership is not None:
-                # the owner-local EP cache (OwnerOffloadMoeCache) has no disk-tier
-                # fetch path; the plain slot cache's expert rows are rank-local there
-                problems.append(
-                    "--moe-disk-tier v0 does not support owner-local EP (--moe-ep-size > 1)")
+                # Supported: OwnerOffloadMoeCache attaches the tier with its
+                # ownership geometry; DiskTier translates local<->global at the
+                # fetch/prefetch/prefill boundaries (see moe/disk_tier.py).
+                pass
             if problems:
                 raise ValueError(
                     "--moe-disk-tier on: unmet preconditions:\n  - " + "\n  - ".join(problems))

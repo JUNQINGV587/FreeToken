@@ -838,35 +838,52 @@ class Engine:
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
         disk_tier = None
-        if config.moe_disk_tier == "on":
-            from freetoken.moe.disk_tier import DiskTierSpec
+        if config.moe_disk_tier in ("on", "auto"):
+            from freetoken.moe.disk_tier import DiskTierSpec, resolve_auto_ram_experts
 
             E = config.model_config.num_experts
-            # Collect ALL unmet preconditions and raise once: each used to surface as a
-            # separate boot-time ValueError, costing a full boot per missing flag.
-            problems = []
-            if not 0 < config.expert_ram_experts < E:
-                problems.append(
-                    f"--expert-ram-experts must be in (0, {E}) with --moe-disk-tier on")
-            if decode_target != "gpu":
-                problems.append(
-                    "--moe-disk-tier v0 requires the gpu decode path (--moe-strategy offload)")
-            # Prefill overlap is supported: the ring streams only the pinned RAM
-            # prefix (prefix-only copy in prefetch_prefill_layer) and the routed
-            # disk rows are patched into the borrowed buffer at layer entry
-            # (DiskTier.fetch_routed_into via fetch_into_prefill_buffer).
-            # CUDA graphs are supported: capture records graph-doorbell fetch
-            # kernels (moe/graph_fetch.py) and a host service thread performs
-            # the actual disk reads at replay time.
-            if ownership is not None:
-                # Supported: OwnerOffloadMoeCache attaches the tier with its
-                # ownership geometry; DiskTier translates local<->global at the
-                # fetch/prefetch/prefill boundaries (see moe/disk_tier.py).
-                pass
-            if problems:
-                raise ValueError(
-                    "--moe-disk-tier on: unmet preconditions:\n  - " + "\n  - ".join(problems))
-            disk_tier = DiskTierSpec(ram_experts=config.expert_ram_experts)
+            ram_experts = config.expert_ram_experts
+            if config.moe_disk_tier == "auto":
+                resolved, row_bytes, available = resolve_auto_ram_experts(
+                    config.model_path, config.model_config,
+                    reserve_bytes=int(config.disk_tier_auto_reserve_gb * (1 << 30)))
+                total_gib = (row_bytes * config.model_config.num_moe_layers * E
+                             / (1 << 30))
+                if resolved is None:
+                    logger.info_rank0(
+                        f"--moe-disk-tier auto: the full expert set "
+                        f"({total_gib:.1f} GiB) fits in host RAM "
+                        f"(MemAvailable={available / (1 << 30):.1f} GiB); "
+                        "tier dormant — all experts pinned, no NVMe fetches")
+                else:
+                    ram_experts = resolved
+                    logger.info_rank0(
+                        f"--moe-disk-tier auto: host RAM "
+                        f"(MemAvailable={available / (1 << 30):.1f} GiB) fits "
+                        f"{ram_experts}/{E} experts per layer of "
+                        f"{total_gib:.1f} GiB; tier active for the rest")
+            if ram_experts or config.moe_disk_tier == "on":
+                # Collect ALL unmet preconditions and raise once: each used to surface
+                # as a separate boot-time ValueError, costing a full boot per miss.
+                problems = []
+                if not 0 < ram_experts < E:
+                    problems.append(
+                        f"--expert-ram-experts must be in (0, {E}) with --moe-disk-tier on")
+                if decode_target != "gpu":
+                    problems.append(
+                        "--moe-disk-tier requires the gpu decode path (--moe-strategy offload)")
+                # Prefill overlap is supported: the ring streams only the pinned RAM
+                # prefix (prefix-only copy in prefetch_prefill_layer) and the routed
+                # disk rows are patched into the borrowed buffer at layer entry
+                # (DiskTier.fetch_routed_into via fetch_into_prefill_buffer).
+                # CUDA graphs are supported: capture records graph-doorbell fetch
+                # kernels (moe/graph_fetch.py) and a host service thread performs
+                # the actual disk reads at replay time.
+                if problems:
+                    raise ValueError(
+                        f"--moe-disk-tier {config.moe_disk_tier}: unmet preconditions:\n  - "
+                        + "\n  - ".join(problems))
+                disk_tier = DiskTierSpec(ram_experts=ram_experts)
         # Fast path: an FTW checkpoint loads its repacked banks directly.
         # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
         # expert-tensor granularity. Both pin-after-fill.

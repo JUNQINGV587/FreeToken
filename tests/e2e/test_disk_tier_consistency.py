@@ -84,10 +84,14 @@ def _worker(args: argparse.Namespace) -> None:
     )
     if args.overlap:
         kwargs["moe_cache_size"] = 2 * 512 + 256
-    if args.disk_tier != "off":
+    if args.disk_tier == "on":
         kwargs["expert_ram_experts"] = args.ram_experts
-        # engine.py:857 -- disk-tier v0 requires cuda graphs disabled.
+        # TP1 gate configs keep graphs off (historical baseline); graphs-on is
+        # covered by the owner (server) configs.
         kwargs["cuda_graph_max_bs"] = 0
+    # "auto" derives its own prefix from host RAM: dormant (== "off" path) when
+    # everything fits, otherwise active — graphs stay at the default 1 either
+    # way (graphs-on tier fetches are supported by the doorbell path).
     llm = LLM(**kwargs)
     try:
         sampling = SamplingParams(
@@ -155,9 +159,11 @@ def _worker_owner(args: argparse.Namespace) -> None:
         # Overlap defaults on (config.py); keep the historical gate behaviour
         # unless --overlap opts in.
         cmd.append("--disable-moe-prefill-overlap")
-    if args.disk_tier != "off":
+    if args.disk_tier == "on":
         cmd += ["--moe-disk-tier", "on",
                 "--expert-ram-experts", str(args.ram_experts)]
+    elif args.disk_tier == "auto":
+        cmd += ["--moe-disk-tier", "auto"]
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
 
     def _serving(deadline: float) -> None:
@@ -242,6 +248,12 @@ def gate_results() -> dict:
         # comparable).
         "disk_overlap": _run_config(
             model_path, "on", ram_experts, prefetch_window=0, overlap=1),
+        # Capacity-adaptive mode: resolves dormant (plain tier-off path) when
+        # the host RAM fits the full expert set, active with an auto-derived
+        # prefix otherwise — greedy output must match the baseline EITHER WAY
+        # (the boot log records which resolution fired).
+        "auto": _run_config(model_path, "auto", ram_experts=0,
+                            prefetch_window=0),
     }
     if torch.cuda.device_count() >= 2:
         # Owner-local EP (TP2+EP2): each rank's tier serves only its owned
@@ -291,6 +303,15 @@ def test_disk_tier_greedy_matches_all_ram_baseline(gate_results):
     # Warm pass: slots populated by the cold pass change which misses hit the
     # stash/RAM vs disk boundary -- the second pass re-exercises it.
     assert disk["warm"] == base, _diff("disk-tier warm decode", disk["warm"], base)
+
+
+@pytest.mark.needs_weights
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="disk-tier gate needs CUDA")
+def test_disk_tier_auto_matches_baseline(gate_results):
+    base = gate_results["baseline"]
+    auto = gate_results["auto"]
+    assert auto["cold"] == base["cold"], _diff("auto dormant cold", auto["cold"], base["cold"])
+    assert auto["warm"] == base["warm"], _diff("auto dormant warm", auto["warm"], base["warm"])
 
 
 @pytest.mark.needs_weights
@@ -380,7 +401,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker", action="store_true")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--disk-tier", choices=["off", "on"], required=True)
+    ap.add_argument("--disk-tier", choices=["off", "on", "auto"], required=True)
     ap.add_argument("--ram-experts", type=int, default=0)
     ap.add_argument("--prefetch", type=int, default=0)
     ap.add_argument("--ep-size", type=int, default=1)

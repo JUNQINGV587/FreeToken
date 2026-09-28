@@ -786,14 +786,26 @@ def parse_args(
     parser.add_argument(
         "--moe-disk-tier",
         default=ServerArgs.moe_disk_tier,
-        choices=["off", "on"],
+        choices=["off", "on", "auto"],
         help=(
             "NVMe tier for MoE experts (see moe/disk_tier.py): experts beyond "
             "--expert-ram-experts per layer stay on disk in the original checkpoint "
-            "and are fetched on slot-cache miss. Requires native NVFP4 banks. "
-            "v0 preconditions (all enforced at once at boot): --moe-strategy offload "
-            "(gpu decode), --disable-moe-prefill-overlap, --cuda-graph-max-bs 0, "
-            "and 0 < --expert-ram-experts < num_experts."
+            "and are fetched on slot-cache miss. Requires native NVFP4 banks and "
+            "--moe-strategy offload (gpu decode); prefill overlap and cuda graphs "
+            "are supported. 'auto' = capacity-adaptive: dormant (exactly 'off', "
+            "all experts pinned in RAM, zero fetch machinery) when the full expert "
+            "set fits in host RAM with headroom, otherwise active with an "
+            "auto-derived RAM prefix (see --disk-tier-auto-reserve-gb)."
+        ),
+    )
+    parser.add_argument(
+        "--disk-tier-auto-reserve-gb",
+        type=float,
+        default=ServerArgs.disk_tier_auto_reserve_gb,
+        help=(
+            "With --moe-disk-tier auto: host RAM (GiB) reserved outside the tier "
+            "budget (OS, other containers, page cache). The PLE context table keeps "
+            "its own disk backend (ple_backend) regardless of this resolution."
         ),
     )
     parser.add_argument(
@@ -802,9 +814,9 @@ def parse_args(
         default=ServerArgs.expert_ram_experts,
         help=(
             "With --moe-disk-tier on: experts per layer kept pinned in RAM "
-            "(0 < N < num_experts; the rest are disk-resident). Keep "
-            "N * (smallest bank row bytes) page-aligned (a multiple of 4096) or "
-            "the small scale banks' tail rows stay resident instead of released "
+            "(0 < N < num_experts; the rest are disk-resident). Ignored by 'auto'. "
+            "Keep N * (smallest bank row bytes) page-aligned (a multiple of 4096) "
+            "or the small scale banks' tail rows stay resident instead of released "
             "(warns, does not abort). The rule is per-model: e.g. Qwen3.8-Flash-Next "
             "needs a multiple of 8, Ornith-1.5-35B a multiple of 2."
         ),

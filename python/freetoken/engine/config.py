@@ -69,12 +69,18 @@ class EngineConfig:
     # skip the startup prefill warmup forwards; first requests then pay the kernel module loads (and the full JIT compile on a cold start)
     prefill_warmup: bool = True
     # Disk tier (--moe-disk-tier, see moe/disk_tier.py): "off" = classic behavior.
-    # When "on", experts [0, expert_ram_experts) per layer stay pinned in RAM and the
-    # rest are fetched from the original checkpoint on slot-cache miss. Requires the
-    # native NVFP4 layout, gpu decode target, no prefill overlap, no cuda graphs.
+    # "on": experts [0, expert_ram_experts) per layer stay pinned in RAM and the
+    # rest are fetched from the original checkpoint on slot-cache miss. "auto":
+    # capacity-adaptive — dormant (exactly "off") when the full expert set fits in
+    # host RAM with headroom, otherwise active with an auto-derived RAM prefix.
+    # Requires the native NVFP4 layout and the gpu decode target; prefill overlap
+    # and cuda graphs are supported.
     moe_disk_tier: str = "off"
     expert_ram_experts: int = 0
     disk_fetch_workers: int = 8
+    # auto mode only: host RAM kept out of the tier budget (GiB). The PLE context
+    # table has its own disk backend (ple_backend) and is unaffected by all of this.
+    disk_tier_auto_reserve_gb: float = 16.0
     # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a

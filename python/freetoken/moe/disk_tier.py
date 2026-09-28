@@ -287,6 +287,97 @@ class Nvfp4DiskIndex:
             for i in range(len(_NVP4_BANK_SEGS[bank_idx]))
         ]
 
+    def row_bytes_per_expert(self) -> int:
+        """On-disk bytes of ONE expert across all banks (layer 0).
+
+        Native NVFP4 checkpoint rows are fixed-size, so expert 0 of layer 0 is
+        representative; this equals the per-expert pinned-RAM cost per layer."""
+        total = 0
+        for bank_idx in range(len(_NVP4_BANK_SEGS)):
+            total += sum(nbytes for _, _, nbytes in self.row_segments(bank_idx, 0, 0))
+        return total
+
+
+# --moe-disk-tier auto: capacity-adaptive activation -------------------------
+# Every rank on the host resolves independently from an early-boot
+# /proc/meminfo snapshot (neither rank has allocated its banks yet), so the
+# dormant/active decision is quantized with wide hysteresis: dormancy requires
+# the FULL expert set to fit with _AUTO_DORMANT_HEADROOM x headroom, and an
+# active K leaves (1 - _AUTO_BUDGET_USE) of the budget untouched and aligns
+# down to _AUTO_ALIGN. Rank divergence would need the snapshots to differ by
+# more than that band within the same boot minute — impossible before either
+# rank has allocated. PLE's disk backend is a separate subsystem
+# (ple_backend="disk") and is not affected by this resolution.
+_AUTO_DORMANT_HEADROOM = 1.25
+_AUTO_BUDGET_USE = 0.95
+_AUTO_ALIGN = 8  # per-model page-alignment rule (see --expert-ram-experts)
+
+
+def mem_available_bytes(path: str = "/proc/meminfo") -> int:
+    """MemAvailable from /proc/meminfo, in bytes."""
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024  # kB -> bytes
+    raise RuntimeError(f"MemAvailable not found in {path}")
+
+
+def auto_ram_experts(row_bytes: int, num_layers: int, num_experts: int,
+                     available_bytes: int, reserve_bytes: int) -> int | None:
+    """Pure resolution math for --moe-disk-tier auto.
+
+    Returns None when the full expert set fits in host RAM (tier dormant: run
+    exactly like tier off); otherwise the largest aligned RAM prefix K in
+    (0, num_experts) whose pinned cost fits the budget. The host cost of the
+    full set spans ALL ranks (single-host TP: every rank's banks together hold
+    the global expert set), so ``num_experts`` is the global count.
+    """
+    budget = available_bytes - reserve_bytes
+    if budget <= 0:
+        raise ValueError(
+            "--moe-disk-tier auto: no RAM budget left after the "
+            f"{reserve_bytes / (1 << 30):.0f} GiB reserve "
+            f"(MemAvailable={available_bytes / (1 << 30):.1f} GiB)")
+    layer_cost = row_bytes * num_layers
+    total = layer_cost * num_experts
+    if total * _AUTO_DORMANT_HEADROOM <= budget:
+        return None
+    k = int((budget * _AUTO_BUDGET_USE) // layer_cost)
+    k = min(k, num_experts - 1) // _AUTO_ALIGN * _AUTO_ALIGN
+    if k <= 0:
+        raise ValueError(
+            "--moe-disk-tier auto: RAM budget fits fewer than "
+            f"{_AUTO_ALIGN} experts per layer "
+            f"({budget * _AUTO_BUDGET_USE / (1 << 30):.1f} GiB budget vs "
+            f"{layer_cost / (1 << 30):.2f} GiB per expert across "
+            f"{num_layers} layers); use --moe-disk-tier on with an explicit "
+            "--expert-ram-experts instead")
+    return k
+
+
+def resolve_auto_ram_experts(model_path: str, model_config,
+                             reserve_bytes: int) -> tuple[int | None, int, int]:
+    """IO wrapper around auto_ram_experts: reads the checkpoint index for the
+    per-expert row bytes and /proc/meminfo for MemAvailable.
+
+    Returns (ram_experts_or_None, row_bytes, available_bytes) so the caller can
+    log exact numbers. Raises NotImplementedError for non-NVFP4 layouts (same
+    rule as the disk-tier loader path)."""
+    from freetoken.moe.expert_pieces import nvfp4_expert_spec_of
+    from freetoken.models.nvfp4_banks import _num_moe_layers
+
+    spec = nvfp4_expert_spec_of(model_path, model_config)
+    if spec is None:
+        raise NotImplementedError(
+            "--moe-disk-tier auto: expert layers are not in NVFP4 layout; "
+            "auto mode supports the NVFP4 checkpoint format only")
+    index = Nvfp4DiskIndex(model_path, model_config, spec)
+    row_bytes = index.row_bytes_per_expert()
+    available = mem_available_bytes()
+    resolved = auto_ram_experts(row_bytes, _num_moe_layers(model_config),
+                                model_config.num_experts, available, reserve_bytes)
+    return resolved, row_bytes, available
+
 
 class DiskTier:
     """Runtime fetcher: disk-resident slot-cache misses -> staging -> GPU slot."""

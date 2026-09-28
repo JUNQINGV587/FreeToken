@@ -771,3 +771,52 @@ def test_owner_prefetch_filters_to_owned(checkpoint):
             expected[bank_idx])
     assert tier.stats()["prefetch_hits"] == 1
     assert cache.num_indices.item() == 0
+
+
+# ---------------------------------------------------------------------------
+# --moe-disk-tier auto: capacity-adaptive resolution (pure math)
+# ---------------------------------------------------------------------------
+from freetoken.moe.disk_tier import _AUTO_ALIGN, auto_ram_experts
+
+_GIB = 1 << 30
+# Representative geometry: Qwen3.8-Flash-Next-NVFP4 — 48 layers x 512 experts,
+# ~30.9 MiB per expert per layer -> ~1.45 GiB per expert across depth,
+# ~744 GiB for the full set (unit-test numbers, not the production model's).
+_ROW = 32 * 1024 * 1024
+_LAYERS = 48
+_EXPERTS = 512
+_RESERVE = 16 * _GIB
+
+
+def test_auto_dormant_when_full_set_fits_with_headroom():
+    total = _ROW * _LAYERS * _EXPERTS
+    available = int(total * 1.25) + _RESERVE  # exactly at the dormancy boundary
+    assert auto_ram_experts(_ROW, _LAYERS, _EXPERTS, available, _RESERVE) is None
+    assert auto_ram_experts(_ROW, _LAYERS, _EXPERTS, 1024 * _GIB, _RESERVE) is None
+
+
+def test_auto_active_just_below_dormancy_boundary():
+    total = _ROW * _LAYERS * _EXPERTS
+    available = int(total * 1.25) + _RESERVE - 1  # one byte short of dormant
+    k = auto_ram_experts(_ROW, _LAYERS, _EXPERTS, available, _RESERVE)
+    assert k is not None and 0 < k < _EXPERTS
+    # Budget-limited, aligned down, and the aligned prefix must actually fit.
+    assert k % _AUTO_ALIGN == 0
+    assert k * _ROW * _LAYERS <= (available - _RESERVE) * 0.95
+
+
+def test_auto_active_scales_with_budget():
+    # 400 GiB available - 16 GiB reserve -> 384 * 0.95 / 1.5 GiB-per-expert ~ 243
+    k = auto_ram_experts(_ROW, _LAYERS, _EXPERTS, 400 * _GIB, _RESERVE)
+    layer_cost = _ROW * _LAYERS
+    assert k == int((400 * _GIB - _RESERVE) * 0.95 // layer_cost) // _AUTO_ALIGN * _AUTO_ALIGN
+    # Half the budget -> roughly half the prefix (still aligned).
+    k_half = auto_ram_experts(_ROW, _LAYERS, _EXPERTS, 208 * _GIB, _RESERVE)
+    assert 0 < k_half < k and k_half % _AUTO_ALIGN == 0
+
+
+def test_auto_rejects_budget_below_one_aligned_prefix():
+    with pytest.raises(ValueError, match="fewer than"):
+        auto_ram_experts(_ROW, _LAYERS, _EXPERTS, _RESERVE + _GIB, _RESERVE)
+    with pytest.raises(ValueError, match="no RAM budget"):
+        auto_ram_experts(_ROW, _LAYERS, _EXPERTS, _RESERVE, _RESERVE)

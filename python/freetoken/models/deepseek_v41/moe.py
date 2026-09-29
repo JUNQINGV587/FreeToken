@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
+from freetoken.layers.moe import owner_ep_expert_tp_size
 
 from .args import DeepseekV41Args
 
@@ -82,6 +83,14 @@ class DSV41OffloadMoELayer(OffloadMoELayer):
         # which the shared NVFP4 epilogue now computes through ``swiglu_clamp``; the marlin and b12x
         # kernels still cannot express it and are rejected by ``gated_epilogue_reason``, so these
         # layers select the Triton backend.
+        #
+        # The experts are NVFP4, and no NVFP4 expert kernel accepts TP > 1: the kernel has to be told
+        # the GEMM is unsharded, which is exactly true under owner-local EP (every rank holds whole,
+        # disjoint experts) -- the layer still all-reduces once at its output. Without it every
+        # candidate kernel is skipped and building the model dies with KernelSelectionError
+        # ("TP > 1 is not supported for this expert format"). This seam constructs the offload layer
+        # directly instead of going through ``make_moe_layer``, so it asks the same helper that
+        # factory uses rather than re-deriving the rule.
         super().__init__(
             layer_id=layer_id,
             num_experts=args.n_routed_experts,
@@ -91,6 +100,7 @@ class DSV41OffloadMoELayer(OffloadMoELayer):
             renormalize=True,
             activation="silu",
             limit=args.swiglu_limit if args.swiglu_limit > 0 else None,
+            expert_tp_size=owner_ep_expert_tp_size(args),
             strategy=strategy,
             decode_target=decode_target,
             quant_config=quant_config,
@@ -103,38 +113,17 @@ class DSV41OffloadMoELayer(OffloadMoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        # Whole-layer streaming moves all num_experts rows per layer; a small chunk touches at
-        # most T*top_k of them, so below that crossover the decode-style on-demand slot path
-        # strictly moves fewer bytes. Mixing modes across chunks is safe: the streaming buffers
-        # disown their borrowed slots on invalidation.
-        cache = self.offload_cache
-        assert cache is not None
-        if self.owner_cache is not None:
-            # The owner adapter must see the original global route; its local-row remap,
-            # borrowed-buffer lifecycle and remote zeroing stay in the base implementation.
-            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-        # Unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the
-        # whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot
-        # remap would contradict.
-        if (
-            hidden_states.shape[0] * self.top_k >= self.num_experts
-            or cache.is_unpinned_layer(self.layer_id)
-        ):
-            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
-        cache.copy_missing()
-        if cache.collect_stats:
-            cache.record_decode_stats(self.layer_id)
-        return self._expert_gemm(
-            cache,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            views=cache.bank_views(),
-            n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
-            is_prefill=True,
-        )
+        # Prefill must NOT take the decode-style on-demand slot path. That path hands the
+        # inline-NVFP4 GEMM slot ids, whose namespace is the whole slot pool (1675 rows here,
+        # spanning layers), and asks moe_align_block_size for a histogram over it. sgl_kernel's
+        # align kernel silently produces garbage for an id space that size -- observed
+        # num_tokens_post_pad = -1694418143 with expert_ids ~ 1e9 on a 5-token chunk, after which
+        # the GEMM's `pid_m * BLOCK_SIZE_M >= num_tokens_post_padded` guard never returns and the
+        # slot indexes a wild address (illegal memory access). FreeToken's own Triton align kernel
+        # has no such cap, but wiring a 2048-bin histogram into every prefill is not worth it for
+        # a byte-count optimization. The base path keeps position == expert id (n == num_experts),
+        # which is also what the disk tier's ring/identity-slot staging is built around.
+        return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
 
 
 class MoE(BaseOP):

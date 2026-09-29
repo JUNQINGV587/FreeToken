@@ -42,7 +42,14 @@ class BaseOP:
             if isinstance(param, torch.Tensor):
                 item = state_dict.pop(_concat_prefix(prefix, name))
                 assert isinstance(item, torch.Tensor)
-                assert param.shape == item.shape and param.dtype == item.dtype
+                if param.shape != item.shape or param.dtype != item.dtype:
+                    # Name BOTH sides: this assert is the last stop of the weight loader, and a bare
+                    # AssertionError here costs a full engine boot to find the tensor it is about.
+                    raise AssertionError(
+                        f"weight {_concat_prefix(prefix, name)!r}: the checkpoint gives "
+                        f"{tuple(item.shape)} {item.dtype}, the model declares "
+                        f"{tuple(param.shape)} {param.dtype}"
+                    )
                 setattr(self, name, item)
             elif isinstance(param, BaseOP):
                 param.load_state_dict(

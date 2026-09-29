@@ -236,7 +236,10 @@ class Nvfp4DiskIndex:
             weight_map = json.load(f)["weight_map"]
 
         num_layers = _num_moe_layers(config)
-        # (bank_layer, expert, proj, kind) -> (tensor_name, shard)
+        # (bank_layer, expert, proj, kind) -> (tensor_name, shard). The projection is keyed by
+        # CANONICAL role (gate_proj/up_proj/down_proj, what _NVP4_BANK_SEGS names), so a
+        # checkpoint that spells its experts w1/w2/w3 (V4.1, minimax) resolves through the
+        # same spec.proj_to_role the in-RAM bank path uses.
         loc: dict[tuple[int, int, str, str], tuple[str, str]] = {}
         for name, shard in weight_map.items():
             m = spec.key_pattern.match(name)
@@ -245,7 +248,12 @@ class Nvfp4DiskIndex:
             bank_layer = spec.layer_to_bank(int(m.group("layer")), config)
             if bank_layer is None:
                 continue
-            loc[(bank_layer, int(m.group("expert")), m.group("proj"), m.group("kind"))] = (
+            role = spec.proj_to_role.get(m.group("proj"))
+            if role is None:
+                raise ValueError(
+                    f"{spec.desc}: unknown NVFP4 expert projection {m.group('proj')!r} in {name}"
+                )
+            loc[(bank_layer, int(m.group("expert")), f"{role}_proj", m.group("kind"))] = (
                 name, shard)
 
         shards = sorted(set(shard for _, shard in loc.values()))

@@ -20,10 +20,57 @@ import re
 import safetensors
 import torch
 
+from freetoken.distributed import try_get_tp_info
 from freetoken.models.loader import drop_page_cache
 from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 
 from .args import load_args
+
+# Which checkpoint tensors the MODEL partitions across TP, and on which axis. The model
+# holds ``VocabParallelEmbedding``/``ParallelLMHead`` and column/row-parallel linears, so
+# the loader must cut the raw tensor the same way before handing it over (the shape assert
+# in layers/base.py is the gate that catches a miss). V4.1's names -- wq_b / wo_b /
+# shared_experts.w{1,2,3} -- do NOT match models.loader.shard_tensor's llama/qwen patterns,
+# hence this local table. Everything else (wq_a, wkv, wq_b's companion norms, attn_sink,
+# wo_a, compressor.*, engram.*, gate/hc_* mixing) is replicated, not sharded.
+_TP_SHARD_DIM = {
+    "attn.wq_b": 0,
+    "attn.indexer.wq_b": 0,
+    "attn.wo_b": 1,
+    "ffn.shared_experts.w1": 0,
+    "ffn.shared_experts.w3": 0,
+    "ffn.shared_experts.w2": 1,
+}
+_TP_VOCAB_KEYS = ("embed.weight", "head.weight")
+
+
+def _tp_dim(name: str) -> int | None:
+    """The TP axis of a raw checkpoint tensor, or None when the model replicates it."""
+    stem = name
+    for kind in ("weight", "scale", "bias"):
+        if stem.endswith(f".{kind}"):
+            stem = stem[: -len(kind) - 1]
+            break
+    for key, dim in _TP_SHARD_DIM.items():
+        if stem.endswith(f".{key}"):
+            return dim
+    return None
+
+
+def _tp_shard(name: str, value: torch.Tensor) -> torch.Tensor:
+    """Slice one raw checkpoint tensor for this TP rank (no-op at TP=1 or with no TP set)."""
+    tp = try_get_tp_info()
+    if tp is None or tp.size == 1:
+        return value
+    if name in _TP_VOCAB_KEYS:
+        rows = -(-value.shape[0] // tp.size)
+        return value[tp.rank * rows : min((tp.rank + 1) * rows, value.shape[0]), :].clone()
+    dim = _tp_dim(name)
+    if dim is None:
+        return value
+    # tensor_split, not chunk: chunk may return FEWER parts than asked when the axis is
+    # smaller than tp.size (a degenerate block-scale grid, e.g. 2x1), which then IndexErrors.
+    return value.tensor_split(tp.size, dim=dim)[tp.rank].clone()
 
 
 class _ShardReader:
@@ -87,7 +134,9 @@ def iter_weights(
     Routed NVFP4 experts come from the offload cache, so ``include_moe_experts`` must be
     False (DeepSeek-V4.1 only runs ``--moe-strategy offload``). Tensors yielded in
     checkpoint dtype (fp8 + e8m0 preserved); ``wo_a`` dequantized to bf16 to match the
-    reference einsum.
+    reference einsum. TP>1 slices the partitioned tensors itself (``_tp_shard``) instead
+    of declaring a ``tp_shard`` parameter, the way llama/qwen do -- the engine only
+    forwards that flag to readers that ask for it.
     """
     if include_moe_experts:
         raise ValueError(
@@ -101,7 +150,7 @@ def iter_weights(
     reader = _ShardReader(model_path, _weight_map(model_path), device)
 
     def get(name: str) -> torch.Tensor:
-        return reader.get(name)
+        return _tp_shard(name, reader.get(name))
 
     def linear(src: str, dst: str):
         yield f"{dst}.weight", get(f"{src}.weight")

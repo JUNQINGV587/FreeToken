@@ -7,11 +7,13 @@ and what a pick past the live count means) are addressing, so they live here -- 
 keeps ``wq_b`` / ``weights_proj`` and hands the projections in, mirroring sglang's
 ``C4IndexerBackendMixin.forward_c4_indexer(..., c4_indexer=self, ...)``.
 
-V4.1's indexer tier is routed by BAND, off ``index_source_layers``: whether a layer has an
-indexer is a model-side topology fact, and an index source that is not a KV source (24/28/32/36
-on the real checkpoint) still reads the indexer rows its band's KV source published. The DSV4
-rule -- "an indexer exists iff ``ratio == 4``" -- is wrong here on both counts, so this mixin
-consults no ratio at all; membership in the band is the only question.
+V4.1's indexer keys are routed by BAND: the key tier belongs to the band's KV source, because
+only a kv-source indexer has ``wk`` to build keys with, and an index source that is not a KV
+source (24/28/32/36 on the real checkpoint) reads the rows that source published. Whether a
+layer has an indexer at all is a separate, model-side fact (membership in ``index_source_layers``
+-- the publication axis for topk/candidate lists). The DSV4 rule -- "an indexer exists iff
+``ratio == 4``" -- is wrong here on both counts, so this mixin consults no ratio at all; the
+pool's accessor resolves both questions.
 
 The ``-1`` a selection emits for a pick past the live count is a gather-only sentinel: the
 sparse-attention kernel masks it, and it never reaches a store.

@@ -24,7 +24,9 @@ the compressor latent before it is rotated or quantized, so ``_compress_kv`` mus
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
+from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.fp4_e4m3_act import fp4_act_quant_e4m3_inplace
 from freetoken.layers import (
@@ -35,6 +37,7 @@ from freetoken.layers import (
     RMSNorm,
 )
 
+from ..deepseek_v4.ops import apply_rotary_emb_decode
 from .args import DeepseekV41Args
 from .compress import Compressor
 from .indexer import Indexer, SharedAttentionRuntime
@@ -117,6 +120,12 @@ class Attention(BaseOP):
                 )
         self._window_cache: torch.Tensor | None = None
         self._compress_cache: torch.Tensor | None = None
+        # Paged addressing (M5). The pool itself is never stored -- ``attn`` and ``pool`` are read
+        # off the live global context -- so a runtime rebuild needs no unbind.
+        self._paged = False
+        self.band_ratio = self.compress_ratio
+        self._has_compression = False
+        self.index_topk = args.index_topk
 
         # Ratio-0 layers turn YaRN off (the window never exceeds the trained length); compressed
         # layers rope their latents with ``compress_rope_theta`` over the 16x stretched context.
@@ -131,23 +140,45 @@ class Attention(BaseOP):
         # Bound on first forward. Underscore-prefixed so it stays out of state_dict.
         self._freqs_cis: torch.Tensor | None = None
 
-    def bind(self, device: torch.device) -> None:
+    def bind(self, device: torch.device, pool=None) -> None:
+        """Bind the rope table and pick the path: ``pool is None`` keeps the eager per-layer
+        caches (the oracle-comparison path), a pool switches to the paged backend.
+
+        The pool is used for its geometry only, never stored: a rebuild is followed by
+        ``mark_for_rebind`` on the model, which re-derives the fixed-shape scratch.
+        """
         self._freqs_cis = get_freqs_cis(*self._freqs_params, device)
-        # The reference allocates these as non-persistent buffers; here they are plain state, so
-        # they must stay out of ``state_dict`` (underscore) and out of the checkpoint's way.
-        self._window_cache = torch.zeros(
-            self.max_batch_size, self.window_size, self.head_dim,
-            dtype=torch.bfloat16, device=device,
-        )
-        if self.compressor is not None:
-            self._compress_cache = torch.zeros(
-                self.max_batch_size, self.max_seq_len // self.compress_ratio, self.head_dim,
+        self._paged = pool is not None
+        if pool is None:
+            # The reference allocates these as non-persistent buffers; here they are plain state, so
+            # they must stay out of ``state_dict`` (underscore) and out of the checkpoint's way.
+            self._window_cache = torch.zeros(
+                self.max_batch_size, self.window_size, self.head_dim,
                 dtype=torch.bfloat16, device=device,
             )
+            if self.compressor is not None:
+                self._compress_cache = torch.zeros(
+                    self.max_batch_size, self.max_seq_len // self.compress_ratio, self.head_dim,
+                    dtype=torch.bfloat16, device=device,
+                )
+            return
+        self._window_cache = None
+        self._compress_cache = None
+        # The band's ratio, not this layer's: a consumer shares the pool its source addressed.
+        self.band_ratio = pool.cmp_ratio_of(self.layer_id) or self.compress_ratio
+        self._has_compression = pool.cmp_source_of(self.layer_id) is not None
+        if self.compressor is not None:
+            self.compressor.bind_paged(self.layer_id, self._freqs_cis, tier="attn")
+        if self.indexer is not None:
+            self.indexer.bind_paged(self.layer_id, self._freqs_cis, device)
 
     def reset(self) -> None:
         """Drop the per-sequence state: window/compressed rings, the compressor carry and the
         indexer's key cache. The rope table and the shared runtime slots are re-derived per step."""
+        if self._paged:
+            # the pool owns the paged state and the scheduler recycles it per request, so there is
+            # nothing here to drop -- and the runtime's buffers are fixed-shape, not per-sequence
+            return
         if self._window_cache is not None:
             self._window_cache.zero_()
         if self._compress_cache is not None:
@@ -244,6 +275,177 @@ class Attention(BaseOP):
         wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
         return self.wo_b.forward(o)
+
+    # ----- paged path (M5) ----------------------------------------------------------------
+    @property
+    def attn(self):
+        return get_global_ctx().attn_backend
+
+    @property
+    def pool(self):
+        return get_global_ctx().kv_cache
+
+    def _segment_window(self, kv_seg: torch.Tensor, ti: int, start_pos: int, n: int):
+        """Store this segment's window KV and return its window half as GLOBAL slot lists."""
+        win = self.window_size
+        device = kv_seg.device
+        end = start_pos + n
+        slots = self.attn.window_slots_of(ti, start_pos, end)
+        self.attn.store_window(kv_seg[0], self.layer_id, slots)
+        if start_pos == 0:
+            cols = get_window_topk_idxs(win, 1, n, 0).to(device)
+            return self.attn.win_cols_to_global(cols, slots)
+        # an extend segment sees the whole ring: slot j holds the newest position p <= q with
+        # p % win == j, i.e. p = q - ((q - j) % win)
+        w_lo = max(0, start_pos - win + 1)
+        ring = self.attn.window_slots_of(ti, w_lo, end)
+        q = start_pos + torch.arange(n, device=device).unsqueeze(1)
+        cols = (q - win + 1).clamp(min=w_lo) + torch.arange(win, device=device)
+        cols = torch.where(cols > q, -1, cols - w_lo).unsqueeze(0)
+        return self.attn.win_cols_to_global(cols, ring)
+
+    def _segment_blocks(self, x_seg, qr_seg, ti: int, start_pos: int, off: int) -> torch.Tensor:
+        """The compressed half of this segment's index list, as BLOCK indices.
+
+        A layer without a compressor of its own reads the band source's published picks verbatim;
+        its pool is the source's pool, so those blocks resolve to the same rows.
+        """
+        n = x_seg.size(1)
+        assert self._runtime.topk_idxs is not None, (
+            f"layer {self.layer_id} reads its band's picks but source "
+            f"{self.kv_source_layer} has no indexer"
+        )
+        topk = min(self.index_topk, (start_pos + n) // self.band_ratio)
+        return self._runtime.topk_idxs[: x_seg.size(0), off : off + n, :topk]
+
+    def _segment(self, x_seg, qr_seg, kv_seg, ti: int, start_pos: int, off: int):
+        """``(window half, compressed half)`` for one request's segment, both as global slots."""
+        n = x_seg.size(1)
+        win_global = self._segment_window(kv_seg, ti, start_pos, n)
+        if not self._has_compression:
+            return win_global, None
+        latent = starts = None
+        if self.compressor is not None:
+            latent, starts = self.compressor.compress_paged(x_seg, start_pos, ti)
+        if self.indexer is not None:
+            blocks = self.indexer.forward_paged(
+                x_seg, qr_seg, latent, starts, start_pos, ti, off
+            )
+        else:
+            blocks = self._segment_blocks(x_seg, qr_seg, ti, start_pos, off)
+        if latent is not None and starts is not None and starts.numel():
+            # scatter only now: the indexer above had to score the latent UNROTATED
+            self.compressor.store_paged(latent, starts, ti)
+        return win_global, self.attn.blocks_to_global(blocks, self.band_ratio, ti=ti)
+
+    @torch.no_grad()
+    def prefill_ragged(
+        self, x: torch.Tensor, segments: list, flat_positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Paged ragged prefill: ``x`` is [1, T, dim] and ``segments`` carries one
+        ``(offset, n, table_idx, start_pos)`` per request, tiling [0, T). Returns [1, T, dim]."""
+        assert self._paged, "prefill_ragged is the paged path; bind the layer with a pool"
+        total = x.size(1)
+        if len(segments) == 1:
+            freqs = self._freqs_cis[segments[0][3] : segments[0][3] + total]
+        else:
+            freqs = self._freqs_cis.index_select(0, flat_positions)
+        rd = self.rope_head_dim
+
+        qr = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb(q[..., -rd:], freqs)
+
+        kv = self.kv_norm.forward(self.wkv.forward(x))
+        apply_rotary_emb(kv[..., -rd:], freqs)
+        act_quant_fp8_inplace(kv, 32)
+
+        win_parts, cmp_parts = [], []
+        for off, n, ti, start_pos in segments:
+            win = self._segment(
+                x[:, off : off + n], qr[:, off : off + n], kv[:, off : off + n], ti, start_pos,
+                off,
+            )
+            win_parts.append(win[0])
+            if win[1] is not None:
+                cmp_parts.append(win[1])
+        # one kernel launch over all segments, so both halves share a width across the batch
+        n_window = self.window_size if len(segments) > 1 else win_parts[0].shape[-1]
+        if cmp_parts:
+            max_c = max(part.shape[-1] for part in cmp_parts)
+            flat = [
+                torch.cat(
+                    [
+                        F.pad(w, (0, n_window - w.shape[-1]), value=-1),
+                        F.pad(c, (0, max_c - c.shape[-1]), value=-1),
+                    ],
+                    dim=-1,
+                )
+                for w, c in zip(win_parts, cmp_parts)
+            ]
+        else:
+            flat = [F.pad(w, (0, n_window - w.shape[-1]), value=-1) for w in win_parts]
+        topk_idxs = (flat[0] if len(flat) == 1 else torch.cat(flat, dim=1)).int()
+        o = self.attn.attend(
+            q, self.layer_id, topk_idxs, n_window, self.attn_sink, self.softmax_scale,
+            has_compression=bool(cmp_parts),
+        )
+        apply_rotary_emb(o[..., -rd:], freqs, True)
+        return self._wo(o, 1, total)
+
+    @torch.no_grad()
+    def decode_step(
+        self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
+        wctx=None,
+    ) -> torch.Tensor:
+        """One decode token per row against the window ring and the band's compressed pool."""
+        bsz = x.size(0)
+        if wctx is None:
+            wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
+        window_slots, prev_window_slots, window_slots_topk = wctx
+        rd = self.rope_head_dim
+        freqs_t = self._freqs_cis.index_select(0, pos)
+
+        qr = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb_decode(q[..., -rd:], freqs_t)
+
+        kv = self.kv_norm.forward(self.wkv.forward(x))
+        apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
+        act_quant_fp8_inplace(kv, 32)
+        self.attn.store_window(kv.view(bsz, -1), self.layer_id, window_slots)
+
+        cmp_counts = None
+        if self._has_compression:
+            ratio = self.band_ratio
+            n_stage = (cmp_stage_cap + 1) // ratio
+            latent = completed = None
+            if self.compressor is not None:
+                latent, completed = self.compressor.decode_paged(
+                    x, pos, prev_window_slots, window_slots
+                )
+            if self.indexer is not None:
+                blocks = self.indexer.decode_paged(x, qr, latent, pos, n_stage, rows)
+            else:
+                assert self._runtime.topk_idxs is not None, (
+                    f"layer {self.layer_id} reads its band's picks but source "
+                    f"{self.kv_source_layer} has no indexer"
+                )
+                blocks = self._runtime.topk_idxs[:bsz, :1, : min(self.index_topk, n_stage)]
+            if latent is not None:
+                self.compressor.store_decode(latent, rows, pos, completed)
+            compress_idxs = self.attn.blocks_to_global(blocks, ratio, rows=rows)
+            topk_idxs = torch.cat([window_slots_topk, compress_idxs], dim=-1)
+            cmp_counts = ((pos + 1) // ratio).clamp(max=compress_idxs.shape[-1])
+            cmp_counts = cmp_counts.to(torch.int32).view(bsz, 1)
+        else:
+            topk_idxs = window_slots_topk
+        o = self.attn.attend(
+            q, self.layer_id, topk_idxs.int(), self.window_size, self.attn_sink,
+            self.softmax_scale, cmp_counts=cmp_counts, has_compression=self._has_compression,
+        )
+        apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)
+        return self._wo(o, bsz, 1)
 
     @torch.no_grad()
     def forward(

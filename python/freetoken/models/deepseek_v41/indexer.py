@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import torch
 
+from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import fp4_act_quant_inplace
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, RMSNorm
 
+from ..deepseek_v4.ops import apply_rotary_emb_decode
 from .args import DeepseekV41Args
 from .compress import select_candidate_blocks
 from .ops import apply_rotary_emb, get_freqs_cis
@@ -48,6 +50,22 @@ class SharedAttentionRuntime:
         self.index_k = None
         self.candidates = None
         self.topk_idxs = None
+
+    def bind_paged(self, *, max_batch: int, max_seq_len: int, topk: int, device) -> None:
+        """Fixed-shape publish buffers, written in place: a captured graph bakes their addresses.
+
+        Only the first index source of the model allocates them; every later band reuses the same
+        two tensors, which is what lets a consumer layer hold a view of what its source published.
+        The shape check (rather than ``is None``) also clears a buffer a previous EAGER pass left
+        behind -- the eager indexer stores its own ``[b, s, topk]`` picks on the same runtime.
+        """
+        shape = (max_batch, max_seq_len, topk)
+        if self.topk_idxs is None or tuple(self.topk_idxs.shape) != shape:
+            self.topk_idxs = torch.zeros(*shape, dtype=torch.int32, device=device)
+        want = (1, max_seq_len, max_seq_len)
+        if self.candidates is None or tuple(self.candidates.shape) != want:
+            # one entry per compressed position; ratio >= 1 makes max_seq_len an upper bound
+            self.candidates = torch.zeros(*want, dtype=torch.bool, device=device)
 
 
 class Indexer(BaseOP):
@@ -183,6 +201,130 @@ class Indexer(BaseOP):
         topk = min(self.index_topk, end_pos // ratio)
         idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+
+    # ----- paged path (M5) ----------------------------------------------------------------
+    @property
+    def attn(self):
+        """The paged backend. Read live, like the pool: a runtime rebuild needs no unbind."""
+        return get_global_ctx().attn_backend
+
+    def bind_paged(self, layer_id: int, freqs_cis: torch.Tensor, device) -> None:
+        self.layer_id = layer_id
+        self._freqs_cis = freqs_cis
+        self.runtime.bind_paged(
+            max_batch=self.max_batch_size, max_seq_len=self.max_seq_len,
+            topk=self.index_topk, device=device,
+        )
+        if self.owns_k:
+            # only the band's KV source owns the tiers: a consumer's bind must not reset them
+            self.runtime.compress_kv = self.attn.compress_pool(layer_id, "attn")
+            self.runtime.index_k = self.attn.compress_pool(layer_id, "idx")
+
+    def _publish(self, idxs: torch.Tensor, off: int) -> torch.Tensor:
+        """Write this layer's block picks into the shared per-band buffer and hand out the view.
+
+        The picks are BLOCK indices, not pool slots: the attention layer converts them once, so a
+        consumer in the same band reads the same list whatever its own ratio is.
+
+        ``off`` is the segment's offset in the packed prefill row, and the buffer's token axis is
+        that packed row -- a ragged prefill runs every segment of a layer before the next layer
+        starts, so a consumer must find its own segment's picks, not the last segment's.
+        """
+        n, topk = idxs.size(1), idxs.shape[-1]
+        view = self.runtime.topk_idxs[: idxs.size(0), off : off + n, :topk]
+        view.copy_(idxs)
+        return view
+
+    @torch.no_grad()
+    def forward_paged(
+        self, x: torch.Tensor, qr: torch.Tensor, latent: torch.Tensor | None,
+        starts: torch.Tensor | None, start_pos: int, ti: int, off: int = 0,
+    ) -> torch.Tensor:
+        """``x`` [1, n, dim], ``latent``/``starts`` the compressor's output for this segment.
+
+        Returns int32 ``[1, n, topk]`` BLOCK indices (``-1`` unreachable), also published on the
+        band's runtime for the layers between this index source and the next one.
+        """
+        bsz, seqlen, _ = x.shape
+        ratio, rd = self.ratio, self.rope_head_dim
+        end_pos = start_pos + seqlen
+        n_blocks = end_pos // ratio
+
+        if self.owns_k and latent is not None and starts is not None and starts.numel():
+            # the latent stands for the first token of its group, so it is roped at j * ratio
+            k = self.k_norm.forward(self.wk.forward(latent))
+            apply_rotary_emb(k[..., -rd:], self._freqs_cis.index_select(0, starts))
+            fp4_act_quant_inplace(k, 32)
+            rows = self.attn.compress_rows_of(ti, starts, ratio)
+            self.attn.scatter_compressed(self.layer_id, "idx", rows, k[0])
+
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.index_head_dim))
+        apply_rotary_emb(q[..., -rd:], self._freqs_cis[start_pos:end_pos])
+        fp4_act_quant_inplace(q, 32)
+
+        keys = self.attn.indexer_keys(ti, n_blocks, ratio, self.layer_id, bsz)
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads**-0.5)
+        scores = self.attn.indexer_prefill_logits(q, keys, weights)
+
+        # a block becomes visible once the query has passed its last token
+        live = (start_pos + torch.arange(1, seqlen + 1, device=x.device)) // ratio
+        if n_blocks:
+            scores = scores.masked_fill(
+                torch.arange(n_blocks, device=x.device) >= live[:, None], float("-inf")
+            )
+            mask = self.runtime.candidates[:bsz, off : off + seqlen, :n_blocks]
+            if self.is_candidate_source:
+                mask.copy_(
+                    select_candidate_blocks(
+                        scores, live.unsqueeze(-1), self.candidate_topk_blocks,
+                        self.candidate_block_size,
+                    )
+                )
+            elif self.uses_candidates:
+                scores = scores.masked_fill(~mask, float("-inf"))
+
+        topk = min(self.index_topk, n_blocks)
+        idxs = self.attn.indexer_select_prefill(
+            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio, topk=topk, offset=0
+        )
+        return self._publish(idxs, off)
+
+    @torch.no_grad()
+    def decode_paged(
+        self, x: torch.Tensor, qr: torch.Tensor, latent: torch.Tensor | None,
+        pos: torch.Tensor, n_stage: int, rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """One decode token per row: int32 ``[B, 1, topk]`` BLOCK indices, also published."""
+        bsz = x.size(0)
+        ratio, rd = self.ratio, self.rope_head_dim
+
+        if self.owns_k and latent is not None:
+            k = self.k_norm.forward(self.wk.forward(latent))
+            apply_rotary_emb_decode(
+                k[..., -rd:], self._freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))
+            )
+            fp4_act_quant_inplace(k, 32)
+            completed = (pos + 1) % ratio == 0
+            dst = self.attn.decode_compress_rows(
+                rows, pos, ratio, self.layer_id, "idx", completed
+            )
+            self.attn.scatter_compressed(self.layer_id, "idx", dst, k[:, 0])
+
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.index_head_dim))
+        apply_rotary_emb_decode(q[..., -rd:], self._freqs_cis.index_select(0, pos))
+        fp4_act_quant_inplace(q, 32)
+
+        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads**-0.5)
+        valid = (pos + 1) // ratio
+        scores = self.attn.indexer_decode_scores(
+            q.reshape(bsz, self.n_heads, self.index_head_dim),
+            weights.reshape(bsz, self.n_heads),
+            valid, n_stage, ratio, self.layer_id,
+        ).view(bsz, 1, n_stage)
+        topk = min(self.index_topk, n_stage)
+        blocks = self.attn.indexer_select_decode(scores, valid=valid, topk=topk, offset=0)
+        self.runtime.topk_idxs[:bsz, :1, :topk].copy_(blocks)
+        return self.runtime.topk_idxs[:bsz, :1, :topk]
 
 
 __all__ = ["Indexer", "SharedAttentionRuntime"]

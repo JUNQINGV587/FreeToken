@@ -20,6 +20,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.layers import (
@@ -141,8 +142,13 @@ class Block(BaseOP):
         image_mask: torch.Tensor | None = None,
         *,
         trace: dict | None = None,
+        attn_fn=None,
     ):
-        """[B, S, hc_mult, dim] -> ([B, S, hc_mult, dim], ffn_pre [B, S, hc_mult])."""
+        """[B, S, hc_mult, dim] -> ([B, S, hc_mult, dim], ffn_pre [B, S, hc_mult]).
+
+        ``attn_fn`` overrides the attention call alone: the paged path needs a different driver
+        but the same engram / HC / FFN plumbing, and ``None`` is the eager reference call.
+        """
         if pre_mix is None:
             pre_mix = make_identity_pre_mix(x, self.hc_mult)
         bsz, seqlen = x.size(0), x.size(1)
@@ -153,7 +159,7 @@ class Block(BaseOP):
         )
         x = self.hc_pre(x, pre_mix)
         x = self.attn_norm.forward(x)
-        x = self.attn.forward(x, start_pos, trace=trace)
+        x = self.attn.forward(x, start_pos, trace=trace) if attn_fn is None else attn_fn(x)
         x = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = x
@@ -223,9 +229,14 @@ class Transformer(BaseOP):
         if self.engram_layout is not None and tokenizer is not None:
             self._engram_hash = NgramHashState(args, self.engram_layout, tokenizer)
 
-    def bind(self, device: torch.device) -> None:
+    def bind(self, device: torch.device, pool=None) -> None:
+        """``pool is None`` binds the eager path (the oracle-comparison path); a pool binds paged.
+
+        The order is deliberate: ``attn.bind(device)`` is what the eager tests and the reference
+        comparison call, and it must keep meaning the same thing.
+        """
         for layer in self.layers.op_list:
-            layer.attn.bind(device)
+            layer.attn.bind(device, pool)
             if layer.engram is not None:
                 layer.engram.bind(table=self._engram_table, device=device)
         if self._engram_hash is not None:
@@ -277,6 +288,77 @@ class Transformer(BaseOP):
         logits = self.logits(h.reshape(-1, self.args.dim))
         return logits.view(bsz, seqlen, -1) if full_logits else logits
 
+    @torch.no_grad()
+    def forward_paged(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        segments: list | None = None,
+        flat_positions: torch.Tensor | None = None,
+        pos: torch.Tensor | None = None,
+        rows: torch.Tensor | None = None,
+        cmp_stage_cap: int = 0,
+        image_mask: torch.Tensor | None = None,
+        full_logits: bool = False,
+    ) -> torch.Tensor:
+        """Drive the blocks along the paged CSA2 path; bind the model with a pool first.
+
+        ``segments`` -- one ``(offset, n, table_idx, start_pos)`` per request, tiling the token
+        axis -- is a ragged prefill; ``pos``/``rows`` is a decode step, one token per row, and
+        ``cmp_stage_cap`` is the compressed width to stage. Everything else (engram, HC, FFN) is
+        the eager plumbing, so a paged pass and an eager pass over the same tokens are comparable.
+        """
+        input_ids = input_ids.contiguous()
+        bsz, seqlen = input_ids.size()
+        assert (segments is None) != (pos is None), "pass either segments (prefill) or pos (decode)"
+        assert all(layer.attn._paged for layer in self.layers.op_list), (
+            "forward_paged needs the model bound to a pool: Transformer.bind(device, pool)"
+        )
+        if segments is not None:
+            start_pos = segments[0][3]
+            assert all(s[3] == start_pos for s in segments) or len(segments) == 1, (
+                "a ragged batch carries one start_pos per request only when it is a warm pass"
+            )
+            assert start_pos == 0 or len(segments) == 1, (
+                "a warm segment advances one request at a time"
+            )
+            if flat_positions is None:
+                flat_positions = torch.cat([
+                    s[3] + torch.arange(s[1], device=input_ids.device) for s in segments
+                ])
+        else:
+            assert bsz == int(pos.numel()), "one pos per request row"
+            start_pos = int(pos.reshape(-1)[0])
+        engram_mask = None if image_mask is None else ~image_mask
+        hashes = None
+        if self._engram_hash is not None:
+            hashes = self._engram_hash.forward(input_ids, start_pos, engram_mask)
+        h = self.embed.forward(input_ids.reshape(-1)).view(bsz, seqlen, self.args.dim)
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+
+        pre_mix = make_identity_pre_mix(h, self.hc_mult)
+        layer = None
+        for i, layer in enumerate(self.layers.op_list):
+            if layer.engram is not None:
+                idx = layer.engram.layer_hash_index
+                h = layer.engram.forward(h, hashes[:, :, idx, :], engram_mask)
+            if segments is not None:
+                fn = lambda x, _l=layer: _l.attn.prefill_ragged(  # noqa: E731
+                    x, segments, flat_positions
+                )
+            else:
+                fn = lambda x, _l=layer: _l.attn.decode_step(  # noqa: E731
+                    x, pos, rows, cmp_stage_cap
+                )
+            h, pre_mix = layer.forward(h, start_pos, pre_mix, image_mask, attn_fn=fn)
+        assert layer is not None, "a model with no layers has no state to collapse"
+        h = layer.hc_pre(h, pre_mix)
+        h = self.norm.forward(h)
+        if not full_logits:
+            h = h[:, -1:]
+        logits = self.logits(h.reshape(-1, self.args.dim))
+        return logits.view(bsz, seqlen, -1) if full_logits else logits
+
     def logits(self, h: torch.Tensor) -> torch.Tensor:
         """The head over rows the caller has ALREADY gathered.
 
@@ -300,6 +382,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         self._config = config
         self._args: DeepseekV41Args = config.dsv41_args
         self._engram_tier = None
+        self._bound = False
         self.model = Transformer(
             self._args,
             config.quant,
@@ -309,6 +392,33 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             tokenizer=resolve_engram_tokenizer(config),
             engram_table=getattr(config, "engram_table", None),
         )
+
+    def _ensure_bound(self) -> None:
+        """Bind on the first forward, against whatever the global context holds.
+
+        v41 stays runnable with NO context pool (the eval / oracle tests drive ``Transformer``
+        directly), so a missing ctx or kv_cache is not an error -- it just means the eager path.
+        """
+        if self._bound:
+            return
+        pool = None
+        try:
+            pool = get_global_ctx().kv_cache
+        except (AssertionError, AttributeError):
+            pass
+        device = pool.device if pool is not None else getattr(self._config, "device", None)
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.bind(torch.device(device), pool)
+        self._bound = True
+
+    def mark_for_rebind(self) -> None:
+        """Force a re-bind on the next forward. The model holds NO pool reference -- buffers are
+        read off ctx.kv_cache via @property -- so a runtime rebuild needs no unbind; the old pool
+        frees when the engine drops ctx.kv_cache. But the per-bind scratch (the compressor's rope
+        table, the runtime's fixed-shape publish buffers) depends on the new pool's geometry, so
+        re-derive it via _ensure_bound."""
+        self._bound = False
 
     def engram_layers(self) -> list:
         """The blocks that carry an engram lookup (layers 1 and 14 in this checkpoint)."""
@@ -347,6 +457,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         return tier
 
     def forward(self) -> torch.Tensor:
+        self._ensure_bound()
         raise NotImplementedError(
             "DeepseekV41ForCausalLM: the engine batch path (paged CSA2 + the NVFP4 expert cache) "
             "lands with M5 -- call Transformer.forward directly until then."

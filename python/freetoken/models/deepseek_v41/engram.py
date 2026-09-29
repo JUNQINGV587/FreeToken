@@ -220,7 +220,7 @@ class NgramHashState(BaseOP):
     def bind(self, device: torch.device) -> None:
         for name in ("primes", "offsets", "multipliers", "token_map"):
             setattr(self, name, getattr(self, name).to(device))
-        self._cache = torch.empty(
+        self._cache = torch.zeros(
             self.max_batch_size, self.max_seq_len, dtype=torch.int64, device=device
         )
 
@@ -229,7 +229,14 @@ class NgramHashState(BaseOP):
         return self._cache
 
     def reset(self) -> None:
-        self._cache = None  # type: ignore[assignment]
+        """Blank the history: the next pass starts a new sequence at position 0.
+
+        The buffer is CLEARED, not dropped -- dropping it would make the next forward depend on
+        someone remembering to bind again, and the DEAD/pad substitutes already keep a blank slot
+        from being read as a real token (every lookback past the start is blocked).
+        """
+        if self._cache is not None:
+            self._cache.zero_()
 
     @torch.inference_mode()
     def forward(

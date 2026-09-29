@@ -104,6 +104,11 @@ class Indexer(BaseOP):
         )
         self._freqs_cis: torch.Tensor | None = None
 
+    def reset(self) -> None:
+        """The index-K cache is per sequence: a stale one would let a new prompt read another's
+        compressed keys."""
+        self._k_cache = None
+
     def bind(self, device: torch.device) -> None:
         if self._freqs_cis is None:
             self._freqs_cis = get_freqs_cis(*self._freqs_params, device)

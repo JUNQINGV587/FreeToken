@@ -145,6 +145,19 @@ class Attention(BaseOP):
                 dtype=torch.bfloat16, device=device,
             )
 
+    def reset(self) -> None:
+        """Drop the per-sequence state: window/compressed rings, the compressor carry and the
+        indexer's key cache. The rope table and the shared runtime slots are re-derived per step."""
+        if self._window_cache is not None:
+            self._window_cache.zero_()
+        if self._compress_cache is not None:
+            self._compress_cache.zero_()
+        if self.compressor is not None:
+            self.compressor.reset()
+        if self.indexer is not None:
+            self.indexer.reset()
+        self._runtime.reset()
+
     def _window_kv(
         self, x: torch.Tensor, freqs: torch.Tensor, start_pos: int
     ) -> tuple[torch.Tensor, torch.Tensor]:

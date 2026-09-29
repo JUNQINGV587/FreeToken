@@ -18,6 +18,8 @@ import os
 import struct
 from types import SimpleNamespace
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -108,7 +110,19 @@ def _args() -> DeepseekV41Args:
     )
 
 
-def _model(monkeypatch, device) -> model_mod.Transformer:
+def _band_args() -> DeepseekV41Args:
+    """A stack whose layer 2 is a CONSUMER: layer 1 is the band's only kv/index source, so
+    layers 2 (ratio 2) and 3 (ratio 1) have no compressor and no indexer of their own."""
+    return dataclasses.replace(
+        _args(),
+        compress_ratios=(0, 2, 2, 1),
+        kv_source_layers=(1,),
+        index_source_layers=(1,),
+        candidate_source_layer=1,
+    )
+
+
+def _model(monkeypatch, device, args: DeepseekV41Args | None = None) -> model_mod.Transformer:
     from freetoken.distributed.info import get_tp_info, set_tp_info
     from freetoken.models.deepseek_v41.engram import ResidentEngramTable
 
@@ -117,7 +131,8 @@ def _model(monkeypatch, device) -> model_mod.Transformer:
     except RuntimeError:
         set_tp_info(rank=0, size=1)
     monkeypatch.setattr(model_mod, "MoE", lambda *a, **k: _StubFFN(DIM))
-    args = _args()
+    if args is None:
+        args = _args()
     rows = sum(args.engram_num_embeddings)
     table = ResidentEngramTable(
         (torch.randn(rows, args.engram_head_dim) * 0.1).to(torch.float8_e4m3fn),
@@ -207,6 +222,45 @@ def test_the_engram_layer_is_the_only_one_and_reaches_the_output(monkeypatch):
     assert not torch.allclose(with_engram, without, rtol=1e-3, atol=1e-3), (
         "the engram contribution never reached the logits"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_one_band_runtime_is_shared_by_a_source_and_the_consumers_that_read_it(monkeypatch):
+    """The reference's ``shared_attn`` is module-global, so the whole stack shares one runtime.
+
+    Per-layer instances silently break the band: a consumer has no compressor and no indexer, so
+    its compressed half *is* whatever its source published -- with a private runtime that is None.
+    """
+    device = torch.device("cuda")
+    model = _model(monkeypatch, device, args=_band_args())
+    attns = [layer.attn for layer in model.layers.op_list]
+
+    assert len({id(attn._runtime) for attn in attns}) == 1
+    source, consumer, ratio1_consumer = attns[1], attns[2], attns[3]
+    assert source.is_kv_source and source.compressor is not None and source.indexer is not None
+    assert consumer.kv_source_layer == 1 and not consumer.is_kv_source
+    assert consumer.compressor is None and consumer.indexer is None
+    assert ratio1_consumer.kv_source_layer == 1 and ratio1_consumer.indexer is None
+    assert consumer._runtime is source._runtime and ratio1_consumer._runtime is source._runtime
+
+    ids = torch.randint(0, VOCAB, (1, 6), device=device)
+    logits = _logits(model, ids)
+    assert torch.isfinite(logits).all()
+    # The source published the compressed half its consumers read (the consumers' own is derived,
+    # not stored): without the shared runtime this is None and the forward above raises.
+    assert source._runtime.topk_idxs is not None
+    assert source._runtime.compress_kv is not None
+
+    # Positive control: the same stack built with a runtime per layer (what a missing ``runtime=``
+    # used to give) cannot run at all -- a consumer has no compressor and no indexer, so its
+    # private runtime leaves both the compressed pool and the index list at None.
+    original_block = model_mod.Block
+    monkeypatch.setattr(
+        model_mod, "Block", lambda *a, **kw: original_block(*a, **{**kw, "runtime": None})
+    )
+    unshared = _model(monkeypatch, device, args=_band_args())
+    with pytest.raises(TypeError, match="NoneType"):
+        _logits(unshared, ids)
 
 
 def _set_tp_info() -> None:

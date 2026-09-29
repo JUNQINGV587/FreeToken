@@ -34,6 +34,7 @@ from freetoken.models.blocks import BaseLLMModel
 from .args import DeepseekV41Args
 from .attention import Attention
 from .engram import Engram, EngramLayout, NgramHashState
+from .indexer import SharedAttentionRuntime
 from .moe import MoE
 
 
@@ -64,11 +65,14 @@ class Block(BaseOP):
         prefix: str = "",
         layout: EngramLayout | None = None,
         table=None,
+        runtime: SharedAttentionRuntime | None = None,
     ):
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.dim = args.dim
-        self.attn = Attention(layer_id, args, quant_config=quant_config, prefix=f"{prefix}.attn")
+        self.attn = Attention(
+            layer_id, args, quant_config=quant_config, prefix=f"{prefix}.attn", runtime=runtime
+        )
         # The reference keeps the engram in the Transformer but the weights live at
         # ``layers.N.engram.*``, so the module is owned here and driven from the loop below.
         self.engram = (
@@ -195,11 +199,16 @@ class Transformer(BaseOP):
         self.hc_mult = args.hc_mult
         self.engram_layout = EngramLayout.from_args(args)
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
+        # ONE band runtime for the whole stack, like the reference's module-global ``shared_attn``:
+        # a kv-source layer publishes its compressed pool and its index list there, and every
+        # consumer in its band (layers 3-7 <- 2, 9-13 <- 8, 15-19 <- 14, 21-39 <- 20) reads it back.
+        # Per-layer instances would leave every consumer without a source's topk list.
+        self._runtime = SharedAttentionRuntime()
         self.layers = OPList([
             Block(
                 i, args, strategy=strategy, decode_target=decode_target,
                 quant_config=quant_config, prefix=f"{prefix}.layers.{i}",
-                layout=self.engram_layout, table=engram_table,
+                layout=self.engram_layout, table=engram_table, runtime=self._runtime,
             )
             for i in range(args.n_layers)
         ])

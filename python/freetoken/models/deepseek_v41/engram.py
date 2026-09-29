@@ -210,12 +210,20 @@ class NgramHashState(BaseOP):
         self.max_batch_size = args.max_batch_size
         self.max_seq_len = args.max_seq_len
         # buffers: matched by the loader by name, not by dtype/shape brittleness
-        self.primes = torch.tensor(layout.primes)
-        self.offsets = layout.bucket_offsets()
-        self.multipliers = compute_hash_multipliers(
-            layout.layer_ids, layout.max_ngram_size, vocab_size
-        )
-        self.token_map = torch.tensor(token_map)
+        #
+        # Computed on CPU, NOT on the model's build device: the engine builds the model under
+        # ``torch.device("meta")`` (engine/engine.py builds with that default device), which is
+        # right for the weights the loader then materializes but wrong for these four -- they are
+        # DERIVED here from the tokenizer and the layout, so no checkpoint ever supplies them and
+        # ``bind`` could only ever move a meta tensor (which has no data). Same reasoning as the
+        # rope cache: a computed buffer must exist before the device is known.
+        with torch.device("cpu"):
+            self.primes = torch.tensor(layout.primes)
+            self.offsets = layout.bucket_offsets()
+            self.multipliers = compute_hash_multipliers(
+                layout.layer_ids, layout.max_ngram_size, vocab_size
+            )
+            self.token_map = torch.tensor(token_map)
 
     def bind(self, device: torch.device) -> None:
         for name in ("primes", "offsets", "multipliers", "token_map"):

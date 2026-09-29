@@ -331,7 +331,14 @@ class Transformer(BaseOP):
                 ])
         else:
             assert bsz == int(pos.numel()), "one pos per request row"
-            start_pos = int(pos.reshape(-1)[0])
+            if torch.cuda.is_current_stream_capturing():
+                # A captured graph may not host-sync, and ``start_pos`` never reaches the paged
+                # decode: the blocks only pass it to the EAGER attention call (``attn_fn`` is the
+                # paged entry here), while the per-row positions travel in ``pos`` itself. So the
+                # static 0 is the capture-safe value, not a guess at a position.
+                start_pos = 0
+            else:
+                start_pos = int(pos.reshape(-1)[0])
         engram_mask = None if image_mask is None else ~image_mask
         hashes = None
         if self._engram_hash is not None:

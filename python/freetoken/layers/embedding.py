@@ -137,12 +137,24 @@ class ParallelLMHead(VocabParallelEmbedding):
             logits = F.linear(x, self.tied_embedding.weight, self.bias)
         else:
             logits = self.quant_method.apply(self, x)
+        return self.gather_logits(logits)
+
+    def gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """All-gather the vocab shards so every rank samples over the whole vocabulary.
+
+        ``logits`` is ``[rows, num_embeddings_tp]`` -- this rank's shard only. Sampling from a
+        shard is not a smaller version of sampling from the vocabulary: a different softmax
+        denominator and a different argmax, so the ranks would emit different tokens and even
+        disagree on whether the sequence ended. The gather is therefore part of the head, not an
+        optional optimization, and every caller that turns hidden states into logits must go
+        through here.
+        """
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)

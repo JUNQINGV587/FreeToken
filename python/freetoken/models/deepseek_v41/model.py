@@ -382,12 +382,14 @@ class Transformer(BaseOP):
         """The head over rows the caller has ALREADY gathered.
 
         ``ParallelLMHead.forward`` is written for the engine's batch path: it takes the request
-        count and the per-request last-token indices off the attention metadata and all-gathers
-        across TP. None of that exists here (M5 wires the batch path), and this checkpoint ties no
-        embedding, so the head is exactly its quantized linear.
+        count and the per-request last-token indices off the attention metadata. None of that
+        exists here, and this checkpoint ties no embedding, so the head is exactly its quantized
+        linear -- but the vocab shard still has to be gathered across TP, or each rank samples
+        from its own half of the vocabulary and the ranks disagree about the next token (and
+        about whether the sequence ended at all).
         """
         assert self.head.tied_embedding is None, "this checkpoint does not tie the head"
-        return self.head.quant_method.apply(self.head, h)
+        return self.head.gather_logits(self.head.quant_method.apply(self.head, h))
 
 
 class DeepseekV41ForCausalLM(BaseLLMModel):

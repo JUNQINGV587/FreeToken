@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Any, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -683,6 +683,19 @@ class OffloadMoELayer(MoELayer):
         raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
 
 
+def owner_ep_expert_tp_size(config: Any) -> int | None:
+    """The tensor-parallel degree the expert GEMM kernels should be told about.
+
+    Under owner-local EP (``--moe-ep-size`` == ``--tensor-parallel-size`` > 1) every rank holds
+    whole, disjoint experts, so the routed-expert GEMM is unsharded and the NVFP4/MXFP4 kernels --
+    which reject ``TP > 1`` outright -- become selectable. The layer still all-reduces once at its
+    output (``MoELayer.tp_size`` stays the real one); only the kernel's view changes.
+
+    ``None`` means "the layer's own tp_size", which is what the resident path wants.
+    """
+    return 1 if getattr(config, "moe_ep_size", 1) > 1 else None
+
+
 def make_moe_layer(
     config: "ModelConfig",
     *,
@@ -737,7 +750,9 @@ def make_moe_layer(
         kwargs["layer_id"] = layer_id
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
-    if getattr(config, "moe_ep_size", 1) > 1:
-        # owner-local EP: whole disjoint experts per rank -> the expert GEMM is not sharded
-        kwargs["expert_tp_size"] = 1
+    # owner-local EP: whole disjoint experts per rank -> the expert GEMM is not sharded. The rule
+    # lives in ``owner_ep_expert_tp_size`` alone, because V4.1's MoE seam builds its offload layer
+    # directly instead of through this factory and has to ask the same question.
+    if (expert_tp := owner_ep_expert_tp_size(config)) is not None:
+        kwargs["expert_tp_size"] = expert_tp
     return layer_cls(**kwargs)

@@ -1709,6 +1709,11 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     model_config = config.model_config
     model_config.dsv41_args.max_seq_len = config.max_seq_len
     model_config.dsv41_args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    # The routed experts are NVFP4, and no NVFP4 expert kernel accepts TP > 1, so the model's MoE
+    # seam has to know whether owner-local EP made them whole per rank. The engine owns that number
+    # (--moe-ep-size); sync it the same way as max_seq_len so the layer built later can ask
+    # ``owner_ep_expert_tp_size`` (see freetoken.layers.moe).
+    model_config.dsv41_args.moe_ep_size = getattr(config, "moe_ep_size", 1)
     # DSV4.1's KV page IS the P-token window page (window == radix reuse granularity), so
     # max_num_tokens = num_pages * page_size holds like every model.
     P = model_config.dsv41_args.window_size

@@ -460,6 +460,56 @@ def test_unsupported_dialects_fail_closed(tmp_path):
         checkpoint_quant_config(str(tmp_path), hf_config, get_model_spec("Qwen3MoeForCausalLM"))
 
 
+# DeepSeek-V4.1-Flash-NVFP4's quantization_config, verbatim (only the layer list is trimmed).
+_V41_QUANT = {
+    "quant_method": "fp8", "quant_algo": "MIXED_PRECISION", "moe_quant_algo": "NVFP4", "expert_dtype": "fp4",
+    "group_size": 16, "scale_fmt": "ue8m0", "weight_block_size": [32, 32], "kv_cache_quant_algo": None,
+    "activation_scheme": "dynamic", "producer": "modelopt", "ignore": ["*.attn.*", "*.ffn.shared_experts.*", "head", "mtp.*"],
+    "quantized_layers": {f"layers.{i}.ffn.experts": {"group_size": 16, "quant_algo": "NVFP4"} for i in range(40)},
+}
+
+
+def _v41_config():
+    """The dialect under the family's own declarations -- the bf16 pieces come from the ModelSpec, not the quant dict."""
+    spec = get_model_spec("DeepseekV41ForCausalLM")
+    return QuantConfig.from_hf(SimpleNamespace(quantization_config=_V41_QUANT), unquantized=spec.unquantized_modules)
+
+
+def test_v41_reads_as_32_block_fp8_with_nvfp4_experts():
+    cfg = _v41_config()
+    assert type(cfg) is Fp8BlockConfig and cfg.fp8_block == 32
+    linear = cfg.scheme_for("layers.6.attn.wq_b")
+    assert linear.kind is QuantKind.FP8_BLOCK and linear.weight.group == (32, 32)
+    assert cfg.storage(linear)["weight_scale_inv"].name == "scale"  # the e8m0 export calls every scale .scale
+    experts = cfg.scheme_for("layers.6.ffn.experts.0.w1")
+    assert experts.kind is QuantKind.NVFP4 and "weight_global" in experts.roles
+    assert set(cfg.STORAGE[QuantKind.NVFP4]) >= experts.roles
+
+
+def test_v41_the_nvfp4_layer_list_scopes_the_experts():
+    """``quantized_layers`` is explicit: the MTP draft experts it does not name keep the older per-32 layout."""
+    cfg = _v41_config()
+    assert cfg.scheme_for("layers.39.ffn.experts.7.w2").kind is QuantKind.NVFP4
+    assert cfg.scheme_for("model.layers.39.ffn.experts.7.w2").kind is QuantKind.NVFP4  # the engine's own naming
+    assert cfg.scheme_for("mtp.0.ffn.experts.7.w2").kind is QuantKind.MXFP4
+    assert cfg.scheme_for("vision.blocks.0.mlp.w1") is None
+    assert cfg.scheme_for("layers.0.ffn.gate") is None
+    assert cfg.scheme_for("layers.2.attn.compressor.wkv") is None
+
+
+def test_128_block_fp8_still_reads_as_before():
+    cfg = QuantConfig.from_hf(SimpleNamespace(quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]}))
+    scheme = cfg.scheme_for("model.layers.0.mlp.gate_proj")
+    assert scheme.kind is QuantKind.FP8_BLOCK and scheme.weight.group == (128, 128)
+    assert cfg.storage(scheme)["weight_scale_inv"].name == "weight_scale_inv"
+
+
+def test_fp8_block_sizes_other_than_32_or_128_fail_closed():
+    for block in ([64, 64], [32, 128], []):
+        with pytest.raises(NotImplementedError, match="weight_block_size"):
+            QuantConfig.from_hf(SimpleNamespace(quantization_config={"quant_method": "fp8", "weight_block_size": block}))
+
+
 # --------------------------------------------------------------------------- config against the stored tensors
 
 # leaf names FreeToken builds as Linear / MoE layers; routers, norms, convs never ask for a scheme

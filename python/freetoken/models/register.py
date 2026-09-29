@@ -163,12 +163,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=(("model.layers", "layers"), ("model.head", "head")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
         # bf16 pieces although the quantization_config covers them: head, compressors,
-        # the indexer scorer/K projection, the MoE router, the engram small tensors
+        # the indexer scorer/K projection, the MoE router, the engram small tensors.
+        # The VL tower (vision tower + aligner) ships bf16 and is outside checkpoint_roots --
+        # the port drops it, but the quant config is still asked about its names.
         unquantized_modules=(
             "head",
             "*.compressor.wkv", "*.compressor.wgate", "*.compressor.norm",
             "*.indexer.weights_proj", "*.indexer.wk", "*.indexer.k_norm",
             "*.ffn.gate", "*.engram.q_weight", "*.engram.k_weight",
+            "vision.*", "aligner.*",
         ),
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(

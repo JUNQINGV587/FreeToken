@@ -30,8 +30,12 @@ from .compress import select_candidate_blocks
 from .ops import apply_rotary_emb, get_freqs_cis
 
 
-class SharedAttentionRuntime(BaseOP):
-    """What a kv-source layer publishes for the rest of its band (reference ``shared_attn``)."""
+class SharedAttentionRuntime:
+    """What a kv-source layer publishes for the rest of its band (reference ``shared_attn``).
+
+    Deliberately *not* a ``BaseOP``: it holds no parameters, and the caches it carries appear
+    mid-forward, so letting ``state_dict`` walk it would invent checkpoint keys.
+    """
 
     def __init__(self):
         self.compress_kv: torch.Tensor | None = None

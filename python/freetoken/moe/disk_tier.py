@@ -1096,6 +1096,13 @@ class DiskTier:
         (before ensure_experts rewrites it). Identity-map prediction -- colibri
         measured 62.3% top-8 overlap between adjacent layers on DSv4 -- so L's
         routed experts are the prefetch set for L+1..L+window."""
+        if torch.cuda.is_current_stream_capturing():
+            # The telemetry below is a D2H, and an unpinned one is illegal inside a capture. The
+            # fetch itself is not lost: with graphs on, replay-time disk reads go through the
+            # doorbell bridge (offload_cache.copy_missing -> graph_stage_fetch, served by the host
+            # thread). What is lost is the predictor's heat data while graphs are on -- it still
+            # accumulates from every non-captured step (prefill, and any eager decode).
+            return
         # Telemetry first (runs even with the prefetch window disabled).
         flat = expert_ids.reshape(-1).to(torch.int64).cpu()
         self._route_hist[layer_id].scatter_add_(

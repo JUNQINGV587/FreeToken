@@ -137,6 +137,10 @@ class DSV41CaptureData:
 
     full_snap: torch.Tensor
     last_indices: torch.Tensor
+    # The requests' stable table rows, staged on every replay: the engram's n-gram history is keyed
+    # on them, and a captured graph cannot read the live ``active_table_idx`` (that tensor belongs
+    # to the capture-time dummy batch).
+    table_rows: torch.Tensor
 
     @classmethod
     def create(cls, max_bs: int, width: int, device: torch.device) -> DSV41CaptureData:
@@ -145,6 +149,7 @@ class DSV41CaptureData:
             # the sparse kernel masks) and the compressed row arithmetic floors below zero.
             full_snap=torch.full((max_bs, width), -1, dtype=torch.int64, device=device),
             last_indices=torch.arange(max_bs, dtype=torch.int32, device=device),
+            table_rows=torch.arange(max_bs, dtype=torch.int64, device=device),
         )
 
 
@@ -289,9 +294,10 @@ class DSV41SparseAttnBackend(
         src = self.pool.full_loc_map.index_select(0, rows_ti)
         w = min(src.shape[1], cap.full_snap.shape[1])
         cap.full_snap[:bs, :w].copy_(src[:bs, :w])
+        cap.table_rows[:bs].copy_(rows_ti[:bs].to(torch.int64))
         batch.attn_metadata = DSV41AttnMetadata(
             last_indices=cap.last_indices[:bs], full_snap=cap.full_snap[:bs],
-            window_ar=self._window_ar,
+            table_rows=cap.table_rows[:bs], window_ar=self._window_ar,
         )
 
 

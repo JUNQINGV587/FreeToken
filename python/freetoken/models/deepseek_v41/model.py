@@ -297,6 +297,7 @@ class Transformer(BaseOP):
         flat_positions: torch.Tensor | None = None,
         pos: torch.Tensor | None = None,
         rows: torch.Tensor | None = None,
+        engram_rows: torch.Tensor | None = None,
         cmp_stage_cap: int = 0,
         image_mask: torch.Tensor | None = None,
         full_logits: bool = False,
@@ -305,7 +306,9 @@ class Transformer(BaseOP):
 
         ``segments`` -- one ``(offset, n, table_idx, start_pos)`` per request, tiling the token
         axis -- is a ragged prefill; ``pos``/``rows`` is a decode step, one token per row, and
-        ``cmp_stage_cap`` is the compressed width to stage. Everything else (engram, HC, FFN) is
+        ``cmp_stage_cap`` is the compressed width to stage. ``engram_rows`` is the requests'
+        stable table rows for the n-gram history (defaults to ``rows``, the local ones).
+        Everything else (engram, HC, FFN) is
         the eager plumbing, so a paged pass and an eager pass over the same tokens are comparable.
         """
         input_ids = input_ids.contiguous()
@@ -332,7 +335,16 @@ class Transformer(BaseOP):
         engram_mask = None if image_mask is None else ~image_mask
         hashes = None
         if self._engram_hash is not None:
-            hashes = self._engram_hash.forward(input_ids, start_pos, engram_mask)
+            if segments is not None:
+                hashes = self._engram_hash.forward_segments(input_ids, segments, engram_mask)
+            else:
+                # One hash per request ROW, at that row's own position. ``rows`` is the
+                # attention-local row (snapshot/graph order) and a decode batch rebuilds it every
+                # step, so the n-gram history is keyed on the request's TABLE row instead.
+                erows = engram_rows if engram_rows is not None else rows
+                hashes = self._engram_hash.forward(
+                    input_ids, None, engram_mask, rows=erows, positions=pos.view(-1, 1)
+                )
         h = self.embed.forward(input_ids.reshape(-1)).view(bsz, seqlen, self.args.dim)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
@@ -411,6 +423,15 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.bind(torch.device(device), pool)
         self._bound = True
+        # The 94 GiB engram tables are never resident weights, so a boot that did not pass a
+        # table (tests/eval may) serves them off the checkpoint shards through the tier. Lazy:
+        # only when the layers actually lack a table, and only when the checkpoint dir is known --
+        # otherwise the layer raises its own, louder error when it is reached.
+        if self._engram_tier is None:
+            layers = self.engram_layers()
+            model_dir = getattr(self._config, "checkpoint_path", None)
+            if layers and model_dir and any(b.engram.table is None for b in layers):
+                self.bind_engram_tier(device=torch.device(device), model_dir=model_dir)
 
     def mark_for_rebind(self) -> None:
         """Force a re-bind on the next forward. The model holds NO pool reference -- buffers are
@@ -457,10 +478,47 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         return tier
 
     def forward(self) -> torch.Tensor:
+        """One engine step: ragged prefill or a batched decode, logits per row.
+
+        The batch is the scheduler's: ``input_ids`` [T] concatenated for a prefill (one segment per
+        request, each starting at its own ``cached_len``) and [padded_size, 1] for a decode. Every
+        stateful piece (window ring, compressor carry, indexer key cache, the published picks) is
+        addressed through the attention metadata, so requests never read each other's KV.
+        """
         self._ensure_bound()
-        raise NotImplementedError(
-            "DeepseekV41ForCausalLM: the engine batch path (paged CSA2 + the NVFP4 expert cache) "
-            "lands with M5 -- call Transformer.forward directly until then."
+        batch = get_global_ctx().batch
+        input_ids = batch.input_ids.long()
+        md = batch.attn_metadata
+        device = input_ids.device
+        if batch.is_prefill:
+            segments = md.segments
+            # full_logits so the head can pick each REQUEST's final token: a ragged prefill packs
+            # several requests into the token axis and only their last row carries a next token.
+            logits = self.model.forward_paged(
+                input_ids.view(1, -1),
+                segments=segments,
+                flat_positions=batch.positions.long(),
+                full_logits=True,
+            )
+            last = torch.tensor(
+                [off + n - 1 for off, n, _ti, _sp in segments], dtype=torch.long, device=device
+            )
+            return logits[0].index_select(0, last)
+        # DECODE (bs >= 1): per-row position (GPU int tensor -> no host syncs / graph safe). The
+        # compressed staging cap is the max position any row reaches (eager); a static max_seq-1
+        # under graph capture, so the captured static-shape graph serves any replay position.
+        B = batch.padded_size
+        pos = batch.positions.long().view(-1)[:B]
+        if torch.cuda.is_current_stream_capturing():
+            cmp_stage_cap = md.stage_width - 1
+        else:
+            cmp_stage_cap = int(pos.max().item())
+        return self.model.forward_paged(
+            input_ids.view(B, 1),
+            pos=pos,
+            rows=torch.arange(B, device=device),
+            engram_rows=md.table_rows,
+            cmp_stage_cap=cmp_stage_cap,
         )
 
 

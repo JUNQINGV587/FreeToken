@@ -24,9 +24,20 @@ from freetoken.core import Batch, Context, Req, SamplingParams, get_global_ctx, 
 from freetoken.kvcache.dsv41_cost_model import dsv41_pool_sizes
 from freetoken.kvcache.dsv41_paged_pool import DSV41PagedKVCache
 from freetoken.models.deepseek_v41 import model as model_mod
+from freetoken.models.deepseek_v41.engram import EngramLayout, NgramHashState
 from freetoken.utils.torch_utils import torch_dtype
 
-from .test_deepseek_v41_model import VOCAB, _StubFFN, _args, _band_args, _model
+from .test_deepseek_v41_model import (
+    VOCAB,
+    _adapter_config,
+    _args,
+    _band_args,
+    _FakeTokenizer,
+    _model,
+    _set_tp_info,
+    _StubFFN,
+    _write_engram_checkpoint,
+)
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -69,6 +80,22 @@ def _pool_and_backend(args, device):
     backend = DSV41SparseAttnBackend(SimpleNamespace(dsv41_args=args))
     ctx.attn_backend = backend
     return pool, backend
+
+
+def _disjoint_rows(pool, args, device) -> None:
+    """Give every page-table row its own full-location block, the way the scheduler does.
+
+    ``_pool_and_backend``'s identity table is right for a single request, but pointing all rows at
+    ``arange(max_seq_len)`` would let two rows address the SAME pool slots -- something the engine
+    never does: ``scheduler/cache.py:841`` hands each request a disjoint full-location range, which
+    is exactly what keeps concurrent requests from reading each other's window and compressed KV.
+    """
+    sizes = dsv41_pool_sizes(num_pages=NUM_PAGES, args=args, swa_ratio=1.0, P=PAGE)
+    table = torch.zeros(MAX_RUNNING + 1, args.max_seq_len, dtype=torch.int32, device=device)
+    table[MAX_RUNNING].fill_(sizes.full_token - PAGE)
+    for row in range(MAX_RUNNING):
+        table[row] = row * args.max_seq_len + torch.arange(args.max_seq_len, dtype=torch.int32)
+    pool.attach_page_table(table)
 
 
 def _sink(model) -> None:
@@ -312,7 +339,9 @@ def test_lazy_binding_falls_back_to_eager_with_no_context_pool(monkeypatch):
 
         result.mark_for_rebind()
         assert result._bound is False
-        with pytest.raises(NotImplementedError):
+        # the engine path needs a scheduler batch: with the context stripped of its pool it
+        # re-binds eagerly (that is the point of the fallback) and then has nothing to step
+        with pytest.raises(AssertionError, match="batch"):
             result.forward()
     finally:
         ctx.kv_cache = pool
@@ -331,3 +360,277 @@ def test_forward_paged_refuses_an_unbound_model(monkeypatch):
     with pytest.raises(AssertionError, match="segments"):
         model.forward_paged(ids, segments=[(0, 4, 0, 0)], pos=torch.zeros(1, dtype=torch.int64))
     assert DSV41AttnMetadata is not None  # imported for the decode helper above
+
+
+def _req(ids_cpu, table_idx: int, cached_len: int = 0) -> Req:
+    """A host-side Req exactly as the scheduler builds it (``Req`` asserts the ids are on CPU)."""
+    return Req(
+        input_ids=ids_cpu.cpu().to(torch.int32),
+        table_idx=table_idx,
+        cached_len=cached_len,
+        output_len=1,
+        uid=table_idx,
+        sampling_params=SamplingParams(),
+        cache_handle=None,
+    )
+
+
+def _adapter(monkeypatch, device, args) -> "model_mod.DeepseekV41ForCausalLM":
+    """The registered adapter around the stubbed stack, with no engram layers so the engine path
+    needs no checkpoint directory. Random weights: this compares plumbing, not values."""
+    from freetoken.distributed.info import get_tp_info, set_tp_info
+
+    try:
+        get_tp_info()
+    except RuntimeError:
+        set_tp_info(rank=0, size=1)
+    monkeypatch.setattr(model_mod, "MoE", lambda *a, **k: _StubFFN(64))
+    config = SimpleNamespace(
+        dsv41_args=dataclasses.replace(args, engram_layer_ids=()),
+        quant=None,
+        moe_strategy="offload",
+        decode_target="gpu",
+        checkpoint_path=None,
+        engram_tokenizer_path=None,
+        engram_table=None,
+        device=device,
+    )
+    with torch_dtype(torch.bfloat16), torch.device(device):
+        adapter = model_mod.DeepseekV41ForCausalLM(config)
+    torch.manual_seed(1234)
+    for tensor in adapter.state_dict().values():
+        if tensor.dtype.is_floating_point:
+            tensor.copy_(torch.randn_like(tensor.float()).to(tensor.dtype) * 0.1)
+    return adapter
+
+
+@requires_cuda
+def test_the_engine_forward_answers_per_request_in_a_ragged_prefill(monkeypatch):
+    """``DeepseekV41ForCausalLM.forward`` on a prefill batch: the addressing comes off the
+    attention metadata (segments), and the head has to answer per REQUEST -- two requests of
+    different lengths share the flat token axis, each with its own table row."""
+    device = torch.device("cuda")
+    args = _args()
+    adapter = _adapter(monkeypatch, device, args)
+    _sink(adapter.model)
+    torch.manual_seed(29)
+    a = torch.randint(0, VOCAB, (1, 5), device=device)
+    b = torch.randint(0, VOCAB, (1, 3), device=device)
+    # independent requests: the eager answer for each is a pass of its own
+    want = torch.cat(
+        [
+            adapter.model.forward(a, full_logits=True)[:, -1].float(),
+            adapter.model.forward(b, full_logits=True)[:, -1].float(),
+        ]
+    )
+
+    pool, backend = _pool_and_backend(args, device)
+    _disjoint_rows(pool, args, device)
+    adapter.model.bind(device, pool)
+    ctx = _ctx()
+    ids = torch.cat([a[0], b[0]])
+    reqs = [_req(ids[:5], table_idx=0), _req(ids[5:], table_idx=1)]
+    batch = Batch(reqs=reqs, phase="prefill")
+    batch.padded_reqs = reqs
+    batch.input_ids = ids.to(device)
+    batch.positions = torch.cat(
+        [torch.arange(5, device=device), torch.arange(3, device=device)]
+    )
+    backend.prepare_metadata(batch)
+    assert batch.attn_metadata.segments == [(0, 5, 0, 0), (5, 3, 1, 0)]
+    with ctx.forward_batch(batch):
+        got = adapter.forward().float()
+
+    assert got.shape == (2, VOCAB)
+    diff = (got - want).abs().max().item()
+    assert torch.allclose(got, want, rtol=TOL, atol=TOL), f"max abs logit diff {diff}"
+
+
+@requires_cuda
+def test_the_engine_forward_decodes_a_row_onto_the_eager_trajectory(monkeypatch):
+    """The decode half of the adapter: a paged prefill followed by single-token engine steps has
+    to walk the eager argmax trajectory, with the compressed staging cap taken from the batch's
+    position (the eager branch of the graph-vs-eager split)."""
+    device = torch.device("cuda")
+    args = _args()
+    adapter = _adapter(monkeypatch, device, args)
+    _sink(adapter.model)
+    torch.manual_seed(31)
+    n, m = 6, 3
+    ids = torch.randint(0, VOCAB, (1, n + m), device=device)
+    want = [adapter.model.forward(ids[:, :n], full_logits=True)[:, -1].float()]
+    for step in range(n, n + m):
+        want.append(adapter.model.forward(ids[:, step : step + 1], start_pos=step).float())
+
+    pool, backend = _pool_and_backend(args, device)
+    adapter.model.bind(device, pool)
+    ctx = _ctx()
+    req = _req(ids[0, :n], table_idx=0)
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = [req]
+    batch.input_ids = ids[0, :n].to(device)
+    batch.positions = torch.arange(n, device=device)
+    backend.prepare_metadata(batch)
+    with ctx.forward_batch(batch):
+        got = [adapter.forward().float()]
+
+    for step in range(n, n + m):
+        decode = _decode_batch(backend, ctx, 0, step, device)
+        decode.input_ids = ids[0, step].to(device).view(1)
+        with ctx.forward_batch(decode):
+            got.append(adapter.forward().float())
+
+    for step, (e, g) in enumerate(zip(want, got)):
+        assert g.shape == (1, VOCAB), g.shape
+        assert torch.isfinite(g).all(), f"non-finite logits at step {step}"
+        assert torch.equal(g.argmax(-1), e.argmax(-1)), (
+            f"argmax diverged at step {step}: {(g - e).abs().max().item()}"
+        )
+    diff = max((e - g).abs().max().item() for e, g in zip(want, got))
+    assert diff < TOL, diff
+
+
+def _adapter_with_engram(monkeypatch, device, tmp_path):
+    """The adapter with its engram layers LIVE: the token map and the row views come off a
+    checkpoint directory laid out like the real one (``_write_engram_checkpoint``), so a packed
+    pass exercises disk-backed tables, not a resident stub."""
+    args = _args()
+    folder = _write_engram_checkpoint(str(tmp_path), args)
+    _set_tp_info()
+    monkeypatch.setattr(model_mod, "MoE", lambda *a, **k: _StubFFN(64))
+    config = SimpleNamespace(
+        **{
+            **vars(_adapter_config(folder, args)),
+            "engram_table": None,
+            "device": device,
+        }
+    )
+    with torch_dtype(torch.bfloat16), torch.device(device):
+        adapter = model_mod.DeepseekV41ForCausalLM(config)
+    torch.manual_seed(1234)
+    for tensor in adapter.state_dict().values():
+        if tensor.dtype.is_floating_point:
+            tensor.copy_(torch.randn_like(tensor.float()).to(tensor.dtype) * 0.1)
+    return args, adapter
+
+
+@requires_cuda
+def test_a_packed_prefill_keeps_the_two_requests_n_gram_histories_apart(
+    monkeypatch, tmp_path
+):
+    """The n-gram hash is keyed on the request's TABLE row and each segment restarts at its own
+    position, so two requests packed into one flat token axis have to hash to what they hash to
+    alone.
+
+    Hashing the packed axis in one call -- one cache row, positions 0..T -- instead places the
+    second request's tokens at the first request's positions, so it reads the first request's
+    tokens as n-gram context and the row ids land on the WRONG 94 GiB entries. A wrong table row
+    is a different vector, not a rounding difference, which is why the negative control below has
+    to fail this tolerance."""
+    device = torch.device("cuda")
+    args, adapter = _adapter_with_engram(monkeypatch, device, tmp_path)
+    model = adapter.model
+    _sink(model)
+    assert model._engram_hash is not None and [b.engram.layer_id for b in adapter.engram_layers()] == [1]
+    model.bind(device)
+    assert adapter.bind_engram_tier(device, use_io_uring=False) is not None
+
+    torch.manual_seed(29)
+    a = torch.randint(0, VOCAB, (1, 5), device=device)
+    b = torch.randint(0, VOCAB, (1, 3), device=device)
+    # each request's answer ALONE: the two eager passes are the reference the packed pass must meet
+    want = torch.cat(
+        [
+            model.forward(a, full_logits=True)[:, -1].float(),
+            model.forward(b, full_logits=True)[:, -1].float(),
+        ]
+    )
+
+    pool, backend = _pool_and_backend(args, device)
+    _disjoint_rows(pool, args, device)
+    model.bind(device, pool)
+    ctx = _ctx()
+    ids = torch.cat([a[0], b[0]])
+    reqs = [_req(ids[:5], table_idx=0), _req(ids[5:], table_idx=1)]
+    batch = Batch(reqs=reqs, phase="prefill")
+    batch.padded_reqs = reqs
+    batch.input_ids = ids.to(device)
+    batch.positions = torch.cat([torch.arange(5, device=device), torch.arange(3, device=device)])
+    backend.prepare_metadata(batch)
+    with ctx.forward_batch(batch):
+        got = adapter.forward().float()
+    diff = (got - want).abs().max().item()
+    assert torch.allclose(got, want, rtol=TOL, atol=TOL), f"max abs logit diff {diff}"
+
+    # The guard the LOGITS cannot express: the hash ROW IDS. Every id is a row of the 94 GiB
+    # table, so an id that differs at all is a different vector -- but with the shrunken fake
+    # table the resulting logit shift happens to stay inside bf16 tolerance, which is why this
+    # compares ids instead of relying on the negative control above.
+    hash_state = model._engram_hash
+    segments = [(0, 5, 0, 0), (5, 3, 1, 0)]
+    rows = torch.tensor([0], dtype=torch.int64, device=device)
+    others = torch.tensor([1], dtype=torch.int64, device=device)
+
+    hash_state.reset()
+    packed = hash_state.forward_segments(ids.view(1, -1), segments)
+    hash_state.reset()
+    alone = torch.cat(
+        [
+            hash_state.forward(ids.view(1, -1)[:, :5], 0, rows=rows),
+            hash_state.forward(ids.view(1, -1)[:, 5:], 0, rows=others),
+        ],
+        dim=1,
+    )
+    assert torch.equal(packed, alone), "the packed pass hashed to something the requests do not"
+
+    # the call shape this replaced -- one row, positions 0..T -- must NOT agree: the second
+    # request's tokens would read the first request's as n-gram context
+    hash_state.reset()
+    as_one_sequence = hash_state.forward(ids.view(1, -1), 0)
+    assert not torch.equal(as_one_sequence, alone), (
+        "hashing the packed axis in one call agreed with the per-request ids: this test no longer "
+        "guards the bug it was written for"
+    )
+
+
+@requires_cuda
+def test_decode_rows_at_different_positions_keep_their_own_n_gram_context():
+    """Decode advances every row by one token, so the hash needs a position PER ROW.
+
+    The scalar ``start_pos`` this replaced handed row 1 row 0's position, so row 1 wrote its token
+    into the wrong cache cell AND read row 0's history as its own n-gram context -- both land on
+    the wrong 94 GiB rows, and only the row ids show it (see the note in the packed-prefill test
+    about why the logits cannot)."""
+    device = torch.device("cuda")
+    args = _args()
+    layout = EngramLayout.from_args(args)
+    assert layout is not None
+    state = NgramHashState(args, layout, _FakeTokenizer(VOCAB))
+    state.bind(device)
+
+    torch.manual_seed(11)
+    history = torch.randint(0, VOCAB, (2, 4), device=device)
+    step = torch.randint(0, VOCAB, (2, 1), device=device)
+    rows = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    # row 0's prefix sits at positions 0..3, row 1's at 6..9: two requests at different offsets
+    starts = (0, 6)
+    positions = torch.tensor([[4], [10]], dtype=torch.int64, device=device)
+
+    def prime():
+        state.reset()
+        for row in (0, 1):
+            state.forward(history[row : row + 1], starts[row], rows=rows[row : row + 1])
+
+    prime()
+    batched = state.forward(step, None, rows=rows, positions=positions)
+    prime()
+    alone = torch.cat(
+        [state.forward(step[row : row + 1], starts[row] + 4, rows=rows[row : row + 1]) for row in (0, 1)],
+        dim=0,
+    )
+    assert torch.equal(batched, alone), "the batched step hashed row 1 at row 0's position"
+
+    # and the scalar call -- the shape this replaced -- must not agree, or the test guards nothing
+    prime()
+    scalar = state.forward(step, starts[0] + 4, rows=rows)
+    assert not torch.equal(scalar, alone)

@@ -240,21 +240,46 @@ class NgramHashState(BaseOP):
 
     @torch.inference_mode()
     def forward(
-        self, input_ids: torch.Tensor, start_pos: int, token_mask: torch.Tensor | None = None
+        self,
+        input_ids: torch.Tensor,
+        start_pos: int | None,
+        token_mask: torch.Tensor | None = None,
+        *,
+        rows: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``token_mask``: [B, L], False for tokens that take no part in an n-gram (image spans)."""
+        """``token_mask``: [B, L], False for tokens that take no part in an n-gram (image spans).
+
+        ``rows`` -- [B] cache rows, defaulting to ``arange(B)``. A paged call passes each
+        request's TABLE row instead: the history must follow the request, and a decode batch
+        rebuilds its row order every step, so a batch position is not an identity. ``max_batch_size``
+        is exactly the number of live table rows, which is why the cache is that wide.
+
+        ``positions`` -- [B, L] absolute positions, defaulting to ``start_pos + arange(L)``. Pass
+        it when the rows are at different offsets (a decode step whose requests are not in lock
+        step); a ragged prefill instead calls this once per segment, so ``start_pos`` stays an int
+        there.
+        """
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
         if token_mask is not None:
             compressed = torch.where(token_mask, compressed, self.DEAD)
-        self.cache[:batch, start_pos : start_pos + seqlen] = compressed
+        if rows is None:
+            rows = torch.arange(batch, device=input_ids.device)
+        if positions is None:
+            positions = torch.arange(
+                start_pos, start_pos + seqlen, device=input_ids.device
+            ).expand(batch, seqlen)
 
-        positions = torch.arange(start_pos, start_pos + seqlen, device=input_ids.device).expand(
-            batch, seqlen
-        )
+        # Flat index_put_ rather than ``cache[rows, lo:hi] = ...``: advanced indexing on a tensor
+        # copies, so writing back through it would move the whole [B, max_seq_len] buffer per call.
+        flat = rows.to(torch.int64).unsqueeze(1) * self.max_seq_len + positions
+        self.cache.view(-1).index_put_((flat.reshape(-1),), compressed.reshape(-1))
+
+        history = self.cache.index_select(0, rows)
         tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.layout.max_ngram_size):
-            source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))
+            source = history.gather(1, (positions - shift).clamp_min(0))
             blocked = blocked | (positions < shift) | (source == self.DEAD)
             tokens.append(torch.where(blocked, self.pad_id, source))
         tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram_size]
@@ -267,6 +292,35 @@ class NgramHashState(BaseOP):
             rolling = torch.bitwise_xor(rolling, products[..., i])
             hashes.append(rolling.unsqueeze(-1) % self.primes[:, i - 1])
         return torch.cat(hashes, dim=-1) + self.offsets
+
+    @torch.inference_mode()
+    def forward_segments(
+        self, input_ids: torch.Tensor, segments: list, token_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Hash a ragged prefill: one call per ``(offset, n, table_idx, start_pos)`` segment.
+
+        Each segment is hashed on ITS OWN cache row with positions restarting at its own
+        ``start_pos``, so requests packed into one flat token axis keep separate n-gram histories.
+        Hashing the packed axis in one call would let the second request read the first one's
+        tokens as context AND place its own tokens at the first request's positions, so the row
+        ids it produced would address the wrong table entries -- a wrong lookup, not a rounding
+        difference.
+        """
+        bsz, total = input_ids.shape
+        hashes = None
+        for off, n, table_idx, start_pos in segments:
+            row = torch.tensor([table_idx], dtype=torch.int64, device=input_ids.device)
+            part = self.forward(
+                input_ids[:, off : off + n],
+                start_pos,
+                None if token_mask is None else token_mask[:, off : off + n],
+                rows=row,
+            )
+            if hashes is None:
+                hashes = part.new_empty((bsz, total, *part.shape[2:]))
+            hashes[:, off : off + n] = part
+        assert hashes is not None, "a ragged prefill carries at least one segment"
+        return hashes
 
 
 class ResidentEngramTable:

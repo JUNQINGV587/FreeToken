@@ -141,6 +141,30 @@ def _check_owner_ep_model(config: EngineConfig) -> None:
         )
 
 
+def _distributed_timeout(config: EngineConfig) -> float:
+    """Seconds a collective of the engine's process group may take (``FREETOKEN_DIST_TIMEOUT``).
+
+    ``config.distributed_timeout`` (60 s) is a runtime hang detector, but the FIRST collective is
+    not a runtime one: ``_sync_get_memory`` all-reduces only after every rank has loaded its
+    weights and expert banks. Those loads are unbounded (285 GiB of NVFP4 experts for V4.1) and, at
+    TP > 1, uneven -- the ranks read the same checkpoint files, so whichever one reads a shard
+    second gets it from the page cache and arrives minutes early. Owner-local EP widens the gap:
+    each rank reads its own half, so neither is reading what the other just warmed. Raising the
+    timeout is the honest fix; the alternative (a rank declaring the boot hung early) trades a slow
+    boot for a failed one.
+    """
+    raw = os.environ.get("FREETOKEN_DIST_TIMEOUT")
+    if not raw:
+        return config.distributed_timeout
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise ValueError(f"FREETOKEN_DIST_TIMEOUT={raw!r} is not a number of seconds") from None
+    if seconds <= 0:
+        raise ValueError(f"FREETOKEN_DIST_TIMEOUT must be positive, got {seconds}")
+    return seconds
+
+
 def _owner_graph_safe(config: EngineConfig) -> bool:
     """Whether the owner decode route uses the fixed-shape graph-safe admission.
 
@@ -661,7 +685,7 @@ class Engine:
         on every interface, so an unauthenticated TCPStore ends up reachable off-box even
         when distributed_addr says 127.0.0.1. Rank 0 pre-binds the listening socket to
         loopback itself and hands the fd to TCPStore (master_listen_fd) to force that."""
-        timeout = timedelta(seconds=config.distributed_timeout)
+        timeout = timedelta(seconds=_distributed_timeout(config))
         if not config.tp_info.is_primary():
             return torch.distributed.TCPStore(
                 "127.0.0.1", config.distributed_port, config.tp_info.size,
@@ -682,11 +706,12 @@ class Engine:
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         store = self._make_distributed_store(config)
         use_gloo = config.tp_info.size == 1 or config.use_pynccl
+        timeout = timedelta(seconds=_distributed_timeout(config))
         torch.distributed.init_process_group(
             backend="gloo" if use_gloo else "nccl",
             rank=config.tp_info.rank,
             world_size=config.tp_info.size,
-            timeout=timedelta(seconds=config.distributed_timeout),
+            timeout=timeout,
             store=store,
         )
         if use_gloo:

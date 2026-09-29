@@ -12,6 +12,7 @@ import multiprocessing as mp
 from datetime import timedelta
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -64,3 +65,31 @@ def test_two_ranks_rendezvous_with_loopback_only_store():
     # the master's listening socket was pre-bound to loopback, not the wildcard
     # address the C10d TCPStore server binds to on its own
     assert results[0][1] == "127.0.0.1"
+
+
+def test_the_collective_timeout_can_be_raised_for_a_slow_boot(monkeypatch):
+    """The first collective waits for the slowest rank's weight/expert load.
+
+    ``_sync_get_memory`` all-reduces only after every rank has loaded its banks, and at TP > 1
+    that skew is minutes (both ranks read the same checkpoint files; owner-local EP gives each
+    rank a different half, so neither warms what the other reads). The 60 s default is the
+    runtime hang detector, so the boot raises it explicitly instead of relaxing the default.
+    """
+    from freetoken.engine.engine import _distributed_timeout
+
+    config = SimpleNamespace(distributed_timeout=60.0)
+    assert _distributed_timeout(config) == 60.0, "unset -> the configured timeout"
+
+    monkeypatch.setenv("FREETOKEN_DIST_TIMEOUT", "1800")
+    assert _distributed_timeout(config) == 1800.0
+
+    monkeypatch.setenv("FREETOKEN_DIST_TIMEOUT", "")
+    assert _distributed_timeout(config) == 60.0, "empty means unset, not zero"
+
+    monkeypatch.setenv("FREETOKEN_DIST_TIMEOUT", "soon")
+    with pytest.raises(ValueError, match="not a number of seconds"):
+        _distributed_timeout(config)
+
+    monkeypatch.setenv("FREETOKEN_DIST_TIMEOUT", "0")
+    with pytest.raises(ValueError, match="must be positive"):
+        _distributed_timeout(config)

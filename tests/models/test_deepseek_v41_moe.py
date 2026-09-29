@@ -100,6 +100,13 @@ def test_the_shared_expert_is_clamped_by_the_dsv4_kernel():
     torch.manual_seed(0)
     with torch.device("cuda"):
         expert = Expert(DIM, INTER, LIMIT)
+    # the linears come up as torch.empty: on recycled device memory they can hold NaN/inf bit
+    # patterns, which makes a "the output is finite" assertion depend on what ran before it
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    with torch.no_grad():
+        for tensor in expert.state_dict().values():
+            if tensor.is_floating_point() and tensor.numel() > 1:
+                tensor.copy_(torch.randn(tensor.shape, generator=gen, device="cuda", dtype=torch.float32).mul_(0.05).to(tensor.dtype))
     x = torch.randn(4, DIM, dtype=torch.bfloat16, device="cuda") * 4
     out = expert.forward(x)
     assert out.shape == x.shape and torch.isfinite(out).all()

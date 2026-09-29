@@ -108,6 +108,10 @@ def test_moe_dims():
     assert cfg.num_experts_per_tok == 10
     assert cfg.norm_topk_prob is True
     assert cfg.moe_enabled
+    # owner-local EP (--tensor-parallel-size 2 --moe-ep-size 2) is declared here: the engine's
+    # gate reads this flag instead of whitelisting the model_type (engine._check_owner_ep_model),
+    # and this family's MoE block is the one that implements the owner reduction contract.
+    assert cfg.owner_ep is True
 
 
 @pytest.mark.parametrize(

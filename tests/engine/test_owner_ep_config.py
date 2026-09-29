@@ -93,3 +93,57 @@ def test_other_strategies_are_still_rejected(strategy):
 def test_a_topology_other_than_tp2_ep2_is_still_rejected():
     with pytest.raises(ValueError, match="TP2"):
         _validate_owner_ep_config(_config(tp_info=SimpleNamespace(size=4, rank=0)))
+
+
+# --------------------------------------------------------------------------------------
+# The model half of the gate. _validate_owner_ep_config checks the requested topology; the
+# model has to declare that its MoE seam was adapted to it, and the banks have to be the
+# ownership-filtering NVFP4 ones. The gate used to be a qwen4_exp model_type whitelist, which
+# made a model that HAD been adapted (V4.1, whose MoE seam already asks
+# owner_ep_expert_tp_size) unreachable without editing the engine.
+# --------------------------------------------------------------------------------------
+
+
+def _model_config(**over):
+    base = dict(model_type="qwen4_exp", expert_quant="nvfp4", owner_ep=True)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _check(**over):
+    from freetoken.engine.engine import _check_owner_ep_model
+
+    _check_owner_ep_model(SimpleNamespace(model_config=_model_config(**over)))
+
+
+def test_a_model_that_declares_owner_ep_passes():
+    _check()
+
+
+def test_v41_is_accepted_once_the_model_declares_it():
+    _check(model_type="deepseek_v41")
+
+
+def test_a_model_without_the_declaration_is_rejected_by_name():
+    with pytest.raises(NotImplementedError, match="deepseek_v4'"):
+        _check(model_type="deepseek_v4", owner_ep=False)
+
+
+def test_the_rejection_says_what_the_model_has_to_declare():
+    with pytest.raises(NotImplementedError, match="ModelConfig.owner_ep"):
+        _check(model_type="glm5_next", owner_ep=False)
+
+
+def test_a_format_the_ownership_filter_cannot_load_is_rejected():
+    """Only the NVFP4 provider filters expert rows by ownership and renumbers them locally."""
+    with pytest.raises(NotImplementedError, match="NVFP4"):
+        _check(expert_quant="mxfp4")
+
+
+def test_an_older_model_config_without_the_field_is_still_a_clean_refusal():
+    """ModelConfig gained the field, but tests/tools hand-roll SimpleNamespaces."""
+    config = SimpleNamespace(model_config=SimpleNamespace(model_type="qwen4_exp", expert_quant="nvfp4"))
+    from freetoken.engine.engine import _check_owner_ep_model
+
+    with pytest.raises(NotImplementedError, match="owner_ep"):
+        _check_owner_ep_model(config)

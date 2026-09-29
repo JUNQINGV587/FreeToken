@@ -380,6 +380,11 @@ class ModelConfig:
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # Owner-local expert parallelism (``--moe-ep-size == --tensor-parallel-size > 1``): each rank
+    # holds whole, disjoint experts instead of global rows, so the routed-expert GEMM is unsharded
+    # and the expert kernels that reject TP > 1 become selectable. Opt-in per model because the
+    # engine has to know the model's MoE seam was adapted to it (see engine._check_owner_ep_model).
+    owner_ep: bool = False
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()

@@ -414,6 +414,11 @@ def test_parse_config_hands_the_loader_the_checkpoint_directory():
     folder = os.environ.get("FT_V41_CHECKPOINT", "/mnt/nvme/models/DeepSeek-V4.1-Flash-NVFP4")
     config = parse_config(SimpleNamespace(_name_or_path=folder))
     assert config.checkpoint_path == folder
+    # owner-local EP (--tensor-parallel-size 2 --moe-ep-size 2): the engine's gate reads this
+    # declaration instead of whitelisting the model_type (engine._check_owner_ep_model), and the
+    # experts are the NVFP4 whole-expert banks that gate also requires.
+    assert config.owner_ep is True
+    assert config.expert_quant == "nvfp4"
     # the real tokenizer.json is what the compressed map's size in the checkpoint was computed
     # from -- a different tokenizer would not reproduce it
     assert config.dsv41_args.engram_layer_ids == (1, 14)

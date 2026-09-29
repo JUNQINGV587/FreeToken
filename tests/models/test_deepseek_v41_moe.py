@@ -23,19 +23,13 @@ TOPK = 2
 LIMIT = 10.0
 
 
-def _layer():
-    from freetoken.distributed import set_tp_info, try_get_tp_info
-    from freetoken.layers.quantization import QuantBackend, QuantConfig, set_quant_backend
+def _args(moe_ep_size: int = 1):
+    """Synthetic V4.1 args. ``moe_ep_size`` is the engine's ``--moe-ep-size``, which
+    ``_adjust_dsv41_config`` syncs onto ``dsv41_args`` (owner-local EP is ``--moe-ep-size`` ==
+    ``--tensor-parallel-size`` > 1)."""
     from freetoken.models.deepseek_v41.args import DeepseekV41Args
-    from freetoken.models.deepseek_v41.moe import DSV41OffloadMoELayer
 
-    if try_get_tp_info() is None:
-        set_tp_info(0, 1)
-    set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
-    quant = QuantConfig.from_hf(
-        {"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}}
-    )
-    args = DeepseekV41Args(
+    return DeepseekV41Args(
         dim=DIM,
         n_layers=2,
         vocab_size=256,
@@ -52,9 +46,24 @@ def _layer():
         hc_mult=2,
         compress_ratios=(0, 0),
         swiglu_limit=LIMIT,
+        moe_ep_size=moe_ep_size,
+    )
+
+
+def _layer(moe_ep_size: int = 1):
+    """Build one offloaded V4.1 MoE layer against a synthetic NVFP4 setup."""
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.quantization import QuantBackend, QuantConfig, set_quant_backend
+    from freetoken.models.deepseek_v41.moe import DSV41OffloadMoELayer
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
+    quant = QuantConfig.from_hf(
+        {"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}}
     )
     return DSV41OffloadMoELayer(
-        0, args, strategy="offload", decode_target="gpu", quant_config=quant,
+        0, _args(moe_ep_size), strategy="offload", decode_target="gpu", quant_config=quant,
         prefix="model.layers.0.ffn",
     )
 
@@ -116,6 +125,21 @@ def test_the_shared_expert_is_clamped_by_the_dsv4_kernel():
     ref = (torch.nn.functional.silu(gate.clamp(max=LIMIT)) * up.clamp(-LIMIT, LIMIT)).to(torch.bfloat16)
     ref = expert.w2.forward(ref)
     assert (out.float() - ref.float()).abs().max().item() < 2e-2
+
+
+def test_owner_local_ep_tells_the_experts_they_are_whole():
+    """``--moe-ep-size 2`` under TP 2 makes the routed experts whole per rank.
+
+    It needs its own process: ``set_tp_info`` is one-shot, so the TP degree cannot be changed
+    back and forth inside a test session. See
+    ``tests/models/test_deepseek_v41_owner_ep.py`` for the TP=2 half.
+    """
+    from freetoken.layers.moe import owner_ep_expert_tp_size
+
+    layer = _layer(moe_ep_size=2)
+    assert layer.expert_tp_size == 1, "whole experts per rank -> the expert GEMM is unsharded"
+    assert owner_ep_expert_tp_size(_args(moe_ep_size=2)) == 1
+    assert owner_ep_expert_tp_size(_args(moe_ep_size=1)) is None, "no owner EP -> the layer's own degree"
 
 
 class _StubSlotCache:

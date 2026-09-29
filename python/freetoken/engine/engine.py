@@ -106,6 +106,41 @@ def _validate_owner_ep_config(config: EngineConfig) -> None:
     # OwnerOffloadMoeCache.ensure_route_graph when graphs are on (see _owner_graph_safe).
 
 
+def _check_owner_ep_model(config: EngineConfig) -> None:
+    """Fail before allocation unless this model has been adapted for owner-local EP.
+
+    ``--moe-ep-size > 1`` changes what the expert banks hold: whole, disjoint experts per rank
+    instead of global rows. Two things have to be true of the model for that to mean anything,
+    and neither can be inferred from a tensor shape:
+
+    * its MoE seam must ask ``owner_ep_expert_tp_size`` for the unsharded expert GEMM -- every
+      NVFP4/MXFP4 expert kernel rejects TP > 1, so without it a TP=2 boot dies in kernel
+      selection -- and its shared expert has to be reduced by the layer itself (fused with the
+      routed output as in qwen4_exp, or on its own as in deepseek_v41, which reduces each and
+      adds). The model declares both with ``ModelConfig.owner_ep`` (see ``parse_config``).
+    * the bank loader must filter expert rows by ownership and renumber them into rank-local
+      banks, which only the native NVFP4 provider does (``owner EP is not supported for FTW
+      checkpoints`` covers the repacked variant).
+
+    Kept separate from ``_validate_owner_ep_config`` (topology/flags, checked at argument
+    resolution time) because this one needs the parsed model config.
+    """
+    model_config = config.model_config
+    if not getattr(model_config, "owner_ep", False):
+        raise NotImplementedError(
+            f"owner EP is not implemented for model_type={model_config.model_type!r}: the model "
+            "has to declare ModelConfig.owner_ep, which asserts that its MoE seam treats the "
+            "routed experts as whole per rank (the adapted families are qwen4_exp and "
+            "deepseek_v41)"
+        )
+    if model_config.expert_quant != "nvfp4":
+        raise NotImplementedError(
+            "owner EP currently requires native NVFP4 expert banks, got expert_quant="
+            f"{model_config.expert_quant!r}: only the NVFP4 bank loader filters expert rows by "
+            "ownership and renumbers them into the rank-local geometry"
+        )
+
+
 def _owner_graph_safe(config: EngineConfig) -> bool:
     """Whether the owner decode route uses the fixed-shape graph-safe admission.
 
@@ -793,10 +828,7 @@ class Engine:
         ownership = None
         owner_geometry = None
         if owner_ep:
-            if config.model_config.model_type != "qwen4_exp":
-                raise NotImplementedError("owner EP is currently implemented only for Qwen4Exp")
-            if config.model_config.expert_quant != "nvfp4":
-                raise NotImplementedError("owner EP currently requires native NVFP4 expert banks")
+            _check_owner_ep_model(config)
             ownership = ExpertOwnership(
                 global_num_experts=config.model_config.num_experts,
                 world_size=config.moe_ep_size,

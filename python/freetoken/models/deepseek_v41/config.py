@@ -84,6 +84,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_sm_scale=args.head_dim**-0.5,
         swiglu_limit=args.swiglu_limit,
         dsv41_args=args,
+        # V4.1's routed experts are NVFP4 whole-expert banks, and its MoE seam asks
+        # ``owner_ep_expert_tp_size`` for the (unsharded) expert GEMM, so owner-local EP is
+        # available (--tensor-parallel-size 2 --moe-ep-size 2); the engine still gates it on
+        # this declaration. See engine._check_owner_ep_model.
+        owner_ep=True,
         # The engram tables (94 GiB each) and the tokenizer.json the n-gram hash's token map is
         # built from are read straight off the checkpoint directory at load time; the loader never
         # sees them as tensors (see weight.iter_weights and engram_tier.EngramTier).

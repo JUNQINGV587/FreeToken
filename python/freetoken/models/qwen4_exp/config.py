@@ -443,6 +443,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         lm_head_quant=lm_head_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
+        # Qwen3.8's routed experts are native NVFP4 banks and its MoE block implements the
+        # owner-local reduction contract (shared expert reduced with the routed output), so
+        # owner-local EP is available (--tensor-parallel-size 2 --moe-ep-size 2). The engine
+        # gates on this declaration -- see engine._check_owner_ep_model.
+        owner_ep=True,
     )
 
 

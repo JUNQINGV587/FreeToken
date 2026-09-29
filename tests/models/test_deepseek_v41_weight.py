@@ -10,6 +10,7 @@ dialect). Covers: ``load_args`` (inference/config.json -> DeepseekV41Args),
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -321,3 +322,89 @@ def test_nvfp4_expert_spec_matches_checkpoint_keys(checkpoint):
     assert spec.global_reciprocal is False
     assert not spec.key_pattern.match("layers.0.ffn.shared_experts.w1.weight")
     assert not spec.key_pattern.match("mtp.0.experts.0.w1.weight")
+
+
+# --------------------------------------------------------------------- the real checkpoint
+
+REAL_CHECKPOINT = os.environ.get("FT_V41_CHECKPOINT", "/mnt/nvme/models/DeepSeek-V4.1-Flash-NVFP4")
+
+
+@pytest.mark.skipif(os.path.isdir(REAL_CHECKPOINT) is False, reason="needs the V4.1 checkpoint")
+def test_the_loader_and_the_model_agree_with_the_real_checkpoint(monkeypatch):
+    """The synthetic checkpoint proves the naming rules; only the real one proves they cover it.
+
+    Everything here runs off the shard HEADERS plus a stubbed reader, so it needs neither 527 GB
+    of RAM nor a GPU: it answers "does the loader ask for every key the release ships, are all its
+    names real, and does the model declare exactly what it fills?".
+    """
+    from dataclasses import replace
+
+    import glob
+
+    from freetoken.distributed.info import get_tp_info, set_tp_info
+    from freetoken.layers.quantization import set_quant_config
+    from freetoken.models.deepseek_v41 import weight as W
+    from freetoken.models.deepseek_v41.model import DeepseekV41ForCausalLM
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+    from freetoken.utils import cached_load_hf_config
+
+    shipped: set[str] = set()
+    for shard in sorted(glob.glob(os.path.join(REAL_CHECKPOINT, "*.safetensors"))):
+        with open(shard, "rb") as fh:
+            n = int.from_bytes(fh.read(8), "little")
+            shipped |= {k for k in json.loads(fh.read(n)) if k != "__metadata__"}
+
+    asked: dict[str, int] = {}
+
+    class _StubReader:
+        def __init__(self, folder, weight_map, device):
+            self._weight_map = weight_map
+
+        def has(self, name):
+            return name in self._weight_map
+
+        def get(self, name):
+            asked[name] = asked.get(name, 0) + 1
+            return torch.zeros(1)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(W, "_ShardReader", _StubReader)
+    monkeypatch.setattr(W, "_dequant_fp8_block", lambda *a, **k: torch.zeros(1))
+    filled = [name for name, _ in iter_weights(REAL_CHECKPOINT, "cpu", include_moe_experts=False)]
+
+    assert not [n for n in asked if n not in shipped], "the loader asks for keys the release lacks"
+    # everything else the release ships is out of this port's scope: MTP/DSpark and the vision
+    # tower are deferred, routed experts come from the offload banks, and the two 94 GiB engram
+    # tables are served off disk by EngramTier.
+    unread = shipped - set(asked) - {"image_start", "image_end", "image_newline"}
+    assert not [k for k in unread if not _deferred(k)], f"unconsumed keys: {sorted(unread)[:10]}"
+
+    # now the other direction: build the model exactly as the engine does (quant included) and
+    # require the loader's names to be precisely its parameters
+    try:
+        get_tp_info()
+    except RuntimeError:
+        set_tp_info(rank=0, size=1)
+    hf_config = cached_load_hf_config(REAL_CHECKPOINT)
+    spec = get_model_spec(hf_config.architectures[0])
+    quant = checkpoint_quant_config(REAL_CHECKPOINT, hf_config, spec)
+    set_quant_config(quant)
+    config = replace(parse_config(hf_config), quant=quant)
+    with torch.device("meta"):
+        model = DeepseekV41ForCausalLM(config)
+
+    declared = set(model.state_dict())
+    assert set(filled) - declared == set(), "the loader names parameters the model does not declare"
+    assert declared - set(filled) == set(), "the model declares parameters the loader never fills"
+
+
+def _deferred(key: str) -> bool:
+    """Release keys this port deliberately does not consume: MTP/DSpark and the vision tower are
+    deferred, routed experts come from the offload banks, and the two 94 GiB engram tables are
+    served off disk by EngramTier."""
+    return key.startswith(("mtp.", "vision.", "aligner.")) or (
+        ".ffn.experts." in key or ".engram.embed." in key
+    )
+

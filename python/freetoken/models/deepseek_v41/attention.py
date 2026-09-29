@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import try_get_tp_info
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.fp4_e4m3_act import fp4_act_quant_e4m3_inplace
 from freetoken.layers import (
@@ -58,12 +59,34 @@ class Attention(BaseOP):
     ):
         self.layer_id = layer_id
         self.dim = args.dim
-        self.n_heads = args.n_heads
+        # Tensor parallelism splits the query heads -- and, because wo_a is one matrix per output
+        # group and wo_b shards that group axis, whole output groups -- across ranks. The latent
+        # path (wq_a/wkv), every norm and the compressors stay replicated: each rank needs the
+        # whole compressed latent for the q heads it owns. ``wq_b``/``wo_b`` are therefore
+        # declared with the GLOBAL sizes and the parallel linear classes cut them to this rank,
+        # which is also what the weight reader does (``weight._TP_SHARD_DIM``). A rank must own
+        # whole groups: the group einsum (``_wo``) produces one o_lora_rank vector per group and
+        # wo_b's row-parallel reduce sums the ranks' partial inputs, so a group split mid-head
+        # would silently mix two ranks' partial groups.
+        tp = try_get_tp_info()
+        self.tp_size = tp.size if tp is not None else 1
+        heads_per_group = args.n_heads // args.o_groups
+        self.n_heads = args.n_heads // self.tp_size
+        self.n_groups = args.o_groups // self.tp_size
+        if (
+            args.n_heads % self.tp_size
+            or args.o_groups % self.tp_size
+            or self.n_groups * heads_per_group != self.n_heads
+        ):
+            raise ValueError(
+                f"TP={self.tp_size} does not split V4.1's {args.n_heads} query heads into whole "
+                f"output groups ({args.o_groups} groups of {heads_per_group}); wo_b shards the "
+                "group axis, so every rank has to own complete groups."
+            )
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.n_groups = args.o_groups
         self.window_size = args.window_size
         self.eps = args.norm_eps
         self.max_batch_size = args.max_batch_size
@@ -77,14 +100,15 @@ class Attention(BaseOP):
         self._runtime = runtime if runtime is not None else SharedAttentionRuntime()
 
         self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
-        # The latent projections are replicated; wq_b shards over heads, wo_b over the output groups.
+        # The latent projections are replicated; wq_b shards over heads (declared GLOBAL here --
+        # the class cuts it to this rank), wo_b over the output groups.
         self.wq_a = LinearReplicated(
             self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config,
             prefix=f"{prefix}.wq_a",
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = LinearColParallelMerged(
-            self.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False,
+            self.q_lora_rank, [args.n_heads * self.head_dim], has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.wq_b",
         )
         self.wkv = LinearReplicated(
@@ -93,12 +117,14 @@ class Attention(BaseOP):
         )
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as an
-        # einsum; the reference dequantizes it to bf16 and so does the reader.
+        # einsum; the reference dequantizes it to bf16 and so does the reader. K is the *global*
+        # per-group width (this rank owns whole groups, so its groups are complete), while the
+        # stacked rows are this rank's groups -- the reader cuts dim 0 the same way.
         wo_a_rows = self.n_groups * args.o_lora_rank
-        wo_a_k = self.n_heads * self.head_dim // self.n_groups
+        wo_a_k = args.n_heads * self.head_dim // args.o_groups
         self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
         self.wo_b = LinearRowParallel(
-            self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config,
+            args.o_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config,
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim ** -0.5

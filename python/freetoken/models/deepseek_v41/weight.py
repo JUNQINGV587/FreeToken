@@ -31,10 +31,16 @@ from .args import load_args
 # the loader must cut the raw tensor the same way before handing it over (the shape assert
 # in layers/base.py is the gate that catches a miss). V4.1's names -- wq_b / wo_b /
 # shared_experts.w{1,2,3} -- do NOT match models.loader.shard_tensor's llama/qwen patterns,
-# hence this local table. Everything else (wq_a, wkv, wq_b's companion norms, attn_sink,
-# wo_a, compressor.*, engram.*, gate/hc_* mixing) is replicated, not sharded.
+# hence this local table. The attention module is head-parallel: wq_b splits the query
+# heads, attn_sink follows them one row per head, and wo_a/wo_b split the output-group axis
+# (whole groups per rank, which is what lets wo_b's row-parallel reduce sum the ranks'
+# partial groups). Everything else (wq_a, wkv, the norms, compressor.*, engram.*,
+# gate/hc_* mixing, indexer.weights_proj/wk) is replicated, not sharded: the compressed
+# latent, the per-head score weights and the shared pools must be whole on every rank.
 _TP_SHARD_DIM = {
     "attn.wq_b": 0,
+    "attn.attn_sink": 0,
+    "attn.wo_a": 0,
     "attn.indexer.wq_b": 0,
     "attn.wo_b": 1,
     "ffn.shared_experts.w1": 0,
@@ -67,6 +73,12 @@ def _tp_shard(name: str, value: torch.Tensor) -> torch.Tensor:
         return value[tp.rank * rows : min((tp.rank + 1) * rows, value.shape[0]), :].clone()
     dim = _tp_dim(name)
     if dim is None:
+        return value
+    if value.shape[dim] < tp.size:
+        # A degenerate axis cannot be cut into tp non-empty parts (tensor_split would hand the
+        # later ranks an empty tensor). This is a block-scale grid whose block is wider than its
+        # host's partition -- one block covering the whole axis, hence every rank's rows -- so the
+        # companion is replicated, exactly like the ``allow_replicate`` KV-head splits elsewhere.
         return value
     # tensor_split, not chunk: chunk may return FEWER parts than asked when the axis is
     # smaller than tp.size (a degenerate block-scale grid, e.g. 2x1), which then IndexErrors.

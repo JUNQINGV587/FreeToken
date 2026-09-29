@@ -347,6 +347,11 @@ def test_iter_weights_slices_the_tp_partitioned_tensors(checkpoint, tp):
     assert shape("model.layers.1.attn.indexer.wq_b.weight") == (INH * IHD // 2, QR)
     assert shape("model.layers.0.ffn.shared_experts.w1.weight") == (MI // 2, D)
     assert shape("model.layers.0.ffn.shared_experts.w3.weight") == (MI // 2, D)
+    # dim 0 too, one row per head: the attention sink follows the query heads
+    assert shape("model.layers.0.attn.attn_sink") == (NH // 2,)
+    assert torch.equal(
+        items["model.layers.0.attn.attn_sink"], full["layers.0.attn.attn_sink"][: NH // 2]
+    )
     # dim 1 (row parallel): wo_b, shared w2
     assert shape("model.layers.0.attn.wo_b.weight") == (D, OG * OL // 2)
     assert shape("model.layers.0.ffn.shared_experts.w2.weight") == (D, MI // 2)
@@ -354,12 +359,11 @@ def test_iter_weights_slices_the_tp_partitioned_tensors(checkpoint, tp):
     # single 32-wide column at these tiny dims, so it cannot halve -- the real checkpoint's
     # 160x256 -> 160x128 companion is asserted by the header shape audit, not here)
     assert shape("model.layers.0.attn.wq_b.weight_scale_inv") == ((NH * HD // 2 + 31) // 32, 1)
-    # replicated: the low-rank projections, norms, single-head wkv, attn_sink, indexer K
+    # replicated: the low-rank projections, norms, single-head wkv, indexer K
     for name in (
         "model.layers.0.attn.wq_a.weight",
         "model.layers.0.attn.wkv.weight",
         "model.layers.0.attn.q_norm.weight",
-        "model.layers.0.attn.attn_sink",
         "model.layers.1.attn.indexer.wk.weight",
         "model.layers.1.attn.indexer.k_norm.weight",
         "model.layers.1.attn.indexer.weights_proj.weight",
@@ -367,8 +371,9 @@ def test_iter_weights_slices_the_tp_partitioned_tensors(checkpoint, tp):
     ):
         assert items[name].shape == full[name[len("model.") :]].shape, name
     # wo_a is DERIVED (dequantized from wo_a.weight + its e8m0 scale), so it has no same-named
-    # checkpoint key: it must keep the full einsum operand shape, never a half.
-    assert items["model.layers.0.attn.wo_a"].shape == (OG * OL, OG * OL)
+    # checkpoint key. Both raw sources are cut on dim 0 (whole output groups per rank), so the
+    # derived einsum operand keeps every column and only this rank's stacked group rows.
+    assert items["model.layers.0.attn.wo_a"].shape == (OG * OL // 2, OG * OL)
 
     # rank 1 gets the complementary halves
     tp(1, 2)
@@ -382,6 +387,9 @@ def test_iter_weights_slices_the_tp_partitioned_tensors(checkpoint, tp):
     assert torch.equal(
         rank1["model.layers.0.ffn.shared_experts.w2.weight"],
         full["layers.0.ffn.shared_experts.w2.weight"][:, MI // 2 :],
+    )
+    assert torch.equal(
+        rank1["model.layers.0.attn.attn_sink"], full["layers.0.attn.attn_sink"][NH // 2 :]
     )
 
 

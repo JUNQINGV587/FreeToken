@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator, try_get_tp_info
 from freetoken.kernel.triton.dsv4.fp8_linear import fp4_act_quant_inplace
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, RMSNorm
 
@@ -118,7 +119,23 @@ class Indexer(BaseOP):
         self.candidate_topk_blocks = args.candidate_topk_blocks
         self.candidate_block_size = args.candidate_block_size
         self.dim = args.dim
-        self.n_heads = args.index_n_heads
+        # The indexer's own heads are tensor-parallel (its wq_b shards like the attention one),
+        # but the *selection* has to be identical on every rank: the chosen blocks are indices
+        # into the shared compressed pool that every rank's query heads then read. So each rank
+        # scores the heads it owns and the partial scores are summed across ranks before top-k
+        # (``_all_reduce_score``); the per-head weights come from the replicated weights_proj,
+        # sliced to this rank's heads. At TP=1 both are the identity.
+        tp = try_get_tp_info()
+        self.tp_size = tp.size if tp is not None else 1
+        self.tp_rank = tp.rank if tp is not None else 0
+        self._comm = DistributedCommunicator()
+        self.index_n_heads = args.index_n_heads  # global: score scale + weights_proj width
+        if args.index_n_heads % self.tp_size:
+            raise ValueError(
+                f"TP={self.tp_size} does not split V4.1's {args.index_n_heads} index heads; the "
+                "indexer shards wq_b over them and slices its replicated score weights to match."
+            )
+        self.n_heads = args.index_n_heads // self.tp_size
         self.index_head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
@@ -128,11 +145,12 @@ class Indexer(BaseOP):
         self.runtime = runtime if runtime is not None else SharedAttentionRuntime()
 
         self.wq_b = LinearColParallelMerged(
-            args.q_lora_rank, [self.n_heads * self.index_head_dim], has_bias=False,
+            args.q_lora_rank, [args.index_n_heads * self.index_head_dim], has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.wq_b",
         )
         self.weights_proj = LinearReplicated(
-            self.dim, self.n_heads, False, quant_config=quant_config, prefix=f"{prefix}.weights_proj"
+            self.dim, args.index_n_heads, False, quant_config=quant_config,
+            prefix=f"{prefix}.weights_proj",
         )
         self.wk = None
         self.k_norm = None
@@ -151,6 +169,27 @@ class Indexer(BaseOP):
             args.compress_rope_theta, args.rope_factor, args.beta_fast, args.beta_slow,
         )
         self._freqs_cis: torch.Tensor | None = None
+
+    def _head_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's per-head score weights.
+
+        ``weights_proj`` is replicated (one scalar per *global* index head), so the head slice
+        has to follow the same split ``wq_b`` was cut with -- the model's TP ranks own contiguous
+        head ranges. The scale keeps the global head count: the scores are summed across ranks
+        afterwards, so a tp-divided scale would shrink them by sqrt(tp).
+        """
+        w = self.weights_proj.forward(x) * (self.softmax_scale * self.index_n_heads**-0.5)
+        if self.tp_size == 1:
+            return w
+        return w[..., self.tp_rank * self.n_heads : (self.tp_rank + 1) * self.n_heads]
+
+    def _all_reduce_score(self, score: torch.Tensor) -> torch.Tensor:
+        """Sum the ranks' head partials: every rank selects the same blocks.
+
+        The mask indexes the shared compressed pool, which every rank's query heads read, so a
+        rank-local top-k would have each rank attending to a different set of slots.
+        """
+        return score if self.tp_size == 1 else self._comm.all_reduce(score)
 
     def reset(self) -> None:
         """The index-K cache is per sequence: a stale one would let a new prompt read another's
@@ -207,9 +246,11 @@ class Indexer(BaseOP):
         fp4_act_quant_inplace(q, 32)
 
         index_k = runtime.index_k[:bsz, : end_pos // ratio]
-        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads**-0.5)
+        weights = self._head_weights(x)
         index_score = torch.einsum("bshd,btd->bsht", q, index_k)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        index_score = self._all_reduce_score(
+            (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        )
 
         # a block becomes visible once the query has passed its last token
         if start_pos == 0:
@@ -300,8 +341,8 @@ class Indexer(BaseOP):
         fp4_act_quant_inplace(q, 32)
 
         keys = self.attn.indexer_keys(ti, n_blocks, ratio, self.layer_id, bsz)
-        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads**-0.5)
-        scores = self.attn.indexer_prefill_logits(q, keys, weights)
+        weights = self._head_weights(x)
+        scores = self._all_reduce_score(self.attn.indexer_prefill_logits(q, keys, weights))
 
         # a block becomes visible once the query has passed its last token
         live = (start_pos + torch.arange(1, seqlen + 1, device=x.device)) // ratio
@@ -351,13 +392,14 @@ class Indexer(BaseOP):
         apply_rotary_emb_decode(q[..., -rd:], self._freqs_cis.index_select(0, pos))
         fp4_act_quant_inplace(q, 32)
 
-        weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads**-0.5)
+        weights = self._head_weights(x)
         valid = (pos + 1) // ratio
         scores = self.attn.indexer_decode_scores(
             q.reshape(bsz, self.n_heads, self.index_head_dim),
             weights.reshape(bsz, self.n_heads),
             valid, n_stage, ratio, self.layer_id,
         ).view(bsz, 1, n_stage)
+        scores = self._all_reduce_score(scores)
         topk = min(self.index_topk, n_stage)
         blocks = self.attn.indexer_select_decode(scores, valid=valid, topk=topk, offset=0)
         self.runtime.topk_idxs_decode[:bsz, :1, :topk].copy_(blocks)

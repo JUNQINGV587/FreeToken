@@ -332,6 +332,20 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=("ds_fp4",),
         embed_indexing=False,  # plain nn.Embedding
     ),
+    AotModel(
+        # Same MLA + Hyper-Connections skeleton as V4-Flash, but the routed experts are
+        # ModelOpt NVFP4 (packed e2m1 + per-16 E4M3 scales + fp16 row globals) instead of
+        # the V4 ds_fp4 dialect, and the compressor ratios are {0,1,2} with SHARED
+        # compressed-KV caches (CSA2) rather than V4's per-layer state.
+        name="deepseek-ai/DeepSeek-V4.1-Flash",
+        architecture="DeepseekV41ForCausalLM",
+        hidden_size=5120,
+        kv_groups=(),  # shared MLA latent pools write via torch scatter, not store_cache
+        top_k=6,
+        moe_intermediate_size=2304,
+        expert_formats=("nvfp4",),
+        embed_indexing=False,  # plain nn.Embedding
+    ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(
         name="Qwen/Qwen3.6-27B",

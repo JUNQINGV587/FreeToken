@@ -208,11 +208,27 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     sliding_window: int  # the P-token window page
 
 
+@dataclass(frozen=True)
+class DSV41AttentionGroupConfig(BaseAttentionGroupConfig):
+    """DSV4.1 sparse attention (window + SHARED compressed caches + CSA2 two-level
+    indexer). Standalone like the DSV4 spec (the SWA gates must not claim it).
+    Geometry and the kv/index source-layer topology live in dsv41_args; the pool
+    prices itself from there, not from this spec."""
+
+    kind: ClassVar[Literal["dsv41"]] = "dsv41"
+    cache_kind: ClassVar[Literal["dsv41_paged"]] = "dsv41_paged"
+
+    num_kv_heads: int
+    head_dim: int
+    sliding_window: int  # the P-token window page
+
+
 AttentionGroupConfig: TypeAlias = (
     FullAttentionGroupConfig
     | SWAAttentionGroupConfig
     | LinearGatedDeltaGroupConfig
     | DSV4AttentionGroupConfig
+    | DSV41AttentionGroupConfig
 )
 
 
@@ -335,6 +351,10 @@ class ModelConfig:
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.
     dsv4_args: Any | None = None
+    # Full DeepseekV41Args payload for the DSV4.1-specific machinery (shared-cache
+    # MLA sparse attention / CSA2, ratio {0,1,2} compressors, two-level indexer,
+    # Hyper-Connections, engram). Opaque to model-agnostic engine code.
+    dsv41_args: Any | None = None
     # GLM-5.2 (glm_moe_dsa) MLA/DSA payload (GlmMoeDsaArgs): the MLA low-rank dims and the
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
@@ -457,6 +477,8 @@ class ModelConfig:
             return AttnType.SWA
         if isinstance(group, DSV4AttentionGroupConfig):
             return AttnType.DSV4
+        if isinstance(group, DSV41AttentionGroupConfig):
+            return AttnType.DSV41
         return _full_group_attn_type(group)
 
     def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
@@ -511,6 +533,19 @@ class ModelConfig:
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
                         attn_type=AttnType.DSV4,
+                    )
+                )
+            elif isinstance(group, DSV41AttentionGroupConfig):
+                # Same matrix/taxonomy-only role as the DSV4 entry above (the
+                # DSV4.1 pool prices itself from dsv41_args).
+                specs.append(
+                    KVCacheGroupSpec(
+                        name=group.name,
+                        layer_ids=group.layer_ids,
+                        num_kv_heads=group.num_kv_heads,
+                        head_dim=group.head_dim,
+                        sliding_window=group.sliding_window,
+                        attn_type=AttnType.DSV41,
                     )
                 )
         return tuple(specs)

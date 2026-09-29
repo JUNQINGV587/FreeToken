@@ -156,6 +156,21 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
         unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
     ),
+    "DeepseekV41ForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v41",
+        "DeepseekV41ForCausalLM",
+        # the checkpoint has no ``model.`` root
+        checkpoint_roots=(("model.layers", "layers"), ("model.head", "head")),
+        packed_modules_mapping=_EXPERTS_W123_PACKED,
+        # bf16 pieces although the quantization_config covers them: head, compressors,
+        # the indexer scorer/K projection, the MoE router, the engram small tensors
+        unquantized_modules=(
+            "head",
+            "*.compressor.wkv", "*.compressor.wgate", "*.compressor.norm",
+            "*.indexer.weights_proj", "*.indexer.wk", "*.indexer.k_norm",
+            "*.ffn.gate", "*.engram.q_weight", "*.engram.k_weight",
+        ),
+    ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoeForConditionalGeneration",

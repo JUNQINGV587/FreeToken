@@ -113,17 +113,51 @@ class DSV41OffloadMoELayer(OffloadMoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        # Prefill must NOT take the decode-style on-demand slot path. That path hands the
-        # inline-NVFP4 GEMM slot ids, whose namespace is the whole slot pool (1675 rows here,
-        # spanning layers), and asks moe_align_block_size for a histogram over it. sgl_kernel's
-        # align kernel silently produces garbage for an id space that size -- observed
-        # num_tokens_post_pad = -1694418143 with expert_ids ~ 1e9 on a 5-token chunk, after which
-        # the GEMM's `pid_m * BLOCK_SIZE_M >= num_tokens_post_padded` guard never returns and the
-        # slot indexes a wild address (illegal memory access). FreeToken's own Triton align kernel
-        # has no such cap, but wiring a 2048-bin histogram into every prefill is not worth it for
-        # a byte-count optimization. The base path keeps position == expert id (n == num_experts),
-        # which is also what the disk tier's ring/identity-slot staging is built around.
-        return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+        # Whole-layer streaming moves all num_experts rows per layer; a small chunk touches at
+        # most T*top_k of them, so below that crossover the decode-style on-demand slot path
+        # strictly moves fewer bytes. Mixing modes across chunks is safe: the streaming buffers
+        # disown their borrowed slots on invalidation.
+        #
+        # This path routes on *slot* ids, whose namespace is the whole pool (1675 rows, shared
+        # across layers), and hands that id space to moe_align_block_size. sglang's align kernel
+        # silently drops anything past ~1024 experts (it wrote ntpp = -1694418143 and
+        # expert_ids ~ 1e9 here, after which the inline-NVFP4 GEMM's
+        # `pid_m * BLOCK_SIZE_M >= num_tokens_post_padded` guard never fired and indexed a wild
+        # bank address). fused.py now keeps the sgl kernel to id spaces it is known to handle and
+        # falls back to FreeToken's own triton align above that -- its histogram is sized from the
+        # id space (HIST = next_pow2(1675 + 2) = 2048), which is what makes this shortcut legal.
+        cache = self.offload_cache
+        assert cache is not None
+        if self.owner_cache is not None:
+            # The owner adapter must see the original global route; its local-row remap,
+            # borrowed-buffer lifecycle and remote zeroing stay in the base implementation.
+            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+        # Unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the
+        # whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot
+        # remap would contradict.
+        if (
+            hidden_states.shape[0] * self.top_k >= self.num_experts
+            or cache.is_unpinned_layer(self.layer_id)
+        ):
+            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+        cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
+        cache.copy_missing()
+        if cache.collect_stats:
+            cache.record_decode_stats(self.layer_id)
+        # ``n`` is the align kernel's num_experts, so it must be the id space these rows are drawn
+        # from: the bank's row count (the slot pool), not the model's 384 experts. The base path's
+        # invariant is the same one -- there n == num_experts because its ids are expert ids.
+        views = cache.bank_views()
+        return self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=views,
+            n=views[0].shape[0],
+            alphas=cache.alphas_for_slots(self.layer_id),
+            is_prefill=True,
+        )
 
 
 class MoE(BaseOP):

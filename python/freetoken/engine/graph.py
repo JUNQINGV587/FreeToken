@@ -173,6 +173,19 @@ class GraphRunner:
         bridge = getattr(tier, "_graph_bridge", None) if tier is not None else None
         if bridge is not None:
             bridge.disable()
+        # The engram doorbell (models/deepseek_v41/engram_fetch.py) needs the same off/arm pair:
+        # its row ids are hashed inside the graph, so a captured gather can only reach the 94 GiB
+        # NVMe tables through a request block, and the service thread must ignore capture.
+        # Resolve the tier FIRST: v41 binds it lazily on its first forward (_ensure_bound) and
+        # that first forward is one of the captures below, so without this the lookup reads the
+        # pre-bind model, the bridge is created mid-capture and never armed -- every replay then
+        # runs the spin kernel against a doorbell that is still 0 and silently serves stale rows.
+        ensure_bound = getattr(model, "_ensure_bound", None)
+        if callable(ensure_bound):
+            ensure_bound()
+        engram_bridge = getattr(getattr(model, "_engram_tier", None), "_graph_bridge", None)
+        if engram_bridge is not None:
+            engram_bridge.disable()
 
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
@@ -213,6 +226,8 @@ class GraphRunner:
             # All graphs replay-ready: service thread starts (ignoring every
             # sequence written during capture) and spin kernels go live.
             bridge.enable()
+        if engram_bridge is not None:
+            engram_bridge.enable()
         # Boot-time guard for the custom-AR donor's sequence-paired barriers (see
         # distributed.impl.verify_ar_sequence_boot): no-op when the donor is inactive.
         from freetoken.distributed.impl import verify_ar_sequence_boot

@@ -283,10 +283,24 @@ class Transformer(BaseOP):
         assert layer is not None, "a model with no layers has no state to collapse"
         h = layer.hc_pre(h, pre_mix)
         h = self.norm.forward(h)
-        if not full_logits:
-            h = h[:, -1:]
-        logits = self.logits(h.reshape(-1, self.args.dim))
+        logits = self.logits(self._head_rows(h, None, full_logits))
         return logits.view(bsz, seqlen, -1) if full_logits else logits
+
+    @staticmethod
+    def _head_rows(
+        h: torch.Tensor, keep_rows: torch.Tensor | None, full_logits: bool
+    ) -> torch.Tensor:
+        """The [rows, dim] the head must project: the sampler's rows, not the whole chunk.
+
+        ``h`` arrives as [1, T, dim] from the paged pass. A ragged prefill packs several requests
+        into T while only each request's last row carries a next token, and the head is the
+        vocab-sized GEMM (all-gathered across TP), so projecting T rows is work nobody reads.
+        """
+        if keep_rows is not None:
+            return h.reshape(-1, h.shape[-1]).index_select(0, keep_rows.to(h.device))
+        if full_logits:
+            return h.reshape(-1, h.shape[-1])
+        return h[:, -1:].reshape(-1, h.shape[-1])
 
     @torch.no_grad()
     def forward_paged(
@@ -301,6 +315,7 @@ class Transformer(BaseOP):
         cmp_stage_cap: int = 0,
         image_mask: torch.Tensor | None = None,
         full_logits: bool = False,
+        keep_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Drive the blocks along the paged CSA2 path; bind the model with a pool first.
 
@@ -308,6 +323,8 @@ class Transformer(BaseOP):
         axis -- is a ragged prefill; ``pos``/``rows`` is a decode step, one token per row, and
         ``cmp_stage_cap`` is the compressed width to stage. ``engram_rows`` is the requests'
         stable table rows for the n-gram history (defaults to ``rows``, the local ones).
+        ``keep_rows`` are the flat rows of that ragged pass whose logits the caller actually
+        reads (one per request), and it returns them flat like a decode step.
         Everything else (engram, HC, FFN) is
         the eager plumbing, so a paged pass and an eager pass over the same tokens are comparable.
         """
@@ -373,9 +390,9 @@ class Transformer(BaseOP):
         assert layer is not None, "a model with no layers has no state to collapse"
         h = layer.hc_pre(h, pre_mix)
         h = self.norm.forward(h)
-        if not full_logits:
-            h = h[:, -1:]
-        logits = self.logits(h.reshape(-1, self.args.dim))
+        logits = self.logits(self._head_rows(h, keep_rows, full_logits))
+        if keep_rows is not None:
+            return logits
         return logits.view(bsz, seqlen, -1) if full_logits else logits
 
     def logits(self, h: torch.Tensor) -> torch.Tensor:
@@ -501,18 +518,18 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         device = input_ids.device
         if batch.is_prefill:
             segments = md.segments
-            # full_logits so the head can pick each REQUEST's final token: a ragged prefill packs
-            # several requests into the token axis and only their last row carries a next token.
-            logits = self.model.forward_paged(
-                input_ids.view(1, -1),
-                segments=segments,
-                flat_positions=batch.positions.long(),
-                full_logits=True,
-            )
+            # keep_rows so the head projects each REQUEST's final token only: a ragged prefill packs
+            # several requests into the token axis, and the head is the vocab-sized GEMM that TP
+            # all-gathers, so the chunk's remaining rows are work nobody reads.
             last = torch.tensor(
                 [off + n - 1 for off, n, _ti, _sp in segments], dtype=torch.long, device=device
             )
-            return logits[0].index_select(0, last)
+            return self.model.forward_paged(
+                input_ids.view(1, -1),
+                segments=segments,
+                flat_positions=batch.positions.long(),
+                keep_rows=last,
+            )
         # DECODE (bs >= 1): per-row position (GPU int tensor -> no host syncs / graph safe). The
         # compressed staging cap is the max position any row reaches (eager); a static max_seq-1
         # under graph capture, so the captured static-shape graph serves any replay position.

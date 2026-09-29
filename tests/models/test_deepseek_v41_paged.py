@@ -178,6 +178,31 @@ def test_paged_prefill_matches_the_eager_path_at_a_short_prompt(monkeypatch):
 
 
 @requires_cuda
+def test_a_ragged_prefill_projects_only_the_rows_the_sampler_reads(monkeypatch):
+    """``keep_rows`` names the flat rows whose logits the caller reads (one per request): the head
+    must project exactly those, in the caller's order, and land on the same full-grid rows."""
+    device = torch.device("cuda")
+    args = _args()
+    model = _model(monkeypatch, device, args)
+    _sink(model)
+    torch.manual_seed(37)
+    ids = torch.randint(0, VOCAB, (1, 12), device=device)
+    keep = torch.tensor([2, 9], dtype=torch.long, device=device)
+
+    grid = model.forward(ids, full_logits=True).float().reshape(-1, VOCAB)
+
+    pool, _ = _pool_and_backend(args, device)
+    _bind_paged(model, device, pool)
+    rows = model.forward_paged(ids, segments=[(0, 12, 0, 0)], keep_rows=keep).float()
+
+    assert rows.shape == (2, VOCAB)
+    diff = (rows - grid.index_select(0, keep)).abs().max().item()
+    assert torch.allclose(rows, grid.index_select(0, keep), rtol=TOL, atol=TOL), (
+        f"max abs logit diff {diff}"
+    )
+
+
+@requires_cuda
 def test_paged_decode_walks_the_eager_argmax_trajectory(monkeypatch):
     """Prefill N paged, then one token at a time through the paged decode path: the argmax
     trajectory must be the eager one's, and every step finite."""
@@ -449,6 +474,18 @@ def test_the_engine_forward_answers_per_request_in_a_ragged_prefill(monkeypatch)
     assert got.shape == (2, VOCAB)
     diff = (got - want).abs().max().item()
     assert torch.allclose(got, want, rtol=TOL, atol=TOL), f"max abs logit diff {diff}"
+
+
+def test_the_engine_prefill_asks_the_head_for_the_sampler_rows():
+    # Guard the call site: a ragged prefill must not project the whole chunk through the vocab-sized
+    # head (and, at TP > 1, all-gather it), so it names the rows instead of asking for full logits.
+    import inspect
+
+    from freetoken.models.deepseek_v41.model import DeepseekV41ForCausalLM
+
+    src = inspect.getsource(DeepseekV41ForCausalLM.forward)
+    assert "keep_rows=last" in src, "prefill must name the rows the sampler reads"
+    assert "full_logits=True" not in src, "prefill is projecting the whole chunk through the head"
 
 
 @requires_cuda

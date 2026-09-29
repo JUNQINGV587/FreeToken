@@ -174,6 +174,28 @@ def test_the_head_returns_last_position_logits_and_the_full_grid_on_request(monk
     assert torch.equal(last, full[:, -1])
 
 
+def test_the_head_projects_the_rows_the_sampler_reads():
+    """A ragged prefill names its rows; decode and the logits oracle keep their own defaults.
+
+    ``h`` arrives as [1, T, dim]; the head is the vocab-sized GEMM (all-gathered at TP > 1), so the
+    paged prefill must project each request's last row rather than the whole chunk.
+    """
+    h = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+    flat = h.reshape(-1, 3)
+
+    only_last = model_mod.Transformer._head_rows(h, None, False)
+    assert only_last.shape == (1, 3)
+    assert torch.equal(only_last[0], h[0, -1])
+
+    grid = model_mod.Transformer._head_rows(h, None, True)
+    assert grid.shape == (4, 3)
+    assert torch.equal(grid, flat)
+
+    keep = torch.tensor([3, 1], dtype=torch.long)
+    picked = model_mod.Transformer._head_rows(h, keep, True)
+    assert torch.equal(picked, flat.index_select(0, keep))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_split_pass_lands_where_a_single_pass_lands(monkeypatch):
     """Prefill then token-at-a-time must equal one pass, and ``reset`` must restore the start."""

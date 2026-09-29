@@ -156,6 +156,59 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
     assert input_ids.tolist() == [4, 5, 6]
 
 
+def test_dsv4_encoder_falls_back_to_the_v41_encoding_module(tmp_path):
+    """DeepSeek-V4.1 ships the same encoder API under ``encoding/encoding.py``
+    (V4 used ``encoding_dsv4.py``). Without the fallback the V4.1 checkpoint has
+    no chat template, so every chat request dies with "tokenizer.chat_template
+    is not set"."""
+    encoding_dir = tmp_path / "encoding"
+    encoding_dir.mkdir()
+    (encoding_dir / "encoding.py").write_text(
+        """
+def encode_messages(messages, thinking_mode, reasoning_effort=None):
+    effort = reasoning_effort or "high"
+    assert effort in ("low", "high", "max") or (isinstance(effort, int) and 1 <= effort <= 100)
+    return f"v41 prompt effort={effort}"
+""".lstrip()
+    )
+    tokenizer = FakeDsv4Tokenizer(tmp_path)
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "hello"}],
+        sampling_params=SamplingParams(),
+        chat_template_kwargs={"reasoning_effort": "high"},
+    )
+
+    manager.tokenize([msg])
+
+    assert tokenizer.prompt == "v41 prompt effort=high"
+
+
+def test_dsv4_encoder_prefers_the_v4_filename_when_both_exist(tmp_path):
+    encoding_dir = tmp_path / "encoding"
+    encoding_dir.mkdir()
+    (encoding_dir / "encoding_dsv4.py").write_text(
+        """
+def encode_messages(messages, thinking_mode, reasoning_effort=None):
+    return "v4 prompt"
+""".lstrip()
+    )
+    (encoding_dir / "encoding.py").write_text(
+        """
+def encode_messages(messages, thinking_mode, reasoning_effort=None):
+    return "v41 prompt"
+""".lstrip()
+    )
+    tokenizer = FakeDsv4Tokenizer(tmp_path)
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(uid=1, text=[{"role": "user", "content": "hi"}], sampling_params=SamplingParams())
+
+    manager.tokenize([msg])
+
+    assert tokenizer.prompt == "v4 prompt"
+
+
 def test_dsv4_encoder_gets_tool_call_arguments_as_json_string(tmp_path):
     """Regression: render_messages hands the template dict arguments; the dsv4
     encoder contract is a JSON-object STRING -- a dict trips its fallback that

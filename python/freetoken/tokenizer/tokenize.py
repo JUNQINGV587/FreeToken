@@ -234,23 +234,34 @@ class TokenizeManager:
         return sanitized
 
 
+#: Checkpoints of the DeepSeek-V4 generation shipped a Jinja-less encoder under
+#: different filenames: ``encoding_dsv4.py`` (V4) and ``encoding.py`` (V4.1, see the
+#: checkpoint's own ``encoding/README.md``). Both expose ``encode_messages``; try
+#: them in order so a V4.1 checkpoint does not fall through to the (absent) Jinja
+#: chat template and fail every chat request with "tokenizer.chat_template is not
+#: set".
+_DSV4_ENCODER_FILENAMES = ("encoding_dsv4.py", "encoding.py")
+
+
 def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleType | None:
     if getattr(tokenizer, "chat_template", None):
         return None
     model_path = getattr(tokenizer, "name_or_path", None) or getattr(tokenizer, "_name_or_path", "")
     if not model_path:
         return None
-    encoder_path = os.path.join(str(model_path), "encoding", "encoding_dsv4.py")
-    if not os.path.isfile(encoder_path):
-        return None
-    spec = importlib.util.spec_from_file_location("encoding_dsv4", encoder_path)
-    if spec is None or spec.loader is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if not hasattr(module, "encode_messages"):
-        return None
-    return module
+    for filename in _DSV4_ENCODER_FILENAMES:
+        encoder_path = os.path.join(str(model_path), "encoding", filename)
+        if not os.path.isfile(encoder_path):
+            continue
+        spec = importlib.util.spec_from_file_location(filename[: -len(".py")], encoder_path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not hasattr(module, "encode_messages"):
+            continue
+        return module
+    return None
 
 
 def _apply_dsv4_chat_encoder(

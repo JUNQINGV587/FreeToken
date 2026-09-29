@@ -1,0 +1,181 @@
+"""DSV4.1 MoE: sqrtsoftplus router (no hash layers), shared SwiGLU expert, offloaded NVFP4
+routed experts (ModelOpt per-16 E4M3 scales + a per-tensor ``scale_2``)."""
+
+from __future__ import annotations
+
+import logging
+
+import torch
+import torch.nn.functional as F
+
+from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
+from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
+from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
+
+from .args import DeepseekV41Args
+
+logger = logging.getLogger(__name__)
+
+
+class Gate(BaseOP):
+    """MoE router: sqrtsoftplus scoring with a selection-only bias, and no hash layers.
+
+    V4.1 keeps V4's scoring but drops hash routing entirely and carries a second bias for
+    image-span tokens (``bias_vl``); plain ``bias`` serves text. The bias steers *selection*
+    only -- the routing weights come from the unbiased scores, matching training.
+    """
+
+    def __init__(self, layer_id: int, args: DeepseekV41Args):
+        self.topk = args.n_activated_experts
+        self.score_func = args.score_func
+        self.gate_temp = args.gate_temp
+        self.norm_topk_prob = args.norm_topk_prob
+        self.route_scale = args.route_scale
+        self.weight = torch.empty(args.n_routed_experts, args.dim, dtype=torch.bfloat16)
+        self.bias = torch.empty(args.n_routed_experts, dtype=torch.float32)
+        # The checkpoint always ships bias_vl (it was trained with the VL tower); it is only
+        # consulted when an image mask is supplied, so keep the tensor unconditionally.
+        self.bias_vl = torch.empty(args.n_routed_experts, dtype=torch.float32)
+
+    def forward(
+        self, x: torch.Tensor, image_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = bf16_linear_fp32(x, self.weight)
+        if self.gate_temp != 1.0:
+            scores = scores / self.gate_temp
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1)
+        elif self.score_func == "sigmoid":
+            scores = scores.sigmoid()
+        else:
+            scores = F.softplus(scores).sqrt()
+        bias = self.bias
+        if image_mask is not None and self.bias_vl is not None:
+            bias = torch.where(image_mask.unsqueeze(-1), self.bias_vl, bias)
+        indices = (scores + bias).topk(self.topk, dim=-1)[1]
+        weights = scores.gather(1, indices)
+        if self.norm_topk_prob and self.topk > 1:
+            # 1e-20, not norm_eps: this is the constant training used.
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+        return weights * self.route_scale, indices
+
+
+class Expert(BaseOP):
+    """Dense SwiGLU expert (the shared expert; routed experts are offloaded NVFP4)."""
+
+    def __init__(self, dim: int, inter_dim: int, swiglu_limit: float, *, quant_config=None, prefix: str = ""):
+        self.w1 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1")
+        self.w2 = LinearRowParallel(inter_dim, dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w2")
+        self.w3 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3")
+        self.swiglu_limit = swiglu_limit
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = fused_swiglu(self.w1.forward(x), self.w3.forward(x), self.swiglu_limit, x.dtype)
+        return self.w2.forward(h)
+
+
+class DSV41OffloadMoELayer(OffloadMoELayer):
+    """Routed NVFP4 experts on the shared offload cache.
+
+    Identical strategy to V4's MXFP4 layer (whole-layer streaming prefill, slot-cache / cpu / hybrid
+    decode); only the stored expert format differs, and that comes from ``quant_config``.
+    """
+
+    _warned_limit = False
+
+    def __init__(self, layer_id: int, args: DeepseekV41Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+        # V4.1 trained the routed experts with swiglu_limit=10, but NONE of the NVFP4 MoE kernels
+        # can express an activation clamp (``gated_epilogue_reason`` rejects silu + limit, and b12x
+        # needs SM120); the MXFP4 kernels V4 uses do take one. Until the NVFP4 epilogue grows the
+        # clamp, the routed experts run unclamped -- a bounded, documented approximation (the
+        # shared expert below still clamps, because it is a plain GEMM + ``fused_swiglu``).
+        if args.swiglu_limit > 0 and not DSV41OffloadMoELayer._warned_limit:
+            DSV41OffloadMoELayer._warned_limit = True
+            logger.warning(
+                "deepseek_v41: routed NVFP4 experts run WITHOUT the swiglu limit %.1f -- no NVFP4 "
+                "MoE kernel supports an activation clamp yet; the shared expert is clamped.",
+                args.swiglu_limit,
+            )
+        super().__init__(
+            layer_id=layer_id,
+            num_experts=args.n_routed_experts,
+            top_k=args.n_activated_experts,
+            hidden_size=args.dim,
+            intermediate_size=args.moe_inter_dim,
+            renormalize=True,
+            activation="silu",
+            limit=None,
+            strategy=strategy,
+            decode_target=decode_target,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def _prefill_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # Whole-layer streaming moves all num_experts rows per layer; a small chunk touches at
+        # most T*top_k of them, so below that crossover the decode-style on-demand slot path
+        # strictly moves fewer bytes. Mixing modes across chunks is safe: the streaming buffers
+        # disown their borrowed slots on invalidation.
+        cache = self.offload_cache
+        assert cache is not None
+        if self.owner_cache is not None:
+            # The owner adapter must see the original global route; its local-row remap,
+            # borrowed-buffer lifecycle and remote zeroing stay in the base implementation.
+            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+        # Unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the
+        # whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot
+        # remap would contradict.
+        if (
+            hidden_states.shape[0] * self.top_k >= self.num_experts
+            or cache.is_unpinned_layer(self.layer_id)
+        ):
+            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+        cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
+        cache.copy_missing()
+        if cache.collect_stats:
+            cache.record_decode_stats(self.layer_id)
+        return self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.bank_views(),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
+            is_prefill=True,
+        )
+
+
+class MoE(BaseOP):
+    """Sparse MoE: score router -> offloaded NVFP4 routed experts + one shared expert."""
+
+    def __init__(self, layer_id: int, args: DeepseekV41Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+        self.dim = args.dim
+        self.gate = Gate(layer_id, args)
+        self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit, quant_config=quant_config, prefix=f"{prefix}.shared_experts")
+        self.experts = DSV41OffloadMoELayer(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.experts")
+
+    def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate.forward(x, image_mask)
+        # Shared expert enqueued before routed_forward: the hybrid decode path blocks on the CPU
+        # pool inside routed_forward, so this GEMM must already be on the stream to overlap it.
+        shared = self.shared_experts.forward(x)
+        # routed_forward may mutate the ids in place (offload decode slot remap);
+        # indices.to(int32) always copies, so no clone is needed here.
+        routed = self.experts.routed_forward(
+            x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
+        )
+        # The reference accumulates routes in fp32 and casts the sum back to the activation dtype
+        # (``y.type_as(x)``); the shared expert is added before that cast because a bf16 add would
+        # round twice.
+        return (routed + shared.float()).to(x.dtype).view(shape)
+
+
+__all__ = ["Gate", "Expert", "DSV41OffloadMoELayer", "MoE"]

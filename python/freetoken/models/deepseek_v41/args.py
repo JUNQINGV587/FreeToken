@@ -42,6 +42,9 @@ class DeepseekV41Args:
     n_shared_experts: int = 1
     n_activated_experts: int = 6
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sqrtsoftplus"
+    # gate_temp / norm_topk_prob are author-side ModelArgs defaults, not config.json keys.
+    gate_temp: float = 1.0
+    norm_topk_prob: bool = True
     route_scale: float = 1.5
     swiglu_limit: float = 10.0
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import threading
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -135,6 +136,7 @@ class EngramTier:
         *,
         device=None,
         max_rows: int = 16384,
+        graph_rows: int = 2048,
         use_io_uring: bool | None = None,
     ) -> None:
         from freetoken.kernel.row_store import RowStore
@@ -147,6 +149,10 @@ class EngramTier:
         self.head_dim = self.dim
         self.num_layers = len(self.locations)
         self.max_rows = int(max_rows)
+        self.graph_rows = int(graph_rows)
+        # A RowStore keeps its pending batch in member state, so the engine thread (eager prefill)
+        # and the doorbell's service thread (a replayed graph) must not stage into one at once.
+        self._io_lock = threading.Lock()
         if use_io_uring is None:
             use_io_uring = os.getenv(_IO_URING_ENV, "1") != "0"
         self.device = torch.device(device) if device is not None else torch.device(
@@ -162,6 +168,14 @@ class EngramTier:
                 [loc.scale_path], [0], [loc.scale_base], loc.rows, loc.scale_cols, loc.scale_cols, use_io_uring
             )
         self._allocate()
+        # The CUDA-graph path (see engram_fetch): a captured gather cannot D2H its row ids, so it
+        # hand-shakes with a host service thread over a doorbell instead. Off unless there is a
+        # device to capture on.
+        self._graph_bridge = None
+        if self.device.type == "cuda" and os.getenv("FREETOKEN_ENGRAM_FETCH", "1") != "0":
+            from .engram_fetch import EngramGraphFetch
+
+            self._graph_bridge = EngramGraphFetch(self, k_max=self.graph_rows)
 
     # ------------------------------------------------------------------ staging
 
@@ -210,13 +224,34 @@ class EngramTier:
         shape = rows.shape
         flat = rows.reshape(-1)
         n = int(flat.numel())
-        if n > self.max_rows:
-            raise ValueError(
-                f"engram gather of {n} rows exceeds the {self.max_rows}-row staging buffer; "
-                "raise EngramTier(max_rows=...) or gather in chunks"
-            )
         if n == 0:
             return torch.zeros(*shape, self.dim, dtype=torch.bfloat16, device=self.device)
+        if (
+            self._graph_bridge is not None
+            and self.device.type == "cuda"
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            return self._gather_graphed(layer_index, shape, flat, n)
+        if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            # No bridge (FREETOKEN_ENGRAM_FETCH=0, or a non-CUDA device) while capturing: the
+            # eager round trip below starts with a D2H, which CUDA refuses inside capture. Say
+            # so here instead of letting the driver raise mid-graph.
+            raise RuntimeError(
+                "engram gather inside CUDA graph capture needs the doorbell bridge "
+                "(models/deepseek_v41/engram_fetch.py), which FREETOKEN_ENGRAM_FETCH=0 "
+                "disables; relaunch with --cuda-graph-max-bs 0 or re-enable the bridge"
+            )
+        # Chunked: one forward can hash more rows than the staging buffer holds (a 4096-token
+        # prefill gathers 24576 of them), and the staging is what the round trip is sized by.
+        out = torch.empty(n, self.dim, dtype=torch.bfloat16, device=self.device)
+        for start in range(0, n, self.max_rows):
+            stop = min(start + self.max_rows, n)
+            out[start:stop] = self._gather_eager(loc, flat[start:stop])
+        return out.view(*shape, self.dim)
+
+    def _gather_eager(self, loc: EngramTableLocation, flat: torch.Tensor) -> torch.Tensor:
+        """One synchronous round trip: D2H the row ids, preadv the rows, H2D, dequant."""
+        n = int(flat.numel())
         local = flat.detach().to(device="cpu", dtype=torch.int64).contiguous()
         out_of_range = (local < 0) | (local >= loc.rows)
         ids = local.masked_fill(out_of_range, 0)
@@ -225,11 +260,12 @@ class EngramTier:
         scale_store = self._scale_stores[loc.layer_id]
         staged_w = self._pinned_w[: n * self.dim]
         staged_s = self._pinned_s[: n * self._scale_cols]
-        weight_store.stage_rows(ids.data_ptr(), n, staged_w.data_ptr(), 0)
-        scale_store.stage_rows(ids.data_ptr(), n, staged_s.data_ptr(), 0)
-        # one batched round trip for both tensors; the copies below then see finished host memory
-        weight_store.flush(0)
-        scale_store.flush(0)
+        with self._io_lock:
+            weight_store.stage_rows(ids.data_ptr(), n, staged_w.data_ptr(), 0)
+            scale_store.stage_rows(ids.data_ptr(), n, staged_s.data_ptr(), 0)
+            # one batched round trip for both tensors; the copies below then see finished host memory
+            weight_store.flush(0)
+            scale_store.flush(0)
         dev_w = self._dev_w[: n * self.dim].copy_(staged_w, non_blocking=True)
         dev_s = self._dev_s[: n * self._scale_cols].copy_(staged_s, non_blocking=True)
 
@@ -238,6 +274,27 @@ class EngramTier:
         values = values.unflatten(-1, (-1, self.block)) * scales.unsqueeze(-1)
         values = values.flatten(-2).to(torch.bfloat16)
         values = values.masked_fill(out_of_range.to(self.device).unsqueeze(-1), 0)
+        return values
+
+    def _gather_graphed(
+        self, layer_index: int, shape: torch.Size, flat: torch.Tensor, n: int
+    ) -> torch.Tensor:
+        """A captured replay's gather: hand the ids to the doorbell and pull staged rows.
+
+        Nothing here may touch the host: the ids stay on the device (they are hashed inside the
+        graph from the tokens being replayed), the request block reaches the service thread
+        through a captured D2H node, and the rows come back through captured H2D nodes gated by
+        the spin kernel. Rows the request marks out of range are zeroed host-side, so unlike the
+        eager path there is no mask to apply.
+        """
+        bridge = self._graph_bridge
+        bridge.stage_gather(layer_index, flat.to(torch.int64).contiguous(), n)
+        dev_w = bridge.out_w[: n * self.dim]
+        dev_s = bridge.out_s[: n * self._scale_cols]
+        values = dev_w.view(n, self.dim).view(torch.float8_e4m3fn).float()
+        scales = dev_s.view(n, self._scale_cols).view(torch.float8_e8m0fnu).float()
+        values = values.unflatten(-1, (-1, self.block)) * scales.unsqueeze(-1)
+        values = values.flatten(-2).to(torch.bfloat16)
         return values.view(*shape, self.dim)
 
     def describe(self) -> str:

@@ -71,6 +71,36 @@ def _bytes(t: torch.Tensor) -> bytes:
     return t.contiguous().view(torch.uint8).numpy().tobytes()
 
 
+def _no_host_read(self, loc, flat):
+    raise AssertionError("a captured gather must not take the eager D2H path")
+
+
+class _FakeBridge:
+    """``EngramGraphFetch`` minus the CUDA: stages the requested rows into private device buffers.
+
+    The real bridge hands the ids to a host thread and serves rows out of pinned memory; here the
+    rows come straight from the shard's bytes, so what is checked is the routing, the row count the
+    request carries and the dequantization -- not the transport.
+    """
+
+    def __init__(self, weights: torch.Tensor, scales: torch.Tensor) -> None:
+        self._w = weights
+        self._s = scales
+        self.calls: list[tuple[int, list[list[int]], int]] = []
+        self.out_w = torch.zeros(weights.numel(), dtype=torch.uint8)
+        self.out_s = torch.zeros(scales.numel(), dtype=torch.uint8)
+
+    def stage_gather(self, layer_index: int, ids: torch.Tensor, n: int) -> None:
+        self.calls.append((layer_index, ids[:n].tolist(), n))
+        rows = ids[:n]
+        bad = (rows < 0) | (rows >= self._w.shape[0])
+        safe = rows.clamp(0, self._w.shape[0] - 1)
+        w = self._w[safe].masked_fill(bad[:, None], 0)
+        s = self._s[safe].masked_fill(bad[:, None], 0)
+        self.out_w[: n * self._w.shape[1]] = w.reshape(-1)
+        self.out_s[: n * self._s.shape[1]] = s.reshape(-1)
+
+
 @pytest.fixture(scope="module")
 def fake_checkpoint(tmp_path_factory):
     """Two engram layers, 40 and 24 rows, one shard -- the two layers do NOT share a row count."""
@@ -134,12 +164,65 @@ def test_out_of_range_and_negative_rows_read_as_zero(fake_checkpoint):
     assert not torch.equal(got[2], torch.zeros(dim, dtype=torch.bfloat16))
 
 
-def test_a_full_staging_buffer_is_allowed_and_one_row_too_many_is_not(fake_checkpoint):
-    folder, _, _, _ = fake_checkpoint
+def test_a_gather_larger_than_the_staging_buffer_is_chunked(fake_checkpoint):
+    """A 4096-token prefill gathers 24576 rows; the staging buffer is sized for one round trip, not
+    for a whole forward, so the over-long gather has to be split rather than refused."""
+    folder, dim, weights, scales = fake_checkpoint
     tier = EngramTier(folder, [1], device="cpu", max_rows=6, use_io_uring=False)
-    tier.gather(0, torch.arange(6))  # exactly the buffer
-    with pytest.raises(ValueError, match="exceeds the 6-row staging buffer"):
-        tier.gather(0, torch.arange(7))
+    resident = ResidentEngramTable(_as_fp8(weights[1]), _as_e8m0(scales[1]))
+
+    sizes: list[int] = []
+    eager = EngramTier._gather_eager
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        EngramTier, "_gather_eager", lambda self, loc, flat: (sizes.append(int(flat.numel())), eager(self, loc, flat))[1]
+    )
+    try:
+        rows = torch.arange(13) % 40  # 13 rows through a 6-row buffer: 6 + 6 + 1
+        got = tier.gather(0, rows)
+    finally:
+        monkeypatch.undo()
+    assert sizes == [6, 6, 1]
+    assert torch.equal(got, resident.gather(rows))
+    # a chunk boundary must not drop or duplicate a row
+    assert torch.equal(got[6], resident.gather(rows[6:7])[0])
+
+
+def test_a_captured_gather_goes_through_the_doorbell_and_never_reads_the_host(fake_checkpoint):
+    """Inside a capture the ids cannot leave the device, so ``gather`` must hand them to the bridge.
+
+    The bridge is faked out (the real one needs CUDA); what is under test is the routing and the
+    dequant of the staged rows, and that the eager D2H path is not reachable from a capture.
+    """
+    folder, dim, weights, scales = fake_checkpoint
+    tier = EngramTier(folder, [1], device="cpu", max_rows=64, use_io_uring=False)
+    resident = ResidentEngramTable(_as_fp8(weights[1]), _as_e8m0(scales[1]))
+    bridge = _FakeBridge(weights[1], scales[1])
+    tier.device = torch.device("cuda")  # the branch keys off the tier's device, not a real one
+    tier._graph_bridge = bridge
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        patch.setattr(EngramTier, "_gather_eager", _no_host_read)
+        # an id the table does not have: the host side zeroes it, so the graph needs no mask
+        rows = torch.tensor([[-1, 0, 3], [39, 40, 7]])
+        got = tier.gather(0, rows)
+    assert bridge.calls == [(0, [-1, 0, 3, 39, 40, 7], 6)]  # the request carries the flat ids
+    assert got.shape == (2, 3, dim)
+    assert torch.equal(got, resident.gather(rows))
+
+
+def test_a_capture_without_the_bridge_says_so_instead_of_hitting_the_driver(fake_checkpoint):
+    """FREETOKEN_ENGRAM_FETCH=0 plus graphs on must fail loudly, not inside the D2H."""
+    folder, _, _, _ = fake_checkpoint
+    tier = EngramTier(folder, [1], device="cpu", max_rows=64, use_io_uring=False)
+    tier.device = torch.device("cuda")
+    tier._graph_bridge = None
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="needs the doorbell bridge"):
+            tier.gather(0, torch.zeros(2, 3, dtype=torch.int64))
 
 
 def test_an_empty_gather_does_not_touch_the_disk(fake_checkpoint):

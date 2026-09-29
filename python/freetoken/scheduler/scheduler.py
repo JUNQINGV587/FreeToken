@@ -940,7 +940,7 @@ class Scheduler(SchedulerIOMixin):
         config = self.config
         mc = config.model_config
         num_swa_pages = None
-        if getattr(mc, "dsv4_args", None) is not None:
+        if getattr(mc, "dsv4_args", None) is not None or getattr(mc, "dsv41_args", None) is not None:
             sizes = getattr(eng.kv_cache, "sizes", None)
             if sizes is not None:  # usable window pages = physical n_win_pages minus the dummy page
                 num_swa_pages = max(0, sizes.n_win_pages - 1)

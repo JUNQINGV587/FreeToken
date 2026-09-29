@@ -165,6 +165,8 @@ def _required_attn_types(model_config) -> frozenset[AttnType]:
     if specs_fn is None:
         if getattr(model_config, "dsv4_args", None) is not None:
             return frozenset({AttnType.DSV4})
+        if getattr(model_config, "dsv41_args", None) is not None:
+            return frozenset({AttnType.DSV41})
         return frozenset({AttnType.FULL})
     types = frozenset(
         spec.attn_type for spec in specs_fn() if spec.attn_type.backend_driven
@@ -203,6 +205,8 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
+    if AttnType.DSV41 in required:
+        candidates.append(("dsv41_sparse", True))
     if required & {AttnType.MLA, AttnType.DSA}:
         candidates.append(("dsa", True))
     if AttnType.BSA in required:
@@ -251,12 +255,14 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
         info = attention_backend_info(part)
         missing = required - info.supported_types
         if missing:
+            # Derived from the registry, not a hardcoded list: a name in this message must be
+            # one a caller can actually pass (an unregistered optional backend would otherwise
+            # turn this diagnostic into a KeyError for every rejected combination).
+            from freetoken.attention import SUPPORTED_ATTENTION_BACKENDS
+
             valid = [
                 name
-                for name in (
-                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse",
-                    "qsa_sparse",
-                )
+                for name in SUPPORTED_ATTENTION_BACKENDS.supported_names()
                 if required <= attention_backend_info(name).supported_types
             ]
             missing_names = "/".join(sorted(t.value for t in missing))
@@ -1459,9 +1465,11 @@ class Engine:
         restore it afterwards so padded decode graph replay keeps using the
         dedicated dummy KV slot.
         """
-        if AttnType.DSV4 in _required_attn_types(self.config.model_config):
-            # DSV4 prefill reads pool.full_loc_map, which only the scheduler's paged allocation fills
-            logger.info_rank0("Prefill warmup skipped for DSV4.")
+        required = _required_attn_types(self.config.model_config)
+        if AttnType.DSV4 in required or AttnType.DSV41 in required:
+            # DSV4/DSV4.1 prefill reads pool.full_loc_map, which only the scheduler's paged
+            # allocation fills
+            logger.info_rank0("Prefill warmup skipped for DSV4/DSV4.1.")
             return
         warmup_lens = self._warmup_prefill_lens()
         if not warmup_lens:
@@ -1676,6 +1684,66 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
             dropped = [bs for bs in config.cuda_graph_bs if bs > mr]
             logger.warning_rank0(
                 f"dropping cuda_graph_bs entries {dropped} above DSV4 max_running_req {mr} "
+                "(larger decode batches never occur)."
+            )
+            override("cuda_graph_bs", kept)
+
+
+def _adjust_dsv41_config(config: EngineConfig, override) -> None:
+    """DSV4.1 engine-config reconciliation at config-resolution time (before the pool exists).
+
+    Same shape as ``_adjust_dsv4_config``: sync the resolved runtime config into ``dsv41_args``,
+    make page_size the window page P, force single-chunk prefill, and clamp the decode-graph batch
+    sizes to the rows the backend's snapshot holds. Two differences:
+
+    * P is still the window page (window == reuse granularity), but the compressed/state tiers
+      belong to a band's KV source and are shared BY IDENTITY across that band (3-7 <- 2,
+      9-13 <- 8, 15-19 <- 14, 21-39 <- 20), so they do not scale with the layer count the way
+      DSV4's per-layer shadows do -- ``dsv41_cost_model`` sizes them per source.
+    * Cross-request prefix reuse is NOT enabled yet: a matched prefix would hand one request the
+      band-shared compressed rows another request is still writing, and there is no band-level
+      reference count to release them with. M5 boots the no-reuse path (the pool's swa currency
+      rides swa_paged either way); honoring 'radix' would be a correctness bug, not an
+      optimization, so it is reported and overridden.
+    """
+    model_config = config.model_config
+    model_config.dsv41_args.max_seq_len = config.max_seq_len
+    model_config.dsv41_args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    # DSV4.1's KV page IS the P-token window page (window == radix reuse granularity), so
+    # max_num_tokens = num_pages * page_size holds like every model.
+    P = model_config.dsv41_args.window_size
+    override("page_size", P)
+    logger.info_rank0(f"DSV4.1 KV pages are {P}-token window pages; page_size set to {P}")
+    if getattr(config, "cache_type", "radix") != "naive":
+        requested_cache = getattr(config, "cache_type", "radix")
+        logger.warning_rank0(
+            "DeepSeek-V4.1 compressed rows are shared by identity across an attention band and "
+            f"have no cross-request release policy yet; overriding cache_type "
+            f"{requested_cache!r} -> 'naive' (no prefix reuse) for correctness."
+        )
+        override("cache_type", "naive")
+    # Same reason as DSV4: don't let max_extend_tokens force a second chunk within one prompt
+    # (the pool's prefill_chunk_budget still chunks prompts larger than the window pool);
+    # prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
+    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
+        override("max_extend_tokens", config.max_seq_len)
+
+    # The DSV4.1 decode snapshot is sized to max_running_req rows, so a graph bs above it would
+    # index past the captured rows. Clamp any oversized explicit list / max_bs here (before
+    # GraphRunner ever sees it).
+    mr = config.max_running_req
+    if config.cuda_graph_max_bs is not None and config.cuda_graph_max_bs > mr:
+        logger.warning_rank0(
+            f"cuda_graph_max_bs {config.cuda_graph_max_bs} exceeds DSV4.1 max_running_req {mr}; "
+            "clamping to max_running_req (larger decode batches never occur)."
+        )
+        override("cuda_graph_max_bs", mr)
+    if config.cuda_graph_bs is not None:
+        kept = [bs for bs in config.cuda_graph_bs if bs <= mr]
+        if kept != list(config.cuda_graph_bs):
+            dropped = [bs for bs in config.cuda_graph_bs if bs > mr]
+            logger.warning_rank0(
+                f"dropping cuda_graph_bs entries {dropped} above DSV4.1 max_running_req {mr} "
                 "(larger decode batches never occur)."
             )
             override("cuda_graph_bs", kept)
@@ -1910,6 +1978,7 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    is_dsv41 = getattr(model_config, "dsv41_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
@@ -1953,6 +2022,9 @@ def _adjust_config(config: EngineConfig):
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
+
+    if is_dsv41:
+        _adjust_dsv41_config(config, override)
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
@@ -2241,7 +2313,7 @@ def _adjust_config(config: EngineConfig):
     # DSV4 is exempt: it sizes its own table from the resolved max_seq_len (_adjust_dsv4_config).
     rotary = getattr(model_config, "rotary_config", None)
     seq_override = getattr(config, "max_seq_len_override", None)
-    if seq_override is not None and rotary is not None and not is_dsv4:
+    if seq_override is not None and rotary is not None and not (is_dsv4 or is_dsv41):
         if seq_override > rotary.max_position:
             raise ValueError(
                 f"--max-seq-len-override {seq_override} exceeds the model's "

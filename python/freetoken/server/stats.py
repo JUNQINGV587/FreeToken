@@ -191,11 +191,12 @@ def _resolved_page_size(state: Any, config: Any) -> int:
 
 
 def _swa_page_size(config: Any) -> int:
-    """The window pool's own page unit: P (window_size) for DSV4, 1 token for radix-SWA.
+    """The window pool's own page unit: P (window_size) for DSV4 / DSV4.1, 1 token for radix-SWA.
     Mirrors compute_cache_pools' swa_page_size."""
-    dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None)
-    if dsv4 is not None:
-        return int(getattr(dsv4, "window_size", 0) or 1)
+    mc = getattr(config, "model_config", None)
+    args = getattr(mc, "dsv4_args", None) or getattr(mc, "dsv41_args", None)
+    if args is not None:
+        return int(getattr(args, "window_size", 0) or 1)
     return 1
 
 

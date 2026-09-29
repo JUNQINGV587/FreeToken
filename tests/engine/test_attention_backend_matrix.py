@@ -65,6 +65,16 @@ def _model_config(kind):
     elif kind == "dsv4":
         mc.dsv4_args = SimpleNamespace(window_size=128)
         specs = (_spec("dsv4", AttnType.DSV4, sliding_window=128),)
+    elif kind == "dsv41":
+        # V4.1: the same window page, but the compressed/state/index tiers are owned by the
+        # band's KV source (2/8/14/20) and shared by identity across the band.
+        mc.dsv41_args = SimpleNamespace(
+            window_size=128,
+            compress_ratios=(0, 2, 2, 1),
+            kv_source_layers=(2,),
+            index_source_layers=(2,),
+        )
+        specs = (_spec("dsv41", AttnType.DSV41, sliding_window=128),)
     elif kind == "bsa":
         # MiniMax-M3 shape: one FULL-family group, mla=False + index dims -> BSA.
         specs = (_spec("full", AttnType.BSA, index_head_dim=128),)
@@ -114,6 +124,7 @@ def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
         ("mla", "dsa"),  # plain latent MLA
         ("dsa", "dsa"),  # MLA + DSA indexer (GLM-5.2 shape)
         ("dsv4", "dsv4_sparse"),
+        ("dsv41", "dsv41_sparse"),
         ("bsa", "m3_sparse"),  # MiniMax-M3 block-sparse GQA
         ("qsa", "qsa_sparse"),  # Qwen3.8-Flash-Next compressed-block sparse
     ],
@@ -190,6 +201,28 @@ def test_auto_dsv4_sets_window_page_size(monkeypatch):
     config = _config("dsv4", attention_backend="auto")
     _adjust_config(config)
     assert config.page_size == 128
+
+
+def test_auto_dsv41_sets_window_page_and_refuses_prefix_reuse(monkeypatch):
+    # V4.1's KV page is the P-token window page (page_size must be P, not 1), and cross-request
+    # reuse is not enabled yet: the compressed rows of a band are shared by identity with no
+    # band-level refcount, so a radix hit would hand one request rows another is still writing.
+    # Honoring the default 'radix' would be a correctness bug -> it is overridden to 'naive'.
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("dsv41", attention_backend="auto")
+    _adjust_config(config)
+    assert config.page_size == 128
+    assert config.cache_type == "naive"
+
+    # An explicit request for reuse is reported and overridden too, not silently lost.
+    # ('cache_type' is not an EngineConfig field: the scheduler resolves it and the engine
+    # reconciles it, so it is set the same way _adjust_config overrides it.)
+    config = _config("dsv41", attention_backend="auto")
+    object.__setattr__(config, "cache_type", "swa_radix")
+    _adjust_config(config)
+    assert config.cache_type == "naive"
 
 
 @pytest.mark.parametrize(

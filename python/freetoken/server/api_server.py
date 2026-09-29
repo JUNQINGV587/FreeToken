@@ -627,7 +627,11 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
         or pools.get("num_pages", 0) or 0
     )
     page_size = int(pools.get("page_size", 0) or getattr(config, "page_size", 1) or 1)
-    is_dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None) is not None
+    _mc = getattr(config, "model_config", None)
+    is_dsv4 = (
+        getattr(_mc, "dsv4_args", None) is not None
+        or getattr(_mc, "dsv41_args", None) is not None
+    )
     swa_page_size = page_size if is_dsv4 else 1
     window_tokens = int(round(req.swa_full_tokens_ratio * num_pages * page_size))
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
@@ -832,7 +836,11 @@ def cache_geometry(state: Any) -> dict:
     swa_full_tokens_ratio = float(getattr(state, "swa_full_tokens_ratio", 0.0) or 0.0)
     last_swa_pages = last.get("num_swa_pages")
     if last_swa_pages:
-        is_dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None) is not None
+        _mc = getattr(config, "model_config", None)
+        is_dsv4 = (
+            getattr(_mc, "dsv4_args", None) is not None
+            or getattr(_mc, "dsv41_args", None) is not None
+        )
         full = num_pages if is_dsv4 else num_pages * page_size
         if full > 0:
             swa_full_tokens_ratio = min(1.0, last_swa_pages / full)

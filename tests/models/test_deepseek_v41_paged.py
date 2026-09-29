@@ -76,6 +76,11 @@ def _pool_and_backend(args, device):
 
     ctx = _ctx()
     ctx.kv_cache = pool
+    # This toy pool is 16 pages, so its derived chunk budget is one page -- but the tests here pack
+    # a whole prompt into one ragged prefill row, which a real engine only does up to the budget it
+    # hands the scheduler. Model it as "the whole pool", so the packed-row buffers are sized by the
+    # budget (the production invariant) rather than silently overrun by the harness.
+    pool._chunk_budget = NUM_PAGES * PAGE
     # the backend's __init__ reads ctx.kv_cache.device, so it comes after the pool is attached
     backend = DSV41SparseAttnBackend(SimpleNamespace(dsv41_args=args))
     ctx.attn_backend = backend

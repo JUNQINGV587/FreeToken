@@ -170,7 +170,10 @@ class Attention(BaseOP):
         if self.compressor is not None:
             self.compressor.bind_paged(self.layer_id, self._freqs_cis, tier="attn")
         if self.indexer is not None:
-            self.indexer.bind_paged(self.layer_id, self._freqs_cis, device)
+            self.indexer.bind_paged(
+                self.layer_id, self._freqs_cis, device,
+                chunk=getattr(pool, "prefill_chunk_budget", None),
+            )
 
     def reset(self) -> None:
         """Drop the per-sequence state: window/compressed rings, the compressor carry and the
@@ -346,6 +349,13 @@ class Attention(BaseOP):
         ``(offset, n, table_idx, start_pos)`` per request, tiling [0, T). Returns [1, T, dim]."""
         assert self._paged, "prefill_ragged is the paged path; bind the layer with a pool"
         total = x.size(1)
+        if self.indexer is not None:
+            # The candidate mask is prefill-only and data-dependent: size it for THIS row (the
+            # packed batch) and THIS row's reach in compressed blocks, before any layer slices it.
+            reach = max(start_pos + n for _, n, _, start_pos in segments)
+            self._runtime.prepare_candidates(
+                row=total, blocks=reach // self.band_ratio, device=x.device
+            )
         if len(segments) == 1:
             freqs = self._freqs_cis[segments[0][3] : segments[0][3] + total]
         else:
@@ -427,11 +437,11 @@ class Attention(BaseOP):
             if self.indexer is not None:
                 blocks = self.indexer.decode_paged(x, qr, latent, pos, n_stage, rows)
             else:
-                assert self._runtime.topk_idxs is not None, (
+                assert self._runtime.topk_idxs_decode is not None, (
                     f"layer {self.layer_id} reads its band's picks but source "
                     f"{self.kv_source_layer} has no indexer"
                 )
-                blocks = self._runtime.topk_idxs[:bsz, :1, : min(self.index_topk, n_stage)]
+                blocks = self._runtime.topk_idxs_decode[:bsz, :1, : min(self.index_topk, n_stage)]
             if latent is not None:
                 self.compressor.store_decode(latent, rows, pos, completed)
             compress_idxs = self.attn.blocks_to_global(blocks, ratio, rows=rows)

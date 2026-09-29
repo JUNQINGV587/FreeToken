@@ -44,27 +44,57 @@ class SharedAttentionRuntime:
         self.index_k: torch.Tensor | None = None
         self.candidates: torch.Tensor | None = None
         self.topk_idxs: torch.Tensor | None = None
+        self.topk_idxs_decode: torch.Tensor | None = None
 
     def reset(self) -> None:
         self.compress_kv = None
         self.index_k = None
         self.candidates = None
         self.topk_idxs = None
+        self.topk_idxs_decode = None
 
-    def bind_paged(self, *, max_batch: int, max_seq_len: int, topk: int, device) -> None:
+    def bind_paged(self, *, max_batch: int, max_prefill: int, topk: int, device) -> None:
         """Fixed-shape publish buffers, written in place: a captured graph bakes their addresses.
 
         Only the first index source of the model allocates them; every later band reuses the same
-        two tensors, which is what lets a consumer layer hold a view of what its source published.
+        tensors, which is what lets a consumer layer hold a view of what its source published.
         The shape check (rather than ``is None``) also clears a buffer a previous EAGER pass left
         behind -- the eager indexer stores its own ``[b, s, topk]`` picks on the same runtime.
+
+        The token axis is the *packed prefill row*, never ``max_seq_len``: a ragged prefill views
+        its whole batch as ONE row (``[1, T]``), while decode runs one token per request row. The
+        two modes are lopsided in opposite directions, so a single ``[max_batch, max_seq_len,
+        topk]`` tensor multiplies two maxima that never coexist -- 80 x 65536 x 512 int32 is 10 GiB
+        for a buffer whose live slice is either ``[1, chunk, topk]`` or ``[B, 1, topk]``.
+        ``max_prefill`` is the pool's ``prefill_chunk_budget`` (what the scheduler caps a chunk by),
+        not the config's ``max_seq_len``, which the engine deliberately raises past it.
+
+        The candidate mask is deliberately NOT here: it is prefill-only and data-dependent, so
+        ``prepare_candidates`` sizes it per prefill (a capture must not fault in GiB of bool).
         """
-        shape = (max_batch, max_seq_len, topk)
+        shape = (1, max_prefill, topk)
         if self.topk_idxs is None or tuple(self.topk_idxs.shape) != shape:
             self.topk_idxs = torch.zeros(*shape, dtype=torch.int32, device=device)
-        want = (1, max_seq_len, max_seq_len)
-        if self.candidates is None or tuple(self.candidates.shape) != want:
-            # one entry per compressed position; ratio >= 1 makes max_seq_len an upper bound
+        decode = (max_batch, 1, topk)
+        if self.topk_idxs_decode is None or tuple(self.topk_idxs_decode.shape) != decode:
+            self.topk_idxs_decode = torch.zeros(*decode, dtype=torch.int32, device=device)
+
+    def prepare_candidates(self, *, row: int, blocks: int, device) -> None:
+        """Size the candidate mask for THIS prefill row (one packed row per forward).
+
+        The mask is the one publish buffer no captured graph can see: it is written and read only
+        inside a ragged prefill, and its two live axes are the packed row's width and the row's
+        reach in compressed blocks -- both data-dependent, and ``row x max_seq_len`` is GiB of bool
+        for a mask that a decode graph never touches. So it is allocated here, per prefill, instead
+        of baked at bind time. It is still SHARED across the band: the candidate source writes it
+        and every later index source slices it by its own ``off``, which is why the token axis is
+        the packed row and not the segment.
+        """
+        if blocks <= 0 or row <= 0:
+            return
+        want = (1, row, blocks)
+        cur = self.candidates
+        if cur is None or cur.size(1) < row or cur.size(2) < blocks:
             self.candidates = torch.zeros(*want, dtype=torch.bool, device=device)
 
 
@@ -208,12 +238,14 @@ class Indexer(BaseOP):
         """The paged backend. Read live, like the pool: a runtime rebuild needs no unbind."""
         return get_global_ctx().attn_backend
 
-    def bind_paged(self, layer_id: int, freqs_cis: torch.Tensor, device) -> None:
+    def bind_paged(self, layer_id: int, freqs_cis: torch.Tensor, device, chunk: int | None = None) -> None:
         self.layer_id = layer_id
         self._freqs_cis = freqs_cis
         self.runtime.bind_paged(
-            max_batch=self.max_batch_size, max_seq_len=self.max_seq_len,
-            topk=self.index_topk, device=device,
+            max_batch=self.max_batch_size,
+            max_prefill=chunk or self.max_seq_len,
+            topk=self.index_topk,
+            device=device,
         )
         if self.owns_k:
             # only the band's KV source owns the tiers: a consumer's bind must not reset them
@@ -231,6 +263,11 @@ class Indexer(BaseOP):
         starts, so a consumer must find its own segment's picks, not the last segment's.
         """
         n, topk = idxs.size(1), idxs.shape[-1]
+        assert off + n <= self.runtime.topk_idxs.size(1), (
+            f"indexer: segment [{off}, {off + n}) exceeds the packed prefill buffer "
+            f"{tuple(self.runtime.topk_idxs.shape)} -- the pool's prefill_chunk_budget and this "
+            f"bind are out of sync"
+        )
         view = self.runtime.topk_idxs[: idxs.size(0), off : off + n, :topk]
         view.copy_(idxs)
         return view
@@ -323,8 +360,8 @@ class Indexer(BaseOP):
         ).view(bsz, 1, n_stage)
         topk = min(self.index_topk, n_stage)
         blocks = self.attn.indexer_select_decode(scores, valid=valid, topk=topk, offset=0)
-        self.runtime.topk_idxs[:bsz, :1, :topk].copy_(blocks)
-        return self.runtime.topk_idxs[:bsz, :1, :topk]
+        self.runtime.topk_idxs_decode[:bsz, :1, :topk].copy_(blocks)
+        return self.runtime.topk_idxs_decode[:bsz, :1, :topk]
 
 
 __all__ = ["Indexer", "SharedAttentionRuntime"]

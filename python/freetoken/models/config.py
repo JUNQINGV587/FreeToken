@@ -372,6 +372,11 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Where the checkpoint came from (a model's parse_config reads hf_config._name_or_path).
+    # Set by models that have to read something straight off disk at load time instead of out of a
+    # tensor: DSV4.1's two 94 GiB engram tables and the tokenizer.json its n-gram hash is built
+    # from. None for models that only ever load tensors.
+    checkpoint_path: str | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

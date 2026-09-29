@@ -13,6 +13,11 @@ time" lands where a single pass lands, which only holds if every cache above is 
 
 from __future__ import annotations
 
+import json
+import os
+import struct
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -202,3 +207,161 @@ def test_the_engram_layer_is_the_only_one_and_reaches_the_output(monkeypatch):
     assert not torch.allclose(with_engram, without, rtol=1e-3, atol=1e-3), (
         "the engram contribution never reached the logits"
     )
+
+
+def _set_tp_info() -> None:
+    from freetoken.distributed.info import get_tp_info, set_tp_info
+
+    try:  # the tp info is process-global: another test may already have set it
+        get_tp_info()
+    except RuntimeError:
+        set_tp_info(rank=0, size=1)
+
+
+def _write_engram_checkpoint(folder: str, args: DeepseekV41Args) -> str:
+    """A checkpoint directory holding only what the adapter reads OFF DISK: ``tokenizer.json`` and
+    the engram shards its index points at.
+
+    The tier's own file-format cases -- unaligned offsets, two layers with different row counts,
+    out-of-range rows -- live in ``test_deepseek_v41_engram_tier.py``; all this one needs is shards
+    the same reader can walk, with row-dependent values so a misread row would show up.
+    """
+    from tokenizers import Tokenizer, models
+
+    tokenizer = Tokenizer(models.WordLevel({f"tok{i}": i for i in range(VOCAB)}, unk_token=None))
+    tokenizer.save(os.path.join(folder, "tokenizer.json"))
+
+    rows, dim = sum(args.engram_num_embeddings), args.engram_head_dim
+    # e4m3 bit patterns around 0.5 (exponent 0110): valid, finite, and different per row. The
+    # all-ones exponent would be a NaN.
+    raw = torch.arange(rows * dim).reshape(rows, dim) % 8
+    weight = (raw + 0x30).to(torch.uint8)
+    scale = torch.full((rows, dim // 32), 127, dtype=torch.uint8)  # E8M0 127 is 2**0
+
+    layer_id = args.engram_layer_ids[0]
+    tensors = [
+        (f"layers.{layer_id}.engram.embed.weight", "F8_E4M3", weight, weight.numpy().tobytes()),
+        (f"layers.{layer_id}.engram.embed.scale", "F8_E8M0", scale, scale.numpy().tobytes()),
+    ]
+    header: dict[str, dict] = {}
+    blob = bytearray()
+    for name, dtype, tensor, data in tensors:
+        blob += b"\0" * ((8 - len(blob) % 8) % 8)
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(tensor.shape),
+            "data_offsets": [len(blob), len(blob) + len(data)],
+        }
+        blob += data
+    raw_header = json.dumps(header, separators=(",", ":")).encode()
+    raw_header += b" " * ((8 - len(raw_header) % 8) % 8)
+    shard = "model-00001-of-00001.safetensors"
+    with open(os.path.join(folder, shard), "wb") as handle:
+        handle.write(struct.pack("<Q", len(raw_header)) + raw_header + bytes(blob))
+    with open(os.path.join(folder, "model.safetensors.index.json"), "w") as handle:
+        json.dump(
+            {
+                "metadata": {"total_size": len(blob)},
+                "weight_map": {tensor[0]: shard for tensor in tensors},
+            },
+            handle,
+        )
+    return folder
+
+
+def _adapter_config(folder: str | None, args: DeepseekV41Args) -> SimpleNamespace:
+    return SimpleNamespace(
+        dsv41_args=args,
+        quant=None,
+        moe_strategy="offload",
+        decode_target="gpu",
+        checkpoint_path=folder,
+        engram_tokenizer_path=None,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_adapter_reads_its_token_map_and_engram_rows_off_the_checkpoint_dir(
+    monkeypatch, tmp_path
+):
+    """The engine hands this class a config, not a tokenizer or a table: both have to be found in
+    the checkpoint directory, and the 94 GiB per layer table has to stay on disk while it serves."""
+    from freetoken.models.deepseek_v41.engram import ResidentEngramTable
+    from freetoken.models.deepseek_v41.engram_tier import EngramTable
+
+    device = torch.device("cuda")
+    _set_tp_info()
+    args = _args()
+    folder = _write_engram_checkpoint(str(tmp_path), args)
+    monkeypatch.setattr(model_mod, "MoE", lambda *a, **k: _StubFFN(DIM))
+    with torch_dtype(torch.bfloat16), torch.device(device):
+        adapter = model_mod.DeepseekV41ForCausalLM(_adapter_config(folder, args))
+    model = adapter.model
+
+    # the token map came out of tokenizer.json (this fake vocabulary has 256 distinct keys)
+    assert model._engram_hash is not None
+    assert model._engram_hash.token_map.numel() == VOCAB
+    assert [block.engram.layer_id for block in adapter.engram_layers()] == [1]
+
+    torch.manual_seed(7)
+    for tensor in model.state_dict().values():
+        if tensor.dtype.is_floating_point:
+            tensor.copy_(torch.randn_like(tensor.float()).to(tensor.dtype) * 0.1)
+    model.bind(device)
+
+    tier = adapter.bind_engram_tier(device, use_io_uring=False)
+    assert tier is not None and tier.device == device
+    assert tier.rows_of(0) == VOCAB and tier.dim == args.engram_head_dim
+    # each layer gets a view of the shared tier, and only the layer that has an engram block does
+    table = model.layers.op_list[1].engram.table
+    assert isinstance(table, EngramTable) and table.tier is tier and table.layer_id == 1
+    assert table.num_embeddings == VOCAB
+    assert model.layers.op_list[0].engram is None
+
+    ids = torch.randint(0, VOCAB, (2, 5), device=device)
+    served = model.forward(ids).float()
+    assert torch.isfinite(served).all()
+
+    # and the rows read off disk are what reaches the residual: an all-zero table has to move the
+    # logits, or the lookup never made it through `gather`
+    blank = ResidentEngramTable(
+        torch.zeros(VOCAB, args.engram_head_dim, dtype=torch.float8_e4m3fn),
+        torch.full((VOCAB, args.engram_head_dim // 32), 127, dtype=torch.uint8).view(
+            torch.float8_e8m0fnu
+        ),
+    ).to(device)
+    model.layers.op_list[1].engram.bind(table=blank, device=device)
+    model.reset()
+    without = model.forward(ids).float()
+    assert not torch.allclose(served, without, rtol=1e-3, atol=1e-3), (
+        "the rows served off NVMe never reached the logits"
+    )
+
+
+def test_a_model_with_engram_layers_needs_the_tokenizer_its_hash_is_built_from():
+    """Silently hashing with a different tokenizer would renumber every token, so a config that
+    names engram layers without a tokenizer is an error -- and one without them needs none."""
+    config = _adapter_config(None, _args())
+    with pytest.raises(RuntimeError, match="tokenizer.json"):
+        model_mod.resolve_engram_tokenizer(config)
+
+    plain = SimpleNamespace(dsv41_args=SimpleNamespace(engram_layer_ids=()), checkpoint_path=None)
+    assert model_mod.resolve_engram_tokenizer(plain) is None
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(os.environ.get("FT_V41_CHECKPOINT", "/mnt/nvme/models/DeepSeek-V4.1-Flash-NVFP4")),
+    reason="needs the V4.1 checkpoint",
+)
+def test_parse_config_hands_the_loader_the_checkpoint_directory():
+    from freetoken.models.deepseek_v41.config import parse_config
+    from freetoken.models.deepseek_v41.engram import build_compressed_token_map
+
+    folder = os.environ.get("FT_V41_CHECKPOINT", "/mnt/nvme/models/DeepSeek-V4.1-Flash-NVFP4")
+    config = parse_config(SimpleNamespace(_name_or_path=folder))
+    assert config.checkpoint_path == folder
+    # the real tokenizer.json is what the compressed map's size in the checkpoint was computed
+    # from -- a different tokenizer would not reproduce it
+    assert config.dsv41_args.engram_layer_ids == (1, 14)
+    _, size = build_compressed_token_map(model_mod.resolve_engram_tokenizer(config))
+    assert size == config.dsv41_args.engram_compressed_vocab_size

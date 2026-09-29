@@ -246,5 +246,47 @@ class EngramTier:
         total = sum(loc.rows * (loc.dim + loc.scale_cols) for loc in self.locations)
         return f"engram tier ({backend}, {self.device}): {rows}; {total / 2**30:.1f} GiB on disk"
 
+    def layer_index(self, layer_id: int) -> int:
+        return self.layer_ids.index(layer_id)
 
-__all__ = ["EngramTableLocation", "EngramTier", "locate_engram_tables"]
+    def view(self, layer_index: int) -> "EngramTable":
+        """One layer's slice, in the interface ``Engram.forward`` calls."""
+        return EngramTable(self, layer_index)
+
+
+class EngramTable:
+    """One engram layer's slice of an :class:`EngramTier`.
+
+    ``Engram`` asks its table for ``gather(rows)`` -- the signature the resident table has -- while
+    one tier serves every engram layer at once, so binding a tier hands each layer a view. ``to``
+    returns the view (the tier moves underneath it), which is what ``Engram.bind`` expects.
+    """
+
+    def __init__(self, tier: EngramTier, layer_index: int):
+        self.tier = tier
+        self.layer_index = layer_index
+
+    @property
+    def layer_id(self) -> int:
+        return self.tier.locations[self.layer_index].layer_id
+
+    @property
+    def num_embeddings(self) -> int:
+        return self.tier.rows_of(self.layer_index)
+
+    @property
+    def device(self):
+        return self.tier.device
+
+    def gather(self, rows: torch.Tensor) -> torch.Tensor:
+        return self.tier.gather(self.layer_index, rows)
+
+    def to(self, device) -> "EngramTable":
+        self.tier.to(device)
+        return self
+
+    def __repr__(self) -> str:
+        return f"EngramTable(layer {self.layer_id}, {self.num_embeddings} rows)"
+
+
+__all__ = ["EngramTable", "EngramTableLocation", "EngramTier", "locate_engram_tables"]

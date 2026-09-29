@@ -9,11 +9,13 @@ routed MoE -- with three differences that this package exists to carry:
   * Engram layers 1/14: an NVMe-backed 94 GiB-per-layer embedding lookup.
 
 Milestones: M1 is the eager layer-0 path (window attention + hyper-connections) validated against
-``inference/`` numerically; the MoE, the compressor/indexer, the paged backend and the EngramTier
-follow. ``DeepseekV41ForCausalLM`` stays closed until the runtime is wired (M2).
+``inference/`` numerically; the MoE, the compressor/indexer and the EngramTier followed (M2-M3).
+The paged backend and the engine batch path into ``DeepseekV41ForCausalLM.forward`` are M5.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 import torch.nn.functional as F
@@ -281,28 +283,59 @@ class Transformer(BaseOP):
 class DeepseekV41ForCausalLM(BaseLLMModel):
     """Engine entry point (registry key ``DeepseekV41ForCausalLM``).
 
-    Weight loading, config parsing and the eager transformer are wired (M0-M3). The paged CSA2
-    runtime, the NVFP4 expert cache and the EngramTier's NVMe service land with M5; until then the
-    engram layers need a table handed in (``engram_table``) and a tokenizer for the token map.
+    Weight loading, config parsing, the eager transformer and the NVMe-backed engram tables are
+    wired (M0-M3); the paged CSA2 runtime and the NVFP4 expert cache land with M5.
     """
 
     def __init__(self, config):
         self._config = config
         self._args: DeepseekV41Args = config.dsv41_args
-        tokenizer = None
-        if getattr(config, "engram_tokenizer_path", None):
-            from .engram import tokenizer_of
-
-            tokenizer = tokenizer_of(config.engram_tokenizer_path)
+        self._engram_tier = None
         self.model = Transformer(
             self._args,
             config.quant,
             strategy=config.moe_strategy,
             decode_target=config.decode_target,
             prefix="model",
-            tokenizer=tokenizer,
+            tokenizer=resolve_engram_tokenizer(config),
             engram_table=getattr(config, "engram_table", None),
         )
+
+    def engram_layers(self) -> list:
+        """The blocks that carry an engram lookup (layers 1 and 14 in this checkpoint)."""
+        return [block for block in self.model.layers.op_list if block.engram is not None]
+
+    def bind_engram_tier(self, device=None, *, model_dir: str | None = None, use_io_uring=None):
+        """Serve the engram tables off NVMe and hand them to every engram layer.
+
+        The two tables are 94 GiB each, so they are never a resident tensor: :class:`EngramTier`
+        reads the ~24 rows one decode step actually touches straight out of the checkpoint shards
+        (``gather`` per layer, synchronously -- see :mod:`engram_tier`). Returns the tier, or
+        ``None`` for a config with no engram layers. Call it once the device is known; ``bind``
+        hands the table on to each layer.
+        """
+        layers = self.engram_layers()
+        if not layers:
+            return None
+        model_dir = model_dir or getattr(self._config, "checkpoint_path", None)
+        if not model_dir:
+            raise RuntimeError(
+                "DeepseekV41ForCausalLM.bind_engram_tier needs the checkpoint directory "
+                "(ModelConfig.checkpoint_path)"
+            )
+        from .engram_tier import EngramTier
+
+        tier = EngramTier(
+            model_dir,
+            [block.engram.layer_id for block in layers],
+            device=device,
+            use_io_uring=use_io_uring,
+        )
+        for block in layers:
+            view = tier.view(tier.layer_index(block.engram.layer_id))
+            block.engram.bind(table=view, device=device)
+        self._engram_tier = tier
+        return tier
 
     def forward(self) -> torch.Tensor:
         raise NotImplementedError(
@@ -311,4 +344,37 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         )
 
 
-__all__ = ["Block", "Transformer", "DeepseekV41ForCausalLM", "make_identity_pre_mix"]
+def resolve_engram_tokenizer(config):
+    """The tokenizer the n-gram hash's token map is built from.
+
+    ``NgramHashState`` needs the authors' own tokenizer: the compressed map is a per-token
+    normalization of the vocabulary, so an equivalent-but-not-identical tokenizer silently
+    renumbers every token (see ``engram.build_compressed_token_map``). It comes from
+    ``ModelConfig.engram_tokenizer_path`` when a caller pins one -- either the ``tokenizer.json``
+    itself or the directory holding it -- else from ``tokenizer.json`` next to the checkpoint.
+    """
+    path = getattr(config, "engram_tokenizer_path", None)
+    if path and os.path.isfile(path):
+        from tokenizers import Tokenizer
+
+        return Tokenizer.from_file(path)
+    directory = path or getattr(config, "checkpoint_path", None)
+    if directory and os.path.isfile(os.path.join(directory, "tokenizer.json")):
+        from .engram import tokenizer_of
+
+        return tokenizer_of(directory)
+    if getattr(getattr(config, "dsv41_args", None), "engram_layer_ids", ()):
+        raise RuntimeError(
+            "DeepSeek-V4.1 has engram layers, whose n-gram hash needs the checkpoint's "
+            "tokenizer.json (set ModelConfig.checkpoint_path or engram_tokenizer_path)"
+        )
+    return None
+
+
+__all__ = [
+    "Block",
+    "Transformer",
+    "DeepseekV41ForCausalLM",
+    "make_identity_pre_mix",
+    "resolve_engram_tokenizer",
+]

@@ -4,7 +4,11 @@ import json
 
 import pytest
 
-from freetoken.server.function_call_parser import FunctionCallParser, SUPPORTED_TOOL_CALL_PARSERS
+from freetoken.server.function_call_parser import (
+    FunctionCallParser,
+    SUPPORTED_TOOL_CALL_PARSERS,
+    TOOLS_TAG_LIST,
+)
 
 
 TOOLS = [
@@ -247,6 +251,16 @@ def test_gpt_oss_parser_accepts_namespaced_tool_name():
             "read",
             {"filePath": "/tmp/test_calc.py"},
         ),
+        (
+            # DeepSeek-V4.1 spelling: the block is ``calls`` and every tag carries a
+            # space after the DSML token (see encoding/encoding.py tool_calls_block_name).
+            "deepseekv32",
+            "<｜DSML｜ calls><｜DSML｜ invoke name=\"read\">"
+            "<｜DSML｜ parameter name=\"filePath\" string=\"true\">/tmp/test_calc.py</｜DSML｜ parameter>"
+            "</｜DSML｜ invoke></｜DSML｜ calls>",
+            "read",
+            {"filePath": "/tmp/test_calc.py"},
+        ),
     ],
 )
 def test_parser_accepts_family_specific_tool_call_shapes(
@@ -260,6 +274,22 @@ def test_parser_accepts_family_specific_tool_call_shapes(
     assert len(result.calls) == 1
     assert result.calls[0].name == expected_name
     assert json.loads(result.calls[0].parameters) == expected_args
+
+
+def test_dsv41_block_spelling_opens_the_tool_tag_gate():
+    # generation.py hands a response to the tool parser only when one of
+    # TOOLS_TAG_LIST is present, so the V4.1 block opener must be listed or the
+    # parser is never called and the raw DSML leaks into ``content``.
+    text = (
+        "<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="glob">\n'
+        '<｜DSML｜ parameter name="pattern" string="true">*.py</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+    assert any(tag in text for tag in TOOLS_TAG_LIST)
+    parser = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="deepseekv32")
+    assert parser.has_tool_call(text) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -335,6 +365,40 @@ def test_dsv32_streaming_multi_param_args_prefix_stable():
         "pattern": "*.py",
         "path": "/src",
     }
+
+
+def test_dsv41_streaming_matches_the_v4_spelling():
+    # Same block in both generations, split mid-tag: the accumulated buffer is
+    # normalized, so a chunk boundary inside ``<｜DSML｜ calls>`` cannot hide the
+    # tag, and the V4.1 run yields the same calls/fragments as the V4 one.
+    def _run(block):
+        parser = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="deepseekv32")
+        chunks = [block[i : i + 7] for i in range(0, len(block), 7)]
+        _, calls = _feed(parser, chunks)
+        named = [c for c in calls if c.name]
+        joined = "".join(c.parameters for c in calls if c.name is None)
+        return named, joined
+
+    v4 = (
+        "<｜DSML｜function_calls>\n"
+        '<｜DSML｜invoke name="glob">\n'
+        '<｜DSML｜parameter name="pattern" string="true">*.py</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="path" string="true">/src</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜function_calls>"
+    )
+    v41 = (
+        "<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="glob">\n'
+        '<｜DSML｜ parameter name="pattern" string="true">*.py</｜DSML｜ parameter>\n'
+        '<｜DSML｜ parameter name="path" string="true">/src</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+    v4_named, v4_joined = _run(v4)
+    v41_named, v41_joined = _run(v41)
+    assert [c.name for c in v41_named] == [c.name for c in v4_named] == ["glob"]
+    assert json.loads(v41_joined) == json.loads(v4_joined) == {"pattern": "*.py", "path": "/src"}
 
 
 def test_streaming_support_flags():

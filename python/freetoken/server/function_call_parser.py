@@ -77,7 +77,9 @@ TOOLS_TAG_LIST = [
     "[TOOL_CALLS]",
     "<｜DSML｜function_calls>",
     "<｜DSML｜tool_calls>",
+    "<｜DSML｜ calls>",
     "<｜DSML｜invoke",
+    "<｜DSML｜ invoke",
     "<atem:function_calls>",
 ]
 
@@ -1624,10 +1626,54 @@ class Glm47Detector(BaseFormatDetector):
         return residual
 
 
+_DSML_TOKEN = "｜DSML｜"
+
+#: V4.1 renamed the block from ``function_calls``/``tool_calls`` to ``calls`` and
+#: spells every DSML tag with a space between the token and the tag name
+#: (``<｜DSML｜ calls>``, ``<｜DSML｜ invoke name="f">``, ``</｜DSML｜ parameter>``);
+#: V4 / V3.2 write them tight. Rewriting the V4.1 spellings onto the ones this
+#: detector already knows keeps one state machine correct for both generations.
+#: It must be applied to the ACCUMULATED buffer, so a chunk boundary that falls
+#: inside the tag (``<｜DSML｜`` + `` calls>``) still normalizes once joined.
+_DSML_CALLS_OPEN_RE = re.compile(r"<｜DSML｜\s+calls\s*>")
+_DSML_CALLS_CLOSE_RE = re.compile(r"</｜DSML｜\s+calls\s*>")
+_DSML_TAG_SPACE_RE = re.compile(r"(</?｜DSML｜)\s+(?=invoke\b|parameter\b)")
+
+
+def _normalize_dsml_tags(text: str) -> str:
+    """Fold the V4.1 DSML spellings onto the V4 ones (see the regexes above)."""
+    if _DSML_TOKEN not in text:
+        return text
+    text = _DSML_CALLS_OPEN_RE.sub(f"<{_DSML_TOKEN}tool_calls>", text)
+    text = _DSML_CALLS_CLOSE_RE.sub(f"</{_DSML_TOKEN}tool_calls>", text)
+    return _DSML_TAG_SPACE_RE.sub(r"\1", text)
+
+
+def _dsml_v41_alias(token: str) -> str | None:
+    """The V4.1 spelling of a canonical V4 DSML token, or ``None`` for other tokens.
+
+    Used for detecting an *incomplete* tag at the end of a streamed buffer: the
+    V4.1 block name (``calls``) is not a prefix of the V4 one, so the raw bytes
+    ``<｜DSML｜ calls`` would otherwise be released to the user as plain text.
+    """
+    if _DSML_TOKEN not in token:
+        return None
+    spaced = token.replace(_DSML_TOKEN, f"{_DSML_TOKEN} ")
+    for name in ("function_calls", "tool_calls"):
+        if name in spaced:
+            return spaced.replace(name, "calls")
+    return spaced
+
+
 class DeepSeekV32Detector(BaseFormatDetector):
     """
     Detector for DeepSeek V3.2 model function call format using DSML
     (DeepSeek Markup Language).
+
+    Also parses the DeepSeek V4.1 spelling of the same format: the block is
+    named ``calls`` instead of ``function_calls``/``tool_calls`` and every tag
+    carries a space after the ``｜DSML｜`` token; ``_normalize_dsml_tags`` folds
+    those onto the spellings below before parsing.
 
     Format Structure:
     ```
@@ -1696,7 +1742,21 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def block_close_tokens(self) -> tuple:
         return (self.eot_token, self.alt_eot_token)
 
+    def _partial_hold(self, buf: str, *tokens: str) -> int:
+        """Longest trailing partial of any of ``tokens``, in the V4 spelling and the
+        V4.1 one (``_dsml_v41_alias``): a buffer ending inside the V4.1 opener
+        ``<｜DSML｜ calls`` must be held back like the V4 ``<｜DSML｜tool_calls``, or
+        the raw tag streams out to the user before the block is recognized."""
+        hold = 0
+        for token in tokens:
+            hold = max(hold, self._ends_with_partial_token(buf, token))
+            alias = _dsml_v41_alias(token)
+            if alias is not None:
+                hold = max(hold, self._ends_with_partial_token(buf, alias))
+        return hold
+
     def has_tool_call(self, text: str) -> bool:
+        text = _normalize_dsml_tags(text)
         return self.bot_token in text or self.alt_bot_token in text
 
     def _param_fragment(self, index: int, name: str, is_str: str, value: str) -> str:
@@ -1734,6 +1794,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-time parsing for DSML format tool calls."""
+        text = _normalize_dsml_tags(text)
         idx = _first_existing_pos(text, [self.bot_token, self.alt_bot_token])
         normal_text = text[:idx].strip() if idx != -1 else text
         if idx == -1:
@@ -1768,7 +1829,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         argument fragments (``{"key":"`` at parameter open, escaped value chars,
         ``"`` at close, ``}`` at invoke close); non-string values buffer until the
         parameter closes because their JSON form needs the complete text."""
-        self._buffer += new_text
+        self._buffer = _normalize_dsml_tags(self._buffer + new_text)
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
@@ -1806,10 +1867,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break  # text after a call defers to the next step (wire order)
                 pos = _first_existing_pos(buf, [self.bot_token, self.alt_bot_token])
                 if pos == -1:
-                    hold = max(
-                        self._ends_with_partial_token(buf, self.bot_token),
-                        self._ends_with_partial_token(buf, self.alt_bot_token),
-                    )
+                    hold = self._partial_hold(buf, self.bot_token, self.alt_bot_token)
                     release = buf[: len(buf) - hold] if hold else buf
                     if release:
                         for e_token in (self.eot_token, self.alt_eot_token, self.invoke_end_token):
@@ -1870,10 +1928,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         logger.warning(f"Model attempted to call undefined function: {func_name}")
                         self._ds_mode = "invoke_skip"
                     continue
-                hold = max(
-                    self._ends_with_partial_token(buf, self.invoke_start_prefix),
-                    self._ends_with_partial_token(buf, self.eot_token),
-                    self._ends_with_partial_token(buf, self.alt_eot_token),
+                hold = self._partial_hold(
+                    buf, self.invoke_start_prefix, self.eot_token, self.alt_eot_token
                 )
                 if len(buf) - hold > 0:
                     self._buffer = buf[len(buf) - hold:]  # inter-invoke whitespace
@@ -1910,10 +1966,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self._param_lead = lead
                         self._ds_mode = "pbuf"
                     continue
-                hold = max(
-                    self._ends_with_partial_token(buf, param_open_token),
-                    self._ends_with_partial_token(buf, self.invoke_end_token),
-                )
+                hold = self._partial_hold(buf, param_open_token, self.invoke_end_token)
                 if len(buf) - hold > 0:
                     self._buffer = buf[len(buf) - hold:]  # whitespace between parameters
                 break
@@ -1921,7 +1974,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if self._ds_mode == "pstr":
                 end = buf.find(self.param_end_token)
                 if end == -1:
-                    hold = self._ends_with_partial_token(buf, self.param_end_token)
+                    hold = self._partial_hold(buf, self.param_end_token)
                     emit_len = len(buf) - hold
                     if emit_len > 0:
                         _emit_args(json.dumps(buf[:emit_len], ensure_ascii=False)[1:-1])

@@ -7,6 +7,19 @@ from typing import Dict, Tuple
 import torch
 from freetoken.utils import div_ceil
 
+# The id space the vendored sgl align kernel can walk. Past it the kernel writes
+# *nothing* -- ``num_tokens_post_padded`` comes back 0, so the GEMM below sees an
+# empty batch (and on some shapes the buffer holds garbage instead: the 1675-slot
+# V4.1 prefill got ``ntpp = -1694418143`` and indexed its expert banks through
+# ~1e9, i.e. an illegal memory access). Measured with --gpus on sm89:
+#   num_experts+1 <= 1024 -> correct; 1025 and up -> ntpp = 0.
+# FreeToken's own triton align has no such limit (HIST = next_pow2(num_experts+2));
+# it is correct at 1025, 1675 and 2049, for both narrow and pool-wide id sets.
+# A model's expert count (384 for V4.1) never reaches this; a *slot cache* does --
+# v41's 1675-slot shared pool routes prefill through slot ids, which is exactly the
+# id space sgl cannot take.
+_SGL_ALIGN_MAX_EXPERTS = 1023
+
 
 def _torch_fused_topk(
     gating_output: torch.Tensor,
@@ -55,7 +68,8 @@ def moe_align_block_size(
     - topk_ids: A tensor of shape [total_tokens, top_k] representing the
         top-k expert indices for each token.
     - block_size: The block size used in block matrix multiplication.
-    - num_experts: The total number of experts.
+    - num_experts: The id space ``topk_ids`` is drawn from: a model's expert count for the
+        whole-layer path, or a full slot pool for a caller that routes on cache slots.
 
     Returns:
     - sorted_token_ids: A tensor containing the sorted token indices according
@@ -86,7 +100,10 @@ def moe_align_block_size(
     """
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
-    if not is_sgl_kernel_installed():
+    # ``num_experts`` is the id space ids are drawn from, not necessarily a model's
+    # expert count: callers that pass slot-cache ids (models/deepseek_v41/moe.py) hand
+    # over the whole pool. Keep the sgl kernel only where it is known to work.
+    if not is_sgl_kernel_installed() or num_experts > _SGL_ALIGN_MAX_EXPERTS:
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,
         )

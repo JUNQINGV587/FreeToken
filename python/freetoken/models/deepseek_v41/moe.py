@@ -3,8 +3,6 @@ routed experts (ModelOpt per-16 E4M3 scales + a per-tensor ``scale_2``)."""
 
 from __future__ import annotations
 
-import logging
-
 import torch
 import torch.nn.functional as F
 
@@ -13,8 +11,6 @@ from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
 
 from .args import DeepseekV41Args
-
-logger = logging.getLogger(__name__)
 
 
 class Gate(BaseOP):
@@ -81,21 +77,11 @@ class DSV41OffloadMoELayer(OffloadMoELayer):
     decode); only the stored expert format differs, and that comes from ``quant_config``.
     """
 
-    _warned_limit = False
-
     def __init__(self, layer_id: int, args: DeepseekV41Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
-        # V4.1 trained the routed experts with swiglu_limit=10, but NONE of the NVFP4 MoE kernels
-        # can express an activation clamp (``gated_epilogue_reason`` rejects silu + limit, and b12x
-        # needs SM120); the MXFP4 kernels V4 uses do take one. Until the NVFP4 epilogue grows the
-        # clamp, the routed experts run unclamped -- a bounded, documented approximation (the
-        # shared expert below still clamps, because it is a plain GEMM + ``fused_swiglu``).
-        if args.swiglu_limit > 0 and not DSV41OffloadMoELayer._warned_limit:
-            DSV41OffloadMoELayer._warned_limit = True
-            logger.warning(
-                "deepseek_v41: routed NVFP4 experts run WITHOUT the swiglu limit %.1f -- no NVFP4 "
-                "MoE kernel supports an activation clamp yet; the shared expert is clamped.",
-                args.swiglu_limit,
-            )
+        # V4.1 trained the routed experts with swiglu_limit=10 (silu(min(gate, L)) * clamp(up, +-L)),
+        # which the shared NVFP4 epilogue now computes through ``swiglu_clamp``; the marlin and b12x
+        # kernels still cannot express it and are rejected by ``gated_epilogue_reason``, so these
+        # layers select the Triton backend.
         super().__init__(
             layer_id=layer_id,
             num_experts=args.n_routed_experts,
@@ -104,7 +90,7 @@ class DSV41OffloadMoELayer(OffloadMoELayer):
             intermediate_size=args.moe_inter_dim,
             renormalize=True,
             activation="silu",
-            limit=None,
+            limit=args.swiglu_limit if args.swiglu_limit > 0 else None,
             strategy=strategy,
             decode_target=decode_target,
             quant_config=quant_config,

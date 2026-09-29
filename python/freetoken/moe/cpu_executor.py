@@ -72,6 +72,18 @@ _ACT_IDS = {
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
 
 
+def _cpu_act_id(activation: str, swiglu_limit: float | None) -> int:
+    """The extension's act id for this epilogue.
+
+    Plain silu has no limit, so a silu expert that asks for one is really V4.1's clamped swiglu --
+    the same math as act id 4 at alpha=1. Mapping it there keeps the CPU path clamped instead of
+    silently dropping the limit it was handed.
+    """
+    if activation in ("silu", "swish") and swiglu_limit is not None and float(swiglu_limit) != float("inf"):
+        return _ACT_IDS["swiglu_clamp"]
+    return _ACT_IDS[activation]
+
+
 def compiled_extension_supports(activation: str) -> bool:
     """Whether the compiled ``_cpu_moe`` extension can serve ``activation``
     through its generic epilogue. A stale prebuilt .so accepts newer act ids
@@ -235,7 +247,7 @@ class CpuMoeExecutor:
             hidden_size=self.H,
             inter_size=self.I,
             max_tokens=self.max_tokens,
-            activation_id=_ACT_IDS[activation],
+            activation_id=_cpu_act_id(activation, swiglu_limit),
             apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
             weight_format=_WFMT_IDS[fmt],
             swiglu_alpha=float(swiglu_alpha),

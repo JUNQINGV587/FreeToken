@@ -89,7 +89,16 @@ def _swigluoai_ref(h: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) ->
     return gate * torch.sigmoid(gate * alpha) * (up + 1.0)
 
 
-def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="silu") -> torch.Tensor:
+def _silu_clamp_ref(h: torch.Tensor, limit: float) -> torch.Tensor:
+    """DeepSeek-V4.1's clamped silu (``swiglu_limit``) over UNINTERLEAVED [gate; up] halves:
+    ``silu(min(gate, L)) * clamp(up, +-L)`` -- the sigmoid sees the CLAMPED gate, unlike
+    ``_swigluoai_ref`` (whose sigmoid runs on the raw gate and which adds the +1 up bias)."""
+    gate = h[:I].clamp(max=limit)
+    up = h[I:].clamp(-limit, limit)
+    return torch.nn.functional.silu(gate) * up
+
+
+def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="silu", limit=None) -> torch.Tensor:
     """Dequant + dense per-token reference for the gated MoE (silu or swigluoai)."""
     out = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device)
     x = hidden.float()
@@ -109,6 +118,8 @@ def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="silu
             h = gu @ x[t]
             if activation == "swigluoai":
                 act = _swigluoai_ref(h)
+            elif limit is not None:
+                act = _silu_clamp_ref(h, limit)
             else:
                 act = torch.nn.functional.silu(h[:I]) * h[I:]
             out[t] += float(topk_weights[t, j]) * (dn @ act)
@@ -364,6 +375,58 @@ def test_triton_swigluoai_matches_dequant_reference():
         dec_hidden, *banks, dec_weights, dec_ids, "swigluoai", False, 1.702, 7.0
     )
     _assert_close(out, ref)
+
+
+@cuda
+def test_triton_silu_clamp_matches_dequant_reference():
+    """DeepSeek-V4.1's routed experts: plain silu with swiglu_limit=10 through the same Triton
+    prefill grouped GEMM and decode GEMV as the unclamped case. Until the epilogue grew the
+    clamp these layers had to run unclamped, so this pins the clamped numbers (and the fact
+    that the limit no longer knocks the layer off the Triton backend)."""
+    from freetoken.moe.fused_nvfp4 import (
+        fused_experts_decode_nvfp4_marlin,
+        fused_experts_nvfp4,
+    )
+
+    LIMIT = 10.0
+    device = torch.device("cuda")
+    sources = _make_native_sources(device, seed=13)
+    torch.manual_seed(14)
+    M = 8
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) * 3
+    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device)
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    layer_id = 0
+    banks = [
+        sources[name][layer_id].to(device)
+        for name in (
+            "gate_up_packed", "gate_up_scale", "gate_up_global",
+            "down_packed", "down_scale", "down_global",
+        )
+    ]
+    ref = _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, limit=LIMIT)
+    out = fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E, "silu", False, 1.0, LIMIT)
+    _assert_close(out, ref)
+
+    dec_hidden = hidden[:1]
+    dec_ids = topk_ids[:1]
+    dec_weights = topk_weights[:1]
+    ref = _ref_moe(sources, layer_id, dec_hidden, dec_weights, dec_ids, limit=LIMIT)
+    out = fused_experts_decode_nvfp4_marlin(dec_hidden, *banks, dec_weights, dec_ids, "silu", False, 1.0, LIMIT)
+    _assert_close(out, ref)
+
+    # the limit must not knock the layer off the one backend that can express it
+    import dataclasses
+
+    from freetoken.layers.quantization.moe.nvfp4 import (
+        MarlinNvfp4MoEKernel,
+        TritonNvfp4MoEKernel,
+    )
+
+    cfg = dataclasses.replace(_bound_layer("triton").quant_method.cfg, limit=LIMIT)
+    assert TritonNvfp4MoEKernel().unusable_reason(cfg) is None
+    marlin_reason = MarlinNvfp4MoEKernel().unusable_reason(cfg)
+    assert marlin_reason and "plain-silu" in marlin_reason, marlin_reason
 
 
 def _triton_cache(device, *, cache_size=S, prefill_overlap=False):

@@ -114,7 +114,12 @@ def limit_or_inf(layer: Any) -> float:
 
 
 def gated_epilogue_reason(cfg: "MoEConfig") -> str | None:
-    """Why ``gated_act_and_mul`` cannot run ``cfg``'s activation quadruple, or None; the plain kinds have no alpha / limit and nothing takes beta or interleaved rows."""
+    """Why ``gated_act_and_mul`` cannot run ``cfg``'s activation quadruple, or None.
+
+    Plain silu has no alpha, but it DOES express a limit: V4.1's routed experts clamp
+    (``silu(min(gate, L)) * clamp(up, +-L)``, what ``swiglu_clamp`` computes at alpha=1). Nothing
+    takes beta, the gelu pair takes neither knob, and the epilogue reads uninterleaved halves.
+    """
     from freetoken.layers import GATED_ACTIVATIONS
 
     if cfg.activation not in GATED_ACTIVATIONS:
@@ -123,7 +128,11 @@ def gated_epilogue_reason(cfg: "MoEConfig") -> str | None:
         return "the epilogue reads uninterleaved [gate; up] halves"
     if cfg.beta != 0.0:
         return f"the epilogue has no beta (got {cfg.beta})"
-    if cfg.activation in ("silu", "gelu", "gelu_tanh") and (cfg.alpha != 1.0 or cfg.limit is not None):
+    if cfg.activation == "silu":
+        if cfg.alpha != 1.0:
+            return f"silu takes no alpha (got alpha={cfg.alpha})"
+        return None
+    if cfg.activation in ("gelu", "gelu_tanh") and (cfg.alpha != 1.0 or cfg.limit is not None):
         return f"{cfg.activation} takes no alpha / limit (got alpha={cfg.alpha}, limit={cfg.limit})"
     return None
 

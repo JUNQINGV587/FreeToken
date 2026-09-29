@@ -160,8 +160,8 @@ def _fused_experts_decode_nvfp4(
     topk_ids: torch.Tensor,
     activation: str,
     apply_router_weight_on_input: bool,
-    act_alpha: float = 1.702,
-    act_limit: float = 7.0,
+    act_alpha: float = 1.0,
+    act_limit: float = float("inf"),
 ) -> torch.Tensor:
     """Shared decode body (gemm1 -> act -> gemm2 -> sum-reduce); ``gemm_fn`` is either
     the marlin-style int32 GEMV (:func:`_decode_gemm_marlin`) or the original LUT-gather
@@ -201,8 +201,8 @@ def fused_experts_decode_nvfp4_marlin(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
-    act_alpha: float = 1.702,
-    act_limit: float = 7.0,
+    act_alpha: float = 1.0,
+    act_limit: float = float("inf"),
 ) -> torch.Tensor:
     """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
     return _fused_experts_decode_nvfp4(
@@ -226,8 +226,8 @@ def fused_experts_decode_nvfp4_serial(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
-    act_alpha: float = 1.702,
-    act_limit: float = 7.0,
+    act_alpha: float = 1.0,
+    act_limit: float = float("inf"),
 ) -> torch.Tensor:
     """Original LUT-gather decode (one program per route, full K reduction). Retained for
     A/B benchmarking against the marlin decode path; not on the production decode path."""
@@ -328,8 +328,8 @@ def fused_experts_nvfp4(
     num_experts: int,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
-    act_alpha: float = 1.702,
-    act_limit: float = 7.0,
+    act_alpha: float = 1.0,
+    act_limit: float = float("inf"),
 ) -> torch.Tensor:
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the

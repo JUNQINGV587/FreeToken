@@ -71,6 +71,12 @@ GATED_ACTIVATIONS = ("silu", "gelu", "gelu_tanh", "swigluoai", "swiglu_clamp")
 def gated_act_and_mul(activation: str, x, out, *, alpha: float = 1.0, limit: float = float("inf")):
     """The epilogue between the two expert GEMMs: ``activation`` over uninterleaved [gate; up] halves into ``out``."""
     if activation == "silu":
+        if limit != float("inf"):
+            # DeepSeek-V4.1 clamps the ROUTED experts (swiglu_limit=10): silu(min(g, L)) * clamp(u, +-L),
+            # which is exactly ``swiglu_clamp`` at alpha=1 (the math V4's own shared expert runs).
+            # A layer that asks for a limit gets the clamped epilogue rather than a silent plain silu;
+            # alpha rides along, since the clamped kernel scales the sigmoid the same way.
+            return swiglu_clamp_and_mul(x, out, alpha=alpha, limit=limit)
         return silu_and_mul(x, out)
     if activation == "gelu":
         return gelu_and_mul(x, out)

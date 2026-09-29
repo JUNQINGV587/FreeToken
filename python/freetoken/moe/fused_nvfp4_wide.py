@@ -120,8 +120,8 @@ def fused_experts_nvfp4_wide(
     num_experts: int,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
-    act_alpha: float = 1.702,
-    act_limit: float = 7.0,
+    act_alpha: float = 1.0,
+    act_limit: float = float("inf"),
 ) -> torch.Tensor:
     """Wide-load prefill inline-NVFP4 MoE. Mirrors
     ``fused_nvfp4.fused_experts_nvfp4`` with the wide grouped-GEMM kernel."""

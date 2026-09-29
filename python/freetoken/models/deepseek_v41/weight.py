@@ -34,14 +34,15 @@ from .args import load_args
 # hence this local table. The attention module is head-parallel: wq_b splits the query
 # heads, attn_sink follows them one row per head, and wo_a/wo_b split the output-group axis
 # (whole groups per rank, which is what lets wo_b's row-parallel reduce sum the ranks'
-# partial groups). Everything else (wq_a, wkv, the norms, compressor.*, engram.*,
-# gate/hc_* mixing, indexer.weights_proj/wk) is replicated, not sharded: the compressed
-# latent, the per-head score weights and the shared pools must be whole on every rank.
+# partial groups). The indexer, by contrast, is REPLICATED: its output is a block selection
+# that every rank has to agree on, so every rank scores all index heads itself rather than
+# scoring a slice and reconciling. Everything else (wq_a, wkv, the norms, compressor.*,
+# engram.*, gate/hc_* mixing, indexer.wq_b/weights_proj/wk) is replicated, not sharded: the
+# compressed latent, the per-head score weights and the shared pools must be whole on every rank.
 _TP_SHARD_DIM = {
     "attn.wq_b": 0,
     "attn.attn_sink": 0,
     "attn.wo_a": 0,
-    "attn.indexer.wq_b": 0,
     "attn.wo_b": 1,
     "ffn.shared_experts.w1": 0,
     "ffn.shared_experts.w3": 0,

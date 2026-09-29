@@ -342,9 +342,8 @@ def test_iter_weights_slices_the_tp_partitioned_tensors(checkpoint, tp):
     assert shape("model.embed.weight") == (V // 2, D)
     assert shape("model.head.weight") == (V // 2, D)
     assert torch.equal(items["model.embed.weight"], full["embed.weight"][: V // 2])
-    # dim 0 (column parallel): wq_b, the indexer's wq_b, shared w1/w3
+    # dim 0 (column parallel): wq_b, shared w1/w3
     assert shape("model.layers.0.attn.wq_b.weight") == (NH * HD // 2, QR)
-    assert shape("model.layers.1.attn.indexer.wq_b.weight") == (INH * IHD // 2, QR)
     assert shape("model.layers.0.ffn.shared_experts.w1.weight") == (MI // 2, D)
     assert shape("model.layers.0.ffn.shared_experts.w3.weight") == (MI // 2, D)
     # dim 0 too, one row per head: the attention sink follows the query heads
@@ -359,11 +358,13 @@ def test_iter_weights_slices_the_tp_partitioned_tensors(checkpoint, tp):
     # single 32-wide column at these tiny dims, so it cannot halve -- the real checkpoint's
     # 160x256 -> 160x128 companion is asserted by the header shape audit, not here)
     assert shape("model.layers.0.attn.wq_b.weight_scale_inv") == ((NH * HD // 2 + 31) // 32, 1)
-    # replicated: the low-rank projections, norms, single-head wkv, indexer K
+    # replicated: the low-rank projections, norms, single-head wkv, and the WHOLE indexer --
+    # it selects the same compressed blocks on every rank, so it scores them identically
     for name in (
         "model.layers.0.attn.wq_a.weight",
         "model.layers.0.attn.wkv.weight",
         "model.layers.0.attn.q_norm.weight",
+        "model.layers.1.attn.indexer.wq_b.weight",
         "model.layers.1.attn.indexer.wk.weight",
         "model.layers.1.attn.indexer.k_norm.weight",
         "model.layers.1.attn.indexer.weights_proj.weight",

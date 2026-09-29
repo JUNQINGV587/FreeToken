@@ -9,10 +9,13 @@ hit. The fix is the usual tensor-parallel split: the module keeps *local* head/g
 every reshape and sink, while the parallel linears are still declared with GLOBAL sizes (they do
 the cutting), exactly as the reader shards the raw checkpoint tensors.
 
-The indexer needs one extra step the attention does not: the blocks it selects are indices into
-the *shared* compressed pool that every rank's query heads read, so the per-head score partials
-have to be summed across ranks (``_all_reduce_score``) or each rank would attend to its own
-private set of slots. ``weights_proj`` is replicated, so its head slice follows ``wq_b``'s split.
+The indexer takes the opposite decision: it is REPLICATED. The blocks it selects are indices into
+the *shared* compressed pool that every rank's query heads read, so all ranks must select the same
+ones; scoring every head on every rank -- rather than scoring a slice and summing the partials --
+makes them agree by construction. The all-reduce alternative is not even available: the tp
+communicator's NCCL path maps only fp16/bf16 (``python/freetoken/kernel/csrc/src/pynccl.cu``,
+``kNCCLDtypeMap``) while index scores are fp32, and the first TP 2 request died in
+``RuntimeError: unordered_map::at`` proving it.
 
 The TP degree is process-global and can only be set once
 (``freetoken.distributed.set_tp_info``), so each degree runs in a child process -- the same
@@ -86,17 +89,16 @@ def _report() -> str:
     assert _attention(0).n_heads == 2
 
     indexer = _indexer()
-    assert indexer.tp_size == 2 and indexer.tp_rank == 0
     assert indexer.index_n_heads == 4, "the score scale keeps the global head count"
-    assert indexer.n_heads == 2, f"local index heads, got {indexer.n_heads}"
-    assert indexer.wq_b.full_output_size == 4 * 16, "indexer wq_b is declared global too"
-    assert indexer.wq_b.local_output_size == 4 * 16 // 2
-    assert indexer.weights_proj.full_output_size == 4, "weights_proj is replicated, not sharded"
+    assert indexer.n_heads == 4, f"the indexer scores every head on every rank, got {indexer.n_heads}"
+    assert indexer.wq_b.full_output_size == 4 * 16, "indexer wq_b is replicated, not cut"
+    assert indexer.wq_b.local_output_size == 4 * 16, "every rank projects all index heads"
+    assert indexer.weights_proj.full_output_size == 4, "weights_proj is replicated too"
 
     import torch
 
     weights = indexer._head_weights(torch.zeros(1, 3, 512))
-    assert tuple(weights.shape) == (1, 3, 2), f"a rank scores its own heads, got {weights.shape}"
+    assert tuple(weights.shape) == (1, 3, 4), f"every head is scored, got {weights.shape}"
 
     return (
         f"attn(heads={attn.n_heads},groups={attn.n_groups},sink={tuple(attn.attn_sink.shape)},"
@@ -132,7 +134,7 @@ def _child(mode: str) -> str:
 def test_tp2_splits_heads_and_output_groups():
     assert _child("2") == (
         "attn(heads=2,groups=1,sink=(2,),wq_b=128,wo_a=(32, 128),wo_b=32) "
-        "indexer(heads=2,wq_b=32,weights=4,slice=(1, 3, 2))"
+        "indexer(heads=4,wq_b=64,weights=4,slice=(1, 3, 4))"
     )
 
 

@@ -490,6 +490,59 @@ def test_the_engine_forward_decodes_a_row_onto_the_eager_trajectory(monkeypatch)
     assert diff < TOL, diff
 
 
+@requires_cuda
+def test_a_two_row_decode_step_matches_the_same_rows_run_alone(monkeypatch):
+    """A decode batch advances its rows independently -- one token each, at each row's own
+    position -- so the snapshot rows, the staging cap and the page-table rows all have to stay
+    per-row. Run together, the two requests must land where they land separately."""
+    device = torch.device("cuda")
+    args = _args()
+    adapter = _adapter(monkeypatch, device, args)
+    _sink(adapter.model)
+    pool, backend = _pool_and_backend(args, device)
+    _disjoint_rows(pool, args, device)
+    adapter.model.bind(device, pool)
+    ctx = _ctx()
+
+    torch.manual_seed(37)
+    lens = (5, 3)
+    ids = torch.randint(0, VOCAB, (2, max(lens) + 1), device=device)
+    # each request fills ITS OWN table row, one request at a time: row 1 has seen three tokens
+    # and row 0 five, so a batch-wide position would put them in each other's history
+    for row, n in enumerate(lens):
+        req = _req(ids[row, :n], table_idx=row)
+        batch = Batch(reqs=[req], phase="prefill")
+        batch.padded_reqs = [req]
+        batch.input_ids = ids[row, :n].to(device)
+        batch.positions = torch.arange(n, device=device)
+        backend.prepare_metadata(batch)
+        with ctx.forward_batch(batch):
+            adapter.forward()
+
+    steps = {row: lens[row] for row in (0, 1)}
+    alone = []
+    for row in (0, 1):
+        decode = _decode_batch(backend, ctx, row, steps[row], device)
+        decode.input_ids = ids[row, steps[row]].to(device).view(1)
+        with ctx.forward_batch(decode):
+            alone.append(adapter.forward().float())
+
+    reqs = [_req(ids[row, steps[row]].unsqueeze(0), table_idx=row) for row in (0, 1)]
+    joint = Batch(reqs=reqs, phase="decode")
+    joint.padded_reqs = reqs
+    joint.active_table_idx = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    joint.positions = torch.tensor([steps[0], steps[1]], dtype=torch.int64, device=device)
+    joint.input_ids = torch.stack([ids[0, steps[0]], ids[1, steps[1]]]).to(device)
+    backend.prepare_metadata(joint)
+    with ctx.forward_batch(joint):
+        got = adapter.forward().float()
+
+    want = torch.cat(alone, dim=0)
+    assert got.shape == (2, VOCAB), got.shape
+    diff = (got - want).abs().max().item()
+    assert torch.allclose(got, want, rtol=TOL, atol=TOL), f"max abs logit diff {diff}"
+
+
 def _adapter_with_engram(monkeypatch, device, tmp_path):
     """The adapter with its engram layers LIVE: the token map and the row views come off a
     checkpoint directory laid out like the real one (``_write_engram_checkpoint``), so a packed

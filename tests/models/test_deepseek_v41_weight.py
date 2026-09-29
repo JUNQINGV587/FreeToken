@@ -307,6 +307,100 @@ def test_iter_weights_rejects_resident_experts(checkpoint):
         next(iter(iter_weights(str(folder), "cpu", include_moe_experts=True)))
 
 
+@pytest.fixture
+def tp(monkeypatch):
+    """Point the loader's TP lookup at a rank for one test.
+
+    ``set_tp_info`` is a process-wide one-shot (it raises once set), so a test that needs two
+    topologies patches the name the loader reads instead of the global.
+    """
+    from freetoken.models.deepseek_v41 import weight as W
+
+    def _set(rank: int, size: int):
+        monkeypatch.setattr(W, "try_get_tp_info", lambda: SimpleNamespace(rank=rank, size=size))
+
+    yield _set
+
+
+def test_iter_weights_slices_the_tp_partitioned_tensors(checkpoint, tp):
+    """TP>1: the loader cuts exactly what the model partitions, and nothing else.
+
+    The model declares VocabParallelEmbedding/ParallelLMHead + column/row-parallel linears,
+    so handing it the full checkpoint tensor trips the shape assert in layers/base.py -- which
+    is how this was found (a TP=2 boot died on ``model.embed.weight`` (129280,5120) vs
+    (64640,5120)). The names here are V4.1's, so models.loader.shard_tensor's llama/qwen
+    patterns never match.
+    """
+    folder, full = checkpoint
+    tp(0, 2)
+    items = dict(iter_weights(str(folder), "cpu", include_moe_experts=False))
+
+    def shape(name):
+        return tuple(items[name].shape)
+
+    # vocab: half the rows, and the RIGHT half for this rank
+    assert shape("model.embed.weight") == (V // 2, D)
+    assert shape("model.head.weight") == (V // 2, D)
+    assert torch.equal(items["model.embed.weight"], full["embed.weight"][: V // 2])
+    # dim 0 (column parallel): wq_b, the indexer's wq_b, shared w1/w3
+    assert shape("model.layers.0.attn.wq_b.weight") == (NH * HD // 2, QR)
+    assert shape("model.layers.1.attn.indexer.wq_b.weight") == (INH * IHD // 2, QR)
+    assert shape("model.layers.0.ffn.shared_experts.w1.weight") == (MI // 2, D)
+    assert shape("model.layers.0.ffn.shared_experts.w3.weight") == (MI // 2, D)
+    # dim 1 (row parallel): wo_b, shared w2
+    assert shape("model.layers.0.attn.wo_b.weight") == (D, OG * OL // 2)
+    assert shape("model.layers.0.ffn.shared_experts.w2.weight") == (D, MI // 2)
+    # the derived e8m0 companion follows its host tensor's axis (wo_b's own block grid is a
+    # single 32-wide column at these tiny dims, so it cannot halve -- the real checkpoint's
+    # 160x256 -> 160x128 companion is asserted by the header shape audit, not here)
+    assert shape("model.layers.0.attn.wq_b.weight_scale_inv") == ((NH * HD // 2 + 31) // 32, 1)
+    # replicated: the low-rank projections, norms, single-head wkv, attn_sink, indexer K
+    for name in (
+        "model.layers.0.attn.wq_a.weight",
+        "model.layers.0.attn.wkv.weight",
+        "model.layers.0.attn.q_norm.weight",
+        "model.layers.0.attn.attn_sink",
+        "model.layers.1.attn.indexer.wk.weight",
+        "model.layers.1.attn.indexer.k_norm.weight",
+        "model.layers.1.attn.indexer.weights_proj.weight",
+        "model.layers.0.attn_norm.weight",
+    ):
+        assert items[name].shape == full[name[len("model.") :]].shape, name
+    # wo_a is DERIVED (dequantized from wo_a.weight + its e8m0 scale), so it has no same-named
+    # checkpoint key: it must keep the full einsum operand shape, never a half.
+    assert items["model.layers.0.attn.wo_a"].shape == (OG * OL, OG * OL)
+
+    # rank 1 gets the complementary halves
+    tp(1, 2)
+    rank1 = dict(iter_weights(str(folder), "cpu", include_moe_experts=False))
+    assert rank1["model.embed.weight"].shape == (V // 2, D)
+    assert torch.equal(rank1["model.embed.weight"], full["embed.weight"][V // 2 :])
+    assert torch.equal(
+        rank1["model.layers.0.attn.wo_b.weight"],
+        full["layers.0.attn.wo_b.weight"][:, OG * OL // 2 :],
+    )
+    assert torch.equal(
+        rank1["model.layers.0.ffn.shared_experts.w2.weight"],
+        full["layers.0.ffn.shared_experts.w2.weight"][:, MI // 2 :],
+    )
+
+
+def test_tp_shard_is_a_no_op_without_tp_info(checkpoint):
+    """A standalone ``iter_weights`` (conversion, unit tests) must see full tensors.
+
+    ``get_tp_info`` RAISES when nothing set it, so the loader asks ``try_get_tp_info``.
+    """
+    from freetoken.models.deepseek_v41 import weight as W
+
+    folder, full = checkpoint
+    items = dict(iter_weights(str(folder), "cpu", include_moe_experts=False))
+    assert items["model.embed.weight"].shape == (V, D)
+    assert torch.equal(items["model.embed.weight"], full["embed.weight"])
+    assert items["model.layers.0.attn.wo_b.weight"].shape == (D, OG * OL)
+    # and directly: no rank information at all
+    assert W._tp_shard("embed.weight", full["embed.weight"]) is full["embed.weight"]
+
+
 # --------------------------------------------------------------------------- expert spec
 
 

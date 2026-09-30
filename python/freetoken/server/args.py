@@ -845,6 +845,10 @@ def parse_args(
         help=(
             "With --moe-disk-tier on: experts per layer kept pinned in RAM "
             "(0 < N < num_experts; the rest are disk-resident). Ignored by 'auto'. "
+            "With owner-local EP (--moe-ep-size > 1) N is a HOST-wide budget: the "
+            "ranks split it (each pins its own share of its own local experts; see "
+            "moe/disk_tier.local_ram_experts), so one rank is never left with an "
+            "empty prefix while another holds all of it. "
             "Keep N * (smallest bank row bytes) page-aligned (a multiple of 4096) "
             "or the small scale banks' tail rows stay resident instead of released "
             "(warns, does not abort). The rule is per-model: e.g. Qwen3.8-Flash-Next "

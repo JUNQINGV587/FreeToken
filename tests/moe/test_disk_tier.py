@@ -688,20 +688,49 @@ def _ownership(rank, world=2):
     return ExpertOwnership(global_num_experts=E, world_size=world, rank=rank)
 
 
-def test_owner_ram_prefix_clamps(checkpoint):
-    """ram_experts is a GLOBAL count; each rank clamps it to its owned prefix."""
-    # rank 0 owns global {0,1}: global ram=3 -> local ram = 2 (everything RAM).
-    tier0 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=3,
+def test_owner_ram_prefix_uses_the_rank_share_as_given(checkpoint):
+    """``ram_experts`` here is already this rank's share of the host budget.
+
+    The loader resolves the host-wide count once (``local_ram_experts``) and
+    hands the same number to ``release_bank_tails`` and to the tier, so splitting
+    it again divides the share a second time (measured on the EP=2 auto budget:
+    120 -> 64/56 -> 32/24). With the old global-prefix alias, rank 1's whole
+    range sat above the prefix and it pinned nothing at all.
+    """
+    # rank 0 owns global {0,1}: what it was handed is exactly what it pins.
+    tier0 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=2,
                   ownership=_ownership(0))
     assert (tier0._g0, tier0._local_num, tier0._ram) == (0, 2, 2)
-    # rank 1 owns global {2,3}: local ram = 3 - 2 = 1.
-    tier1 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=3,
+    # rank 1 owns global {2,3} and pins its own (not the global) share.
+    tier1 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=1,
                   ownership=_ownership(1))
     assert (tier1._g0, tier1._local_num, tier1._ram) == (2, 2, 1)
-    # global ram=1 stops before rank 1's range -> rank 1 has NO RAM experts.
-    tier2 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=1,
+    # A share wider than the local range clamps to it; zero is legal (this rank
+    # is fully disk-resident) and must not resurrect a global prefix.
+    tier2 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=5,
                   ownership=_ownership(1))
-    assert tier2._ram == 0
+    assert tier2._ram == 2
+    tier3 = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=0,
+                  ownership=_ownership(1))
+    assert tier3._ram == 0
+
+
+def test_local_ram_experts_split_math():
+    """The split preserves the host-wide total on the release-alignment grid."""
+    from freetoken.moe.disk_tier import local_ram_experts
+    from freetoken.moe.ownership import ExpertOwnership
+
+    def own(rank, world=2, e=384):
+        return ExpertOwnership(global_num_experts=e, world_size=world, rank=rank)
+
+    # EP=2 auto budget on this host (120 experts/ep): 64/56, total 120 kept.
+    assert [local_ram_experts(120, own(r)) for r in range(2)] == [64, 56]
+    # Full pin: every rank gets its whole local range.
+    assert [local_ram_experts(384, own(r)) for r in range(2)] == [192, 192]
+    # No ownership -> the global count is unchanged.
+    assert local_ram_experts(120, None) == 120
+    # A single rank keeps the whole budget.
+    assert local_ram_experts(120, own(0, world=1)) == 120
 
 
 def test_owner_fetch_reads_global_rows(checkpoint):
@@ -709,7 +738,7 @@ def test_owner_fetch_reads_global_rows(checkpoint):
     GLOBAL checkpoint rows."""
     ownership = _ownership(rank=1)  # global {2,3} as local {0,1}
     cache = _fake_cache(num_experts=2)
-    tier = _tier(checkpoint, cache, ram_experts=3, ownership=ownership)
+    tier = _tier(checkpoint, cache, ram_experts=1, ownership=ownership)
     for layer in range(L):
         for local in range(2):
             slot = (layer * 2 + local) % 8
@@ -724,7 +753,7 @@ def test_owner_fetch_pending_local_namespace(checkpoint):
     """fetch_pending classifies RAM/disk against the LOCAL clamped prefix."""
     ownership = _ownership(rank=1)
     cache = _fake_cache(num_experts=2)
-    tier = _tier(checkpoint, cache, ram_experts=3, ownership=ownership)  # local ram = 1
+    tier = _tier(checkpoint, cache, ram_experts=1, ownership=ownership)  # local ram = 1
     # Miss list (LOCAL ids): local 0 (global 2, RAM), local 1 (global 3, disk).
     cache.src_indices[:2] = torch.tensor([0, 1], dtype=torch.int32)
     cache.evict_slots[:2] = torch.tensor([5, 6], dtype=torch.int32)
@@ -751,7 +780,7 @@ def test_owner_prefetch_filters_to_owned(checkpoint):
     try:
         ownership = _ownership(rank=1)
         cache = _fake_cache(num_experts=2)
-        tier = _tier(checkpoint, cache, ram_experts=3, ownership=ownership)
+        tier = _tier(checkpoint, cache, ram_experts=1, ownership=ownership)
     finally:
         os.environ.pop("FT_DISK_TIER_PREFETCH", None)
     # Global routing {0 (remote), 2 (owned, RAM local 0), 3 (owned, disk local 1)}:

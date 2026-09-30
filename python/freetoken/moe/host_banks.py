@@ -163,9 +163,10 @@ class HostBank:
         row_bytes = self.nbytes // self.tensor.shape[0]
         nbytes = nrows * row_bytes
         if nbytes == 0:
-            # Owner-local EP with ram_experts <= global_start: this rank owns only
-            # disk-resident rows. Pinning a zero prefix is meaningless (and
-            # cudaHostRegister(addr, 0) fails); the tail stays released/unbacked.
+            # Owner-local EP with a zero share of the host pin budget: this rank
+            # owns only disk-resident rows. Pinning a zero prefix is meaningless
+            # (and cudaHostRegister(addr, 0) fails); the tail stays
+            # released/unbacked.
             self._pinned = True
             self._pinned_bytes = 0
             return

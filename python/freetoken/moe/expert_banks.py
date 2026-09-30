@@ -283,15 +283,15 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
         # the release without an index would serve zeroed experts. Resolving the
         # spec through the family hook keeps the index and the loader reading
         # the same rows.
-        from freetoken.moe.disk_tier import Nvfp4DiskIndex
+        from freetoken.moe.disk_tier import Nvfp4DiskIndex, local_ram_experts
 
         disk_index = Nvfp4DiskIndex(model_path, model_config, source_spec)
-        # skip range is global expert space; the reader renumbers under ownership
-        skip_experts_from = disk_tier.ram_experts
-        # the bank's pin prefix is in rank-local rows under owner-local EP
-        ram_prefix = disk_tier.ram_experts
-        if ownership is not None:
-            ram_prefix = min(ownership.local_num_experts, max(0, disk_tier.ram_experts - ownership.global_start))
+        # The pin budget is host-wide (see local_ram_experts): each rank pins its
+        # own share of it. The skip range is in global expert space and the
+        # reader renumbers under ownership, so the boundary is this rank's own
+        # global start plus that local share.
+        ram_prefix = local_ram_experts(disk_tier.ram_experts, ownership)
+        skip_experts_from = ram_prefix + (ownership.global_start if ownership is not None else 0)
 
     pieces = iter_expert_pieces(
         model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk,

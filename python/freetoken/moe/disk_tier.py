@@ -387,6 +387,40 @@ def resolve_auto_ram_experts(model_path: str, model_config,
     return resolved, row_bytes, available
 
 
+def local_ram_experts(ram_experts: int, ownership) -> int:
+    """This rank's pinned prefix for a host-wide ``ram_experts`` budget.
+
+    ``ram_experts`` counts the experts per layer the host can pin across ALL
+    owner-local ranks (see ``auto_ram_experts``), while the banks it sizes are
+    rank-local. Aliasing that count as one global prefix ``[0, ram_experts)``
+    leaves every rank past the prefix with zero pinned experts: with the EP=2
+    auto budget of 120 on this host, rank 0 pinned 120 experts/ep and rank 1
+    pinned none (measured 93.2 GiB vs 4.1 GiB RSS), which is neither what the
+    flag documents nor a safe host-memory layout. Split the same budget instead,
+    on the alignment grid the tail release needs.
+
+    This balances host RAM; it does NOT shorten a cold prefill. Measured on the
+    same 24k-token cold request: 270.1 s with 120/0 against 273.2 s with 64/56,
+    because the split leaves the total fetch volume (264 expert rows per layer
+    either way) and the per-batch fixed cost unchanged.
+    """
+    if ownership is None:
+        return ram_experts
+    world = max(1, getattr(ownership, "world_size", 1))
+    local_num = ownership.local_num_experts
+    share, rem = divmod(ram_experts, world)
+    if share >= _AUTO_ALIGN:
+        # Stay on the page-alignment grid; leftover whole units go to the
+        # lowest ranks so the host-wide total is preserved.
+        share = share // _AUTO_ALIGN * _AUTO_ALIGN
+        rem = ram_experts - share * world
+        if ownership.rank < rem // _AUTO_ALIGN:
+            share += _AUTO_ALIGN
+        return min(local_num, share)
+    # Budgets below one alignment unit cannot be split on the grid.
+    return min(local_num, share + (1 if ownership.rank < rem else 0))
+
+
 class DiskTier:
     """Runtime fetcher: disk-resident slot-cache misses -> staging -> GPU slot."""
 
@@ -397,14 +431,18 @@ class DiskTier:
         # identifier below) lives in the LOCAL expert namespace
         # [0, ownership.local_num_experts), while the disk index spans the GLOBAL
         # checkpoint rows [0, index.num_experts). ``_g0`` is the local->global
-        # offset applied at every index access; ``_ram`` is the RAM prefix
-        # expressed in the LOCAL namespace (global ``ram_experts`` clamped onto
-        # this rank's owned range). With ownership=None both collapse to the
-        # identity (global) mapping.
+        # offset applied at every index access; ``_ram`` is how many of THIS
+        # rank's local experts are pinned, in the LOCAL namespace.
+        # ``ram_experts`` arrives already split: the loader resolves the
+        # host-wide budget into a per-rank share with ``local_ram_experts`` and
+        # hands that same number to ``release_bank_tails`` and to
+        # ``attach_disk_tier``. Splitting again here would divide the share a
+        # second time (measured on the EP=2 auto budget: 120 -> 64/56 -> 32/24).
+        # With ownership=None both collapse to the identity (global) mapping.
         self._g0 = ownership.global_start if ownership is not None else 0
         self._local_num = (ownership.local_num_experts if ownership is not None
                            else index.num_experts)
-        self._ram = min(self._local_num, max(0, ram_experts - self._g0))
+        self._ram = min(self._local_num, ram_experts)
         self._graph_bridge = None
         self._banks = list(cache.banks)  # [(per_layer_host, gpu_cache)] in schema order
         self._row_bytes = [

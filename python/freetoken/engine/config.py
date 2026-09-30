@@ -69,8 +69,11 @@ class EngineConfig:
     # skip the startup prefill warmup forwards; first requests then pay the kernel module loads (and the full JIT compile on a cold start)
     prefill_warmup: bool = True
     # Disk tier (--moe-disk-tier, see moe/disk_tier.py): "off" = classic behavior.
-    # "on": experts [0, expert_ram_experts) per layer stay pinned in RAM and the
-    # rest are fetched from the original checkpoint on slot-cache miss. "auto":
+    # "on": expert_ram_experts per layer stay pinned in RAM and the rest are
+    # fetched from the original checkpoint on slot-cache miss. The count is
+    # HOST-wide under owner-local EP — moe/disk_tier.local_ram_experts splits it
+    # into a per-rank share (each rank pins that share of its OWN experts), so no
+    # rank is left with an empty prefix. "auto":
     # capacity-adaptive — dormant (exactly "off") when the full expert set fits in
     # host RAM with headroom, otherwise active with an auto-derived RAM prefix.
     # Requires the native NVFP4 layout and the gpu decode target; prefill overlap

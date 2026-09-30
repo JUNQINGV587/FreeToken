@@ -1698,6 +1698,33 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     return requested
 
 
+def _apply_prefill_chunk_cap(config: EngineConfig, override, page_size: int, label: str) -> None:
+    """Resolve the DSV4/DSV4.1 prefill chunk size.
+
+    The pool's ``prefill_chunk_budget`` (half the window pool) is the default cap, so that a prompt
+    longer than the window pool is chunked and frees pages between chunks instead of OOMing
+    ``_alloc_window``. That budget scales with the token reservation, so a large one -- a 1M-token
+    pool resolves to a ~100k-token chunk -- would let a single chunk allocate the indexer's
+    O(chunk x context) causal-mask transient (``dsv41_indexer.indexer_select_prefill``) and take the
+    engine down. ``--prefill-chunk-tokens`` caps the chunk independently of the pool; the scheduler
+    still takes ``min(max_extend_tokens, pool budget)``, so this is an extra upper bound, never a
+    floor. The value is rounded down to whole window pages, the pool's currency.
+    """
+    cap = int(getattr(config, "prefill_chunk_tokens", 0) or 0)
+    if cap > 0:
+        capped = min(max(page_size, cap // page_size * page_size), config.max_seq_len)
+        override("max_extend_tokens", capped)
+        logger.info_rank0(
+            f"{label} prefill chunk capped at {capped} tokens (--prefill-chunk-tokens {cap}; the "
+            "window pool's prefill_chunk_budget still bounds it from above)"
+        )
+    elif getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
+        # Don't let max_extend_tokens force a second chunk within one prompt (the pool's
+        # prefill_chunk_budget still chunks prompts larger than the window pool); prefill batches
+        # ragged (bs>=1), each segment resuming from its own cached_len.
+        override("max_extend_tokens", config.max_seq_len)
+
+
 def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     """DSV4 engine-config reconciliation at config-resolution time (before the pool exists).
     Syncs the resolved runtime config into the opaque ``dsv4_args`` payload, sets
@@ -1719,11 +1746,9 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")
     # 'radix' (SWARadixCache on the full-loc currency, carry-aware re-prefill) is the default and is
-    # honored, as is an explicit 'naive'. Don't let max_extend_tokens force a second chunk within
-    # one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the window
-    # pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
-        override("max_extend_tokens", config.max_seq_len)
+    # honored, as is an explicit 'naive'. The chunk size (pool budget, or an explicit
+    # --prefill-chunk-tokens cap) is resolved below.
+    _apply_prefill_chunk_cap(config, override, P, "DSV4")
 
     # DSV4 decode batches at most max_running_req rows; its full-loc snapshot is sized to that,
     # so a graph bs above it would exceed the backend's captured snapshot rows. Clamp any
@@ -1784,11 +1809,10 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
             f"{requested_cache!r} -> 'naive' (no prefix reuse) for correctness."
         )
         override("cache_type", "naive")
-    # Same reason as DSV4: don't let max_extend_tokens force a second chunk within one prompt
-    # (the pool's prefill_chunk_budget still chunks prompts larger than the window pool);
-    # prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
-        override("max_extend_tokens", config.max_seq_len)
+    # Same reason as DSV4: the chunk is the pool's budget unless --prefill-chunk-tokens caps it
+    # (a pooled 1M-token reservation resolves to a ~100k-token chunk, whose indexer transient is
+    # O(chunk x context) and OOMs).
+    _apply_prefill_chunk_cap(config, override, P, "DSV4.1")
 
     # The DSV4.1 decode snapshot is sized to max_running_req rows, so a graph bs above it would
     # index past the captured rows. Clamp any oversized explicit list / max_bs here (before

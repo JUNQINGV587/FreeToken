@@ -431,6 +431,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-chunk-tokens",
+        type=int,
+        default=ServerArgs.prefill_chunk_tokens,
+        help=(
+            "Cap the DSV4/DSV4.1 prefill chunk in tokens, independently of the KV pool's window "
+            "budget (which scales with --num-tokens: a 1M-token reservation resolves to a ~100k "
+            "token chunk whose O(chunk x context) indexer transient OOMs). Rounded down to whole "
+            "window pages; the pool budget still bounds the chunk from above. 0 (default) keeps "
+            "the pool-budget behaviour."
+        ),
+    )
+
+    parser.add_argument(
         "--decode-log-interval",
         type=_positive_int,
         default=ServerArgs.decode_log_interval,

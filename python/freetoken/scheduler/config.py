@@ -14,6 +14,11 @@ def _get_pid_suffix() -> str:
 @dataclass(frozen=True)
 class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
+    # DSV4/DSV4.1 derive their prefill chunk from the KV pool's window budget, which scales with
+    # --num-tokens; a large pool (a 1M-token reservation) would allow a ~100k-token chunk whose
+    # indexer transient is O(chunk x context). >0 caps the chunk independently of the pool
+    # (rounded down to whole window pages). 0 keeps the historical pool-budget behaviour.
+    prefill_chunk_tokens: int = 0
     cache_type: str = "radix"
     offline_mode: bool = False
     decode_log_interval: int = 40

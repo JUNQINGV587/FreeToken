@@ -444,6 +444,23 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--swa-num-pages-override",
+        type=int,
+        default=ServerArgs.swa_num_pages_override,
+        help=(
+            "Pin the DSV4/DSV4.1 sliding-window page count instead of deriving it from "
+            "--num-tokens and --swa-full-tokens-ratio (0.2 x the reservation by default). The "
+            "attention only reads one 128-token window per in-flight request, so a 1M-token "
+            "reservation does not need a fifth of itself in window pages: pinning a few hundred "
+            "pages hands the difference back as free VRAM (1638 -> 160 pages frees 7.8 GB per "
+            "rank) while the compressed/index/state tiers keep the full history reservation. "
+            "Values below the engine's working-set floor (window reach + per-request reserve) "
+            "are raised to it, values above the pool are capped at it. None (default) keeps the "
+            "derived sizing. Startup only: runtime rebuild is unsupported under TP > 1."
+        ),
+    )
+
+    parser.add_argument(
         "--decode-log-interval",
         type=_positive_int,
         default=ServerArgs.decode_log_interval,
@@ -1024,6 +1041,8 @@ def parse_args(
     kwargs = parser.parse_args(args).__dict__.copy()
     if kwargs["max_concurrent_requests"] < -1:
         parser.error("--max-concurrent-requests must be -1, 0 or a positive integer")
+    if kwargs["swa_num_pages_override"] is not None and kwargs["swa_num_pages_override"] < 1:
+        parser.error("--swa-num-pages-override must be a positive page count (or omitted)")
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

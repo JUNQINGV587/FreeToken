@@ -26,6 +26,7 @@ from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
 from freetoken.kvcache.dsv41_cost_model import (
     _dsv41_pool_sizes,
+    _dsv41_window_floor_pages,
     dsv41_auto_cost_model,
     dsv41_pool_bytes,
     dsv41_pool_sizes,
@@ -451,6 +452,29 @@ def test_force_small_pool_env_hook(monkeypatch):
     monkeypatch.setenv("DSV41_FORCE_SMALL_POOL", "3")
     sizes = _dsv41_pool_sizes(_config(), 8)
     assert sizes.full_token == 3 * P
+
+
+def test_swa_num_pages_override_pins_the_window_and_keeps_the_full_reservation():
+    """A pinned window trades window pages for free VRAM; the history tiers are untouched.
+
+    Fixture: num_pages=2048, swa_ratio=0.5 -> 1024 derived window pages (2048 * 0.5). The pin
+    is an absolute usable-page count, so the physical tier is pin + 1 (the dummy page), and a
+    pin under the working-set floor is raised to it instead. full_token -- what the
+    compressed/index/state tiers are sized from -- stays num_pages * P either way, which is
+    why pinning the window cannot shrink a 1M-context reservation.
+    """
+    derived = _dsv41_pool_sizes(_config(), 2048)
+    pinned = _dsv41_pool_sizes(_config(swa_num_pages_override=160), 2048)
+    floored = _dsv41_pool_sizes(_config(swa_num_pages_override=1), 2048)
+
+    assert derived.n_win_pages == 1024
+    assert pinned.n_win_pages == 161
+    assert floored.n_win_pages == _dsv41_window_floor_pages(_config(), P)
+    assert derived.full_token == pinned.full_token == floored.full_token == 2048 * P
+    assert pinned.n_win_pages < derived.n_win_pages
+    assert dsv41_pool_bytes(pinned, _args(), n_scratch=1) < dsv41_pool_bytes(
+        derived, _args(), n_scratch=1
+    )
 
 
 def test_rebuild_resizes_in_place_and_keeps_band_sharing():

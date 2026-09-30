@@ -1,7 +1,12 @@
-"""--linear-state-cache-ratio: parses onto ServerArgs and sizes the hybrid GDN pool.
+"""Config-surface flags that only need a parser entry, onto ServerArgs.
 
-ServerArgs inherits SchedulerConfig(EngineConfig), so the field already exists on the engine
-side (engine/config.py, default 2.0); the flag only needs the parser entry.
+--linear-state-cache-ratio: parses onto ServerArgs and sizes the hybrid GDN pool.
+--swa-num-pages-override: parses onto ServerArgs and pins the DSV4/DSV4.1 window tier.
+
+ServerArgs inherits SchedulerConfig(EngineConfig), so both fields already exist on the engine
+side (engine/config.py: linear_state_cache_ratio default 2.0, swa_num_pages_override default
+None); the flags only need the parser entry, because parse_args splats the argparse namespace
+straight into ServerArgs(**kwargs).
 """
 from __future__ import annotations
 
@@ -70,3 +75,23 @@ def test_linear_state_cache_ratio_rejects_non_positive():
         )
         with pytest.raises(ValueError, match="linear_state_cache_ratio must be > 0"):
             _adjust_config(config)
+
+
+def test_swa_num_pages_override_default_is_engine_default():
+    args = _parse([])
+    assert args.swa_num_pages_override is None
+    assert EngineConfig.swa_num_pages_override is None
+
+
+def test_swa_num_pages_override_parses_int():
+    """The pinned page count reaches the engine config as-is; _dsv41_pool_sizes floors it."""
+    assert _parse(["--swa-num-pages-override", "160"]).swa_num_pages_override == 160
+
+
+def test_swa_num_pages_override_rejects_non_positive():
+    """A 0/negative pin fails fast at the parser instead of silently meaning 'the floor'."""
+    with pytest.raises(SystemExit):
+        _parse(["--swa-num-pages-override", "0"])
+    with pytest.raises(SystemExit):
+        _parse(["--swa-num-pages-override", "-4"])
+

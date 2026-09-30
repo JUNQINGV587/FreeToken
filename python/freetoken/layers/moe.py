@@ -340,7 +340,10 @@ class OffloadMoELayer(MoELayer):
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         if (cache.disk_tier_enabled and self.layer_id == 0
-                and os.environ.get("FT_DISK_TIER_VERIFY")):
+                and os.environ.get("FT_DISK_TIER_VERIFY")
+                # the verifier reads routes back to the host (masked selects +
+                # .item()), which invalidates a capture; skip it while graphing
+                and not torch.cuda.is_current_stream_capturing()):
             cache._disk_tier.verify_decode_mapping(cache, self.layer_id, topk_ids)
         return self._expert_gemm(
             cache,
@@ -381,6 +384,10 @@ class OffloadMoELayer(MoELayer):
         inner = owner._cache
         if (inner.disk_tier_enabled
                 and os.environ.get("FT_DISK_TIER_VERIFY")
+                # ``update.slot_ids[update.owned_mask]`` is a boolean-mask select:
+                # it syncs (nonzero + .item()) and invalidates a capture. Same
+                # reason the guardrail below is skipped when graph_safe.
+                and not torch.cuda.is_current_stream_capturing()
                 and (self.layer_id == 0
                      or os.environ.get("FT_DISK_TIER_VERIFY_ALL_LAYERS"))):
             inner._disk_tier.verify_decode_mapping(

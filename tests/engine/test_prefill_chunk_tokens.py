@@ -110,6 +110,15 @@ def test_dsv4_unset_still_single_chunks():
     assert config.max_extend_tokens == config.max_seq_len
 
 
+def test_cap_is_applied_with_prefix_reuse_enabled():
+    """Reuse and the chunk cap are independent: resolving V4.1 onto the shared SWARadixCache must
+    not disturb the cap, or a large pool hands the indexer a ~100k-token chunk again."""
+    config, calls = _resolve(_dsv41(), _config(cache_type="radix", prefill_chunk_tokens=2048))
+    assert config.cache_type == "swa_radix"
+    assert config.max_extend_tokens == 2048
+    assert calls["max_extend_tokens"] == 2048
+
+
 def test_page_size_comes_from_the_model_not_the_cap():
     """A different window size must move the rounding unit with it."""
     config = _config(prefill_chunk_tokens=1000)

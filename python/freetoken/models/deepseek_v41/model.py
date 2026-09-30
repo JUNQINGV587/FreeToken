@@ -335,12 +335,16 @@ class Transformer(BaseOP):
             "forward_paged needs the model bound to a pool: Transformer.bind(device, pool)"
         )
         if segments is not None:
+            # One segment per request, each starting at its OWN ``cached_len`` (see
+            # DSV41SparseAttnBackend.prepare_metadata): a ragged prefill packs requests whose
+            # cached prefixes differ -- several live radix hits, or a chunk continuation next to a
+            # fresh admit -- and ``prefill_ragged`` addresses every layer off ``flat_positions`` as
+            # soon as there is more than one segment. The scalar ``start_pos`` below only reaches
+            # the EAGER attention call (``attn_fn`` is always the paged entry here), so it is the
+            # first segment's.
             start_pos = segments[0][3]
-            assert all(s[3] == start_pos for s in segments) or len(segments) == 1, (
-                "a ragged batch carries one start_pos per request only when it is a warm pass"
-            )
-            assert start_pos == 0 or len(segments) == 1, (
-                "a warm segment advances one request at a time"
+            assert sum(s[1] for s in segments) == seqlen, (
+                "segments must tile the packed token axis"
             )
             if flat_positions is None:
                 flat_positions = torch.cat([

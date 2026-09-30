@@ -1782,11 +1782,15 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
       belong to a band's KV source and are shared BY IDENTITY across that band (3-7 <- 2,
       9-13 <- 8, 15-19 <- 14, 21-39 <- 20), so they do not scale with the layer count the way
       DSV4's per-layer shadows do -- ``dsv41_cost_model`` sizes them per source.
-    * Cross-request prefix reuse is NOT enabled yet: a matched prefix would hand one request the
-      band-shared compressed rows another request is still writing, and there is no band-level
-      reference count to release them with. M5 boots the no-reuse path (the pool's swa currency
-      rides swa_paged either way); honoring 'radix' would be a correctness bug, not an
-      optimization, so it is reported and overridden.
+    * Cross-request prefix reuse rides the shared SWARadixCache (is_swa), exactly like DSV4's
+      'radix'. A band's compressed/index tiers are shared BY IDENTITY, but a row is addressed off
+      the FULL-LOC SLOT of the block it compresses (``dsv41_compress.compress_rows_of`` ->
+      ``full_loc // ratio``) and the pool has no compressed-tier freelist, so a row's lifetime IS
+      its full page's lifetime -- which the radix full currency (``ref_count``) already pins for
+      every matched prefix. The window tier is the only currency that is recycled out from under a
+      reader, and it is handled generically (``swa_ref_count`` / tombstone + the per-request
+      ``cached_len`` floor). ``P % ratio == 0``, so a page-aligned match point lands on a compress
+      block boundary and never reads the per-page state ring. 'naive' is still honored.
     """
     model_config = config.model_config
     model_config.dsv41_args.max_seq_len = config.max_seq_len
@@ -1801,14 +1805,17 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     P = model_config.dsv41_args.window_size
     override("page_size", P)
     logger.info_rank0(f"DSV4.1 KV pages are {P}-token window pages; page_size set to {P}")
+    # The generic CacheManager materializes DSV4.1 'radix' as the shared SWARadixCache (is_swa),
+    # like DSV4; 'naive' stays naive with the pool's swa currency riding swa_paged. See the
+    # docstring for why the band-shared compressed rows need no currency of their own: they are
+    # addressed off the full-loc slot, so they are pinned exactly while their full page is.
     if getattr(config, "cache_type", "radix") != "naive":
-        requested_cache = getattr(config, "cache_type", "radix")
-        logger.warning_rank0(
-            "DeepSeek-V4.1 compressed rows are shared by identity across an attention band and "
-            f"have no cross-request release policy yet; overriding cache_type "
-            f"{requested_cache!r} -> 'naive' (no prefix reuse) for correctness."
+        override("cache_type", "swa_radix")
+        logger.info_rank0(
+            "DSV4.1 cross-request prefix reuse enabled (cache_type 'swa_radix'): band-shared "
+            "compressed rows are addressed off the full-loc slot and pinned by the full currency; "
+            "P-aligned match points resume on a compress block boundary."
         )
-        override("cache_type", "naive")
     # Same reason as DSV4: the chunk is the pool's budget unless --prefill-chunk-tokens caps it
     # (a pooled 1M-token reservation resolves to a ~100k-token chunk, whose indexer transient is
     # O(chunk x context) and OOMs).

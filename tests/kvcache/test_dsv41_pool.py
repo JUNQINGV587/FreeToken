@@ -511,3 +511,19 @@ def test_create_kv_pool_builds_a_usable_dsv41_pool():
     assert pool.sizes.full_token == (8 + 1) * P  # + the dummy page
     assert pool.swa_available_size() > 0
     assert pool.cmp_pool[25] is pool.cmp_pool[20]
+
+
+def test_create_kv_pool_wires_the_radix_flag_from_cache_type():
+    # The pool is told whether a prefix cache exists at all: 'naive' keeps the no-reuse window
+    # floor, anything else (the engine resolves DSV4.1 'radix' -> 'swa_radix', see
+    # _adjust_dsv41_config) reserves the generic radix live-tail floor as well. Guards the flag
+    # falling out of the create_kv_pool wiring, which is what kept V4.1 on the no-reuse path.
+    reuse = create_kv_pool(_config(cache_type="swa_radix"), num_pages=8, device=DEVICE,
+                           dtype=torch.bfloat16)
+    naive = create_kv_pool(_config(cache_type="naive"), num_pages=8, device=DEVICE,
+                           dtype=torch.bfloat16)
+    assert reuse._paged_params == (2, True)
+    assert naive._paged_params == (2, False)
+    # The radix reservation is a superset of the naive one, so the pool's default prefill chunk
+    # (half of what is left) can only shrink.
+    assert reuse.prefill_chunk_budget <= naive.prefill_chunk_budget

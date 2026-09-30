@@ -199,6 +199,14 @@ class DSV41PagedKVCache(BaseKVCachePool):
             assert blocks is not None and slots is not None, (
                 f"kv source {src} owns no compressed/state tier in sizes"
             )
+            # The window page P must be a whole number of compress blocks: then no token group
+            # straddles a page and a page-aligned prefix-resume starts a fresh block instead of
+            # reading the per-page state ring (whose rows follow WINDOW slots, which are recycled
+            # independently of the full pages a radix hit shares). See _adjust_dsv41_config.
+            assert self.P % sizes.ring_sizes[src] == 0, (
+                f"window page P={self.P} is not a multiple of kv source {src}'s compress ratio "
+                f"{sizes.ring_sizes[src]}"
+            )
             pool = torch.zeros(blocks + self.n_scratch, self.head_dim, device=device, dtype=dtype)
             ring = CompressStateRing(
                 n_slots=slots,

@@ -203,24 +203,25 @@ def test_auto_dsv4_sets_window_page_size(monkeypatch):
     assert config.page_size == 128
 
 
-def test_auto_dsv41_sets_window_page_and_refuses_prefix_reuse(monkeypatch):
+def test_auto_dsv41_sets_window_page_and_enables_prefix_reuse(monkeypatch):
     # V4.1's KV page is the P-token window page (page_size must be P, not 1), and cross-request
-    # reuse is not enabled yet: the compressed rows of a band are shared by identity with no
-    # band-level refcount, so a radix hit would hand one request rows another is still writing.
-    # Honoring the default 'radix' would be a correctness bug -> it is overridden to 'naive'.
+    # reuse rides the shared SWARadixCache like DSV4. The band-shared compressed rows need no
+    # currency of their own: a row is addressed off the full-loc slot of the block it compresses
+    # (dsv41_compress.compress_rows_of -> full_loc // ratio) and the pool has no compressed-tier
+    # freelist, so a row is pinned exactly while its full page is -- which the radix full currency
+    # already does. An explicit 'naive' is still honored.
     from freetoken.engine.engine import _adjust_config
 
     _patch_env(monkeypatch)
     config = _config("dsv41", attention_backend="auto")
     _adjust_config(config)
     assert config.page_size == 128
-    assert config.cache_type == "naive"
+    assert config.cache_type == "swa_radix"
 
-    # An explicit request for reuse is reported and overridden too, not silently lost.
     # ('cache_type' is not an EngineConfig field: the scheduler resolves it and the engine
     # reconciles it, so it is set the same way _adjust_config overrides it.)
     config = _config("dsv41", attention_backend="auto")
-    object.__setattr__(config, "cache_type", "swa_radix")
+    object.__setattr__(config, "cache_type", "naive")
     _adjust_config(config)
     assert config.cache_type == "naive"
 

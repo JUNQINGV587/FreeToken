@@ -108,6 +108,7 @@ class Scheduler(SchedulerIOMixin):
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
+            adaptive_chunk=bool(getattr(config, "prefill_chunk_adaptive", False)),
         )
 
         # some alias for easy access

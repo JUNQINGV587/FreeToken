@@ -1711,12 +1711,32 @@ def _apply_prefill_chunk_cap(config: EngineConfig, override, page_size: int, lab
     floor. The value is rounded down to whole window pages, the pool's currency.
     """
     cap = int(getattr(config, "prefill_chunk_tokens", 0) or 0)
+    adaptive = bool(getattr(config, "prefill_chunk_adaptive", False))
     if cap > 0:
         capped = min(max(page_size, cap // page_size * page_size), config.max_seq_len)
         override("max_extend_tokens", capped)
+        if adaptive:
+            from freetoken.scheduler.chunk_policy import SAFE_CHUNK_TOKENS, SAFE_CONTEXT_TOKENS
+
+            logger.info_rank0(
+                f"{label} prefill chunk ceiling {capped} tokens (--prefill-chunk-tokens {cap} "
+                "--prefill-chunk-adaptive: each pass takes the longest pending prompt when "
+                f"chunk x context <= {SAFE_CHUNK_TOKENS} x {SAFE_CONTEXT_TOKENS}, else that "
+                "ratio; the window pool's prefill_chunk_budget still bounds it from above)"
+            )
+        else:
+            logger.info_rank0(
+                f"{label} prefill chunk capped at {capped} tokens (--prefill-chunk-tokens {cap}; "
+                "the window pool's prefill_chunk_budget still bounds it from above)"
+            )
+    elif adaptive:
+        # Adaptive with no explicit ceiling: leave max_extend_tokens alone (the pool's budget still
+        # bounds it) instead of raising it to max_seq_len. That raise exists to let the pool chunk a
+        # prompt, and a 1M-token value would size the pynccl scratch, the warmup ladder and the
+        # chunk buffers for a pass no prompt can afford.
         logger.info_rank0(
-            f"{label} prefill chunk capped at {capped} tokens (--prefill-chunk-tokens {cap}; the "
-            "window pool's prefill_chunk_budget still bounds it from above)"
+            f"{label} prefill chunk adaptive, no ceiling given: capping at the configured "
+            f"max_extend_tokens {config.max_extend_tokens} tokens"
         )
     elif getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
         # Don't let max_extend_tokens force a second chunk within one prompt (the pool's

@@ -444,6 +444,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-chunk-adaptive",
+        action="store_true",
+        default=ServerArgs.prefill_chunk_adaptive,
+        help=(
+            "Treat --prefill-chunk-tokens as a CEILING instead of a fixed chunk: each prefill "
+            "pass takes the longest pending prompt's whole length when that fits the indexer's "
+            "measured-safe envelope (chunk x context <= 8192 x 105000), and a context-proportional "
+            "chunk otherwise. Cold prefill is disk-bound and each pass re-fetches the layer's "
+            "routed expert union, so one pass instead of ceil(len/chunk) cut a 24k prompt from "
+            "257.8 s / ~354 GiB read to 125.5 s / 142.7 GiB (measured on the 2xL20 box). Long "
+            "prompts stay at (or below) the static chunk, so the 105k-token path is unchanged."
+        ),
+    )
+
+    parser.add_argument(
         "--swa-num-pages-override",
         type=int,
         default=ServerArgs.swa_num_pages_override,

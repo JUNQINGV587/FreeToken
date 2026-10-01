@@ -8,6 +8,7 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
+from .chunk_policy import adaptive_prefill_budget
 from .mm import mm_chunk_end, mm_rows_after
 from .utils import PendingReq
 
@@ -290,6 +291,10 @@ class PrefillManager:
     decode_manager: DecodeManager
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
+    # ``--prefill-chunk-adaptive``: the pass budget handed in by the scheduler is a ceiling, and
+    # each pass scales it down to the longest pending prompt (see chunk_policy). Off reproduces the
+    # historical fixed-budget behaviour exactly.
+    adaptive_chunk: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -307,6 +312,17 @@ class PrefillManager:
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
+
+        if self.adaptive_chunk:
+            # Scale the ceiling down to the longest pending prompt: cold prefill is disk-bound and
+            # every pass re-fetches each layer's routed expert union, so a prompt that fits one
+            # pass should get it -- while the indexer's O(chunk x context) transient stays inside
+            # the envelope measured safe here (chunk x context <= 8192 x 105000). Lengths, not
+            # cached lengths, are the conservative choice: a continuation chunk still pays the
+            # transient for the whole context it carries.
+            prefill_budget = adaptive_prefill_budget(
+                max(req.input_len for req in self.pending_list), prefill_budget
+            )
 
         # estimated offset due to in-flight decode
         adder = PrefillAdder(

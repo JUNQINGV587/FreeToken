@@ -19,6 +19,13 @@ class SchedulerConfig(EngineConfig):
     # indexer transient is O(chunk x context). >0 caps the chunk independently of the pool
     # (rounded down to whole window pages). 0 keeps the historical pool-budget behaviour.
     prefill_chunk_tokens: int = 0
+    # Adaptive variant of the cap above: ``prefill_chunk_tokens`` becomes a *ceiling* (it still
+    # sizes buffers, warmup lengths and the pynccl scratch) and each prefill pass takes
+    # ``adaptive_prefill_budget(longest pending context, ceiling)`` -- the whole ceiling for a
+    # short prompt (one disk-tier pass instead of ceil(len/chunk)) and a context-proportional
+    # chunk for a long one, so the indexer's O(chunk x context) transient stays inside the
+    # envelope already measured safe on this box. See freetoken/scheduler/chunk_policy.py.
+    prefill_chunk_adaptive: bool = False
     cache_type: str = "radix"
     offline_mode: bool = False
     decode_log_interval: int = 40

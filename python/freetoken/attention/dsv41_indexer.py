@@ -72,12 +72,17 @@ class DSV41IndexerBackendMixin:
         Query ``s`` sits at absolute position ``p = start_pos + s`` and may attend blocks
         ``[0, (p + 1) // ratio)``. Blocks past that score ``-inf`` so they lose the top-k; any
         that still get picked (a short live count) come back as ``-1``.
+
+        The mask is applied by broadcasting the block axis against the live count, so nothing
+        here materialises an O(seqlen x n_blocks) row grid -- this runs once per indexer layer
+        and per prefill pass, and both axes are large on a long context.
         """
         device = scores.device
         n_blocks = scores.shape[-1]
         live = ((start_pos + torch.arange(1, seqlen + 1, device=device)) // ratio).unsqueeze(1)
-        blk = torch.arange(n_blocks, device=device).repeat(seqlen, 1)
-        scores = scores + torch.where(blk >= live, float("-inf"), 0)
+        scores = scores.masked_fill(
+            torch.arange(n_blocks, device=device) >= live, float("-inf")
+        )
         picks = scores.topk(min(topk, n_blocks), dim=-1)[1]
         return torch.where(picks >= live, -1, picks + offset)
 

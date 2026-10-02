@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 
+from freetoken.attention.indexer_memory import plan_query_block
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import fp4_act_quant_inplace
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
@@ -320,30 +321,46 @@ class Indexer(BaseOP):
 
         keys = self.attn.indexer_keys(ti, n_blocks, ratio, self.layer_id, bsz)
         weights = self._head_weights(x)
-        scores = self.attn.indexer_prefill_logits(q, keys, weights)
-
-        # a block becomes visible once the query has passed its last token
-        live = (start_pos + torch.arange(1, seqlen + 1, device=x.device)) // ratio
-        if n_blocks:
-            scores = scores.masked_fill(
-                torch.arange(n_blocks, device=x.device) >= live[:, None], float("-inf")
-            )
-            mask = self.runtime.candidates[:bsz, off : off + seqlen, :n_blocks]
-            if self.is_candidate_source:
-                mask.copy_(
-                    select_candidate_blocks(
-                        scores, live.unsqueeze(-1), self.candidate_topk_blocks,
-                        self.candidate_block_size,
-                    )
-                )
-            elif self.uses_candidates:
-                scores = scores.masked_fill(~mask, float("-inf"))
-
         topk = min(self.index_topk, n_blocks)
-        idxs = self.attn.indexer_select_prefill(
-            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio, topk=topk, offset=0
-        )
-        return self._publish(idxs, off)
+
+        # Every indexer transient here is O(rows x n_blocks), and n_blocks tracks the CONTEXT
+        # while rows track the prefill CHUNK: at a 105k-token context a 24,576-token chunk would
+        # want tens of GiB of scratch, which is what forced long-context prefills down to ~8k
+        # chunks -- and a chunk is one full re-read of the disk tier's expert set, so shrinking it
+        # is expensive. Score the query axis in sub-blocks instead: the MoE half of the pass still
+        # covers the whole chunk, so the disk cost stays at one fetch per chunk while the indexer's
+        # peak is bounded by the sub-block. ``_publish`` takes the segment offset, so each
+        # sub-block publishes its own rows; ``plan_query_block`` returns 0 (one call, byte-identical
+        # arithmetic) whenever the whole chunk already fits the budget.
+        block = plan_query_block(seqlen, n_blocks) or seqlen
+        for s0 in range(0, seqlen, block):
+            n = min(block, seqlen - s0)
+            s1 = s0 + n
+            scores = self.attn.indexer_prefill_logits(
+                q[:, s0:s1], keys, weights[:, s0:s1]
+            )
+            if n_blocks:
+                # a block becomes visible once the query has passed its last token
+                live = (start_pos + torch.arange(s0 + 1, s1 + 1, device=x.device)) // ratio
+                scores = scores.masked_fill(
+                    torch.arange(n_blocks, device=x.device) >= live[:, None], float("-inf")
+                )
+                mask = self.runtime.candidates[:bsz, off + s0 : off + s1, :n_blocks]
+                if self.is_candidate_source:
+                    mask.copy_(
+                        select_candidate_blocks(
+                            scores, live.unsqueeze(-1), self.candidate_topk_blocks,
+                            self.candidate_block_size,
+                        )
+                    )
+                elif self.uses_candidates:
+                    scores = scores.masked_fill(~mask, float("-inf"))
+
+            idxs = self.attn.indexer_select_prefill(
+                scores, start_pos=start_pos + s0, seqlen=n, ratio=ratio, topk=topk, offset=0
+            )
+            self._publish(idxs, off + s0)
+        return self.runtime.topk_idxs[:bsz, off : off + seqlen, :topk]
 
     @torch.no_grad()
     def decode_paged(

@@ -7,12 +7,23 @@ in 3 passes (8,192-token chunk, 160 window pages) and 125.5 s / 142.7 GiB in one
 chunk, 416 pages) -- measured on the 2xL20 box, see
 notes/freetoken/20261001-dsv41-cold-prefill-chunk-merge.md.
 
-The big chunk cannot be pinned statically: ``dsv41_indexer.indexer_select_prefill`` allocates an
-O(chunk x context) causal-mask transient, and a 105k context already peaked at 45,475 of 49,140 MiB
-on GPU0 with the 8,192 chunk (see notes/freetoken/20260930-dsv41-prefill-chunk-sweep.md). So the
-flag makes ``--prefill-chunk-tokens`` a *ceiling* and the pass budget becomes
+The big chunk cannot be pinned statically: the prefill indexer's transients are O(chunk x context),
+and a 105k context already peaked at 45,475 of 49,140 MiB on GPU0 with the 8,192 chunk (see
+notes/freetoken/20260930-dsv41-prefill-chunk-sweep.md). So the flag makes
+``--prefill-chunk-tokens`` a *ceiling* and the pass budget becomes
 ``adaptive_prefill_budget(longest pending context, ceiling)``: the whole ceiling while
-``chunk x context`` stays inside the measured envelope, a context-proportional chunk beyond it.
+``chunk x context`` stays inside the envelope for the current indexer, a context-proportional chunk
+beyond it.
+
+Two envelopes exist, and the tests pin both:
+
+  * ``SAFE_PRODUCT`` (8,192 x 105,000) is what this box has actually run -- it applies when the
+    indexer's query axis is not sub-blocked (``FREETOKEN_INDEXER_SUBBLOCK_BYTES=0``), because the
+    score matrix is then O(chunk x context);
+  * ``BIG_CHUNK_PRODUCT`` (24,576 x 105,000, 3x larger) applies by default, because
+    ``attention/indexer_memory.py`` scores the query axis in sub-blocks and
+    ``indexer_select_prefill`` no longer materialises an int64 row grid. What still scales with the
+    chunk at a long context is the bool candidate mask, which is what the bigger product budgets.
 
 These tests pin the arithmetic, the boundary behaviour, the config-layer resolution (including the
 branch that must NOT raise ``max_extend_tokens`` to ``max_seq_len``), and the scheduler wiring.
@@ -23,14 +34,19 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from freetoken.scheduler.chunk_policy import (
+    BIG_CHUNK_PRODUCT,
+    BIG_CHUNK_TOKENS,
+    MASK_BUDGET_BYTES,
     MIN_CHUNK_TOKENS,
     SAFE_CHUNK_TOKENS,
     SAFE_CONTEXT_TOKENS,
     SAFE_PRODUCT,
     adaptive_prefill_budget,
+    chunk_context_product,
 )
 
 PAGE = 128  # the DSV4/DSV4.1 window page, i.e. the pool's currency
+SUB_BLOCK_ENV = "FREETOKEN_INDEXER_SUBBLOCK_BYTES"
 
 
 # --------------------------------------------------------------------------------------
@@ -44,21 +60,56 @@ def test_short_prompt_takes_the_whole_ceiling():
     assert adaptive_prefill_budget(1, 24_576) == 24_576
 
 
-def test_long_prompt_falls_back_to_todays_chunk():
-    """A 105k context keeps the chunk that was measured to fit it -- the deployed behaviour."""
-    assert adaptive_prefill_budget(SAFE_CONTEXT_TOKENS, 24_576) == SAFE_CHUNK_TOKENS
+def test_long_prompt_keeps_the_measured_chunk_when_the_indexer_is_not_sub_blocked():
+    """With ``FREETOKEN_INDEXER_SUBBLOCK_BYTES=0`` a 105k context keeps the chunk measured to fit."""
+    conservative = dict(safe_product=SAFE_PRODUCT)
+    assert adaptive_prefill_budget(SAFE_CONTEXT_TOKENS, 24_576, **conservative) == SAFE_CHUNK_TOKENS
     # A prompt a hair past the calibration point is cut back by exactly the ratio -- a fraction of
     # a page, not a second pass' worth of disk traffic.
+    assert adaptive_prefill_budget(105_241, 24_576, **conservative) == 8173
+    assert adaptive_prefill_budget(105_241, 24_576, **conservative) <= SAFE_CHUNK_TOKENS
+
+
+def test_long_prompt_takes_the_big_chunk_by_default():
+    """The sub-blocked indexer lifts the envelope 3x, so 105k gets 5 passes instead of 13."""
+    budget = adaptive_prefill_budget(105_241, 24_576)
+    assert budget == BIG_CHUNK_PRODUCT // 105_241
+    assert 24_000 < budget <= BIG_CHUNK_TOKENS
+    assert -(-105_241 // budget) == 5  # ceil division: five passes for the 105k prompt
+    # The conservative envelope is still what an unset/zero budget falls back to.
+    assert chunk_context_product(105_241) == BIG_CHUNK_PRODUCT
+
+
+def test_sub_blocking_switch_selects_the_envelope(monkeypatch):
+    from freetoken.attention.indexer_memory import subblock_budget_bytes
+
+    monkeypatch.delenv(SUB_BLOCK_ENV, raising=False)
+    assert subblock_budget_bytes() > 0
+    assert chunk_context_product(105_241) == BIG_CHUNK_PRODUCT
+
+    monkeypatch.setenv(SUB_BLOCK_ENV, "0")
+    assert subblock_budget_bytes() == 0
+    assert chunk_context_product(105_241) == SAFE_PRODUCT
     assert adaptive_prefill_budget(105_241, 24_576) == 8173
-    assert adaptive_prefill_budget(105_241, 24_576) <= SAFE_CHUNK_TOKENS
+
+    # A malformed value must not silently disable the sub-blocking (that would shrink chunks).
+    monkeypatch.setenv(SUB_BLOCK_ENV, "not-a-number")
+    assert chunk_context_product(105_241) == BIG_CHUNK_PRODUCT
+
+
+def test_mask_budget_is_the_size_a_proven_configuration_produced():
+    assert MASK_BUDGET_BYTES == BIG_CHUNK_TOKENS * SAFE_CONTEXT_TOKENS // 4
+    assert BIG_CHUNK_PRODUCT == BIG_CHUNK_TOKENS * SAFE_CONTEXT_TOKENS
+    assert BIG_CHUNK_PRODUCT == 3 * SAFE_PRODUCT
 
 
 def test_budget_crosses_over_exactly_at_the_envelope():
-    """At chunk x context == SAFE_PRODUCT the ceiling is still allowed; one token more is not."""
-    for ceiling in (4_096, 8_192, 24_576, 65_536):  # > MIN_CHUNK_TOKENS: the floor cannot bite
-        exact = SAFE_PRODUCT // ceiling
-        assert adaptive_prefill_budget(exact, ceiling) == ceiling
-        assert adaptive_prefill_budget(exact + 1, ceiling) < ceiling
+    """At chunk x context == the envelope the ceiling is still allowed; one token more is not."""
+    for product in (SAFE_PRODUCT, BIG_CHUNK_PRODUCT):
+        for ceiling in (4_096, 8_192, 24_576, 65_536):  # > MIN_CHUNK_TOKENS: the floor cannot bite
+            exact = product // ceiling
+            assert adaptive_prefill_budget(exact, ceiling, safe_product=product) == ceiling
+            assert adaptive_prefill_budget(exact + 1, ceiling, safe_product=product) < ceiling
 
 
 def test_ceiling_is_never_exceeded():
@@ -69,15 +120,28 @@ def test_ceiling_is_never_exceeded():
 
 
 def test_transient_stays_inside_the_envelope_unless_the_floor_bites():
-    """Whenever the floor does not bite, the invariant ``budget x context <= SAFE_PRODUCT`` holds.
+    """Whenever the floor does not bite, the invariant ``budget x context <= product`` holds.
 
-    Otherwise the budget is exactly the floor -- which only happens for contexts past ~420k tokens,
-    where the window pool, not the indexer, is the binding limit.
+    Otherwise the budget is exactly the floor -- which only happens for contexts past ~420k tokens
+    (conservative envelope) or ~1.26M tokens (sub-blocked envelope), where the window pool, not the
+    indexer, is the binding limit.
     """
-    for ceiling in (2_048, 4_096, 8_192, 24_576, 1_048_576):
-        for context in (1, 128, 1_000, 23_671, 60_000, SAFE_CONTEXT_TOKENS, 300_000):
+    for product in (SAFE_PRODUCT, BIG_CHUNK_PRODUCT):
+        for ceiling in (2_048, 4_096, 8_192, 24_576, 1_048_576):
+            for context in (1, 128, 1_000, 23_671, 60_000, SAFE_CONTEXT_TOKENS, 300_000):
+                budget = adaptive_prefill_budget(context, ceiling, safe_product=product)
+                assert budget * context <= product or budget == MIN_CHUNK_TOKENS, (
+                    context,
+                    ceiling,
+                    budget,
+                )
+
+
+def test_the_default_path_satisfies_the_big_envelope():
+    for ceiling in (2_048, 8_192, 24_576, 65_536):
+        for context in (1, 128, 23_671, 105_241, 500_000):
             budget = adaptive_prefill_budget(context, ceiling)
-            assert budget * context <= SAFE_PRODUCT or budget == MIN_CHUNK_TOKENS, (
+            assert budget * context <= BIG_CHUNK_PRODUCT or budget == MIN_CHUNK_TOKENS, (
                 context,
                 ceiling,
                 budget,
@@ -85,9 +149,12 @@ def test_transient_stays_inside_the_envelope_unless_the_floor_bites():
 
 
 def test_floor_stops_the_degenerate_shrink():
-    """Above SAFE_PRODUCT // MIN_CHUNK_TOKENS the ratio would fall below the floor."""
+    """Above ``product // MIN_CHUNK_TOKENS`` the ratio would fall below the floor."""
     huge = SAFE_PRODUCT // MIN_CHUNK_TOKENS  # ~420k tokens
-    assert adaptive_prefill_budget(huge, 24_576) == MIN_CHUNK_TOKENS
+    assert adaptive_prefill_budget(huge, 24_576, safe_product=SAFE_PRODUCT) == MIN_CHUNK_TOKENS
+    assert adaptive_prefill_budget(2_000_000, 24_576, safe_product=SAFE_PRODUCT) == MIN_CHUNK_TOKENS
+    # The sub-blocked envelope holds out an order of magnitude further before the floor bites.
+    assert adaptive_prefill_budget(huge, 24_576) > MIN_CHUNK_TOKENS
     assert adaptive_prefill_budget(2_000_000, 24_576) == MIN_CHUNK_TOKENS
     # and the floor never inflates past the ceiling either
     assert adaptive_prefill_budget(2_000_000, PAGE) == PAGE
@@ -261,7 +328,17 @@ def test_scheduler_hands_a_short_prompt_the_whole_ceiling(monkeypatch):
     assert seen["reserved_size"] == 7
 
 
-def test_scheduler_cuts_a_long_prompt_back_to_todays_chunk(monkeypatch):
+def test_scheduler_cuts_a_long_prompt_back_inside_the_envelope(monkeypatch):
+    """Default (sub-blocked) envelope: a 105,241-token prompt gets ~24.5k tokens per pass."""
+    monkeypatch.delenv(SUB_BLOCK_ENV, raising=False)
+    manager, seen = _manager(monkeypatch, adaptive=True)
+    manager.pending_list = [_pending(105_241)]
+    assert manager.schedule_next_batch(24_576) is None
+    assert seen["token_budget"] == BIG_CHUNK_PRODUCT // 105_241
+
+
+def test_scheduler_falls_back_to_the_measured_chunk_without_sub_blocking(monkeypatch):
+    monkeypatch.setenv(SUB_BLOCK_ENV, "0")
     manager, seen = _manager(monkeypatch, adaptive=True)
     manager.pending_list = [_pending(105_241)]
     assert manager.schedule_next_batch(24_576) is None
@@ -269,13 +346,15 @@ def test_scheduler_cuts_a_long_prompt_back_to_todays_chunk(monkeypatch):
 
 
 def test_scheduler_uses_the_longest_pending_prompt(monkeypatch):
+    monkeypatch.delenv(SUB_BLOCK_ENV, raising=False)
     manager, seen = _manager(monkeypatch, adaptive=True)
     manager.pending_list = [_pending(500), _pending(105_241)]
     manager.schedule_next_batch(24_576)
-    assert seen["token_budget"] == 8173
+    assert seen["token_budget"] == BIG_CHUNK_PRODUCT // 105_241
 
 
 def test_scheduler_is_byte_identical_when_the_flag_is_off(monkeypatch):
+    monkeypatch.delenv(SUB_BLOCK_ENV, raising=False)
     manager, seen = _manager(monkeypatch, adaptive=False)
     manager.pending_list = [_pending(105_241)]
     manager.schedule_next_batch(24_576)

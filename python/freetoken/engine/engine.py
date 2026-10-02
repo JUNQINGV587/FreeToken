@@ -1716,13 +1716,20 @@ def _apply_prefill_chunk_cap(config: EngineConfig, override, page_size: int, lab
         capped = min(max(page_size, cap // page_size * page_size), config.max_seq_len)
         override("max_extend_tokens", capped)
         if adaptive:
-            from freetoken.scheduler.chunk_policy import SAFE_CHUNK_TOKENS, SAFE_CONTEXT_TOKENS
+            from freetoken.scheduler.chunk_policy import (
+                SAFE_CONTEXT_TOKENS,
+                chunk_context_product,
+            )
 
+            # Report the envelope the policy will actually apply: with the indexer's query axis
+            # sub-blocked the product is the big one (24,576 x 105,000), and with that switched off
+            # it is the measured conservative one (8,192 x 105,000).
+            big = chunk_context_product(SAFE_CONTEXT_TOKENS) // SAFE_CONTEXT_TOKENS
             logger.info_rank0(
                 f"{label} prefill chunk ceiling {capped} tokens (--prefill-chunk-tokens {cap} "
-                "--prefill-chunk-adaptive: each pass takes the longest pending prompt when "
-                f"chunk x context <= {SAFE_CHUNK_TOKENS} x {SAFE_CONTEXT_TOKENS}, else that "
-                "ratio; the window pool's prefill_chunk_budget still bounds it from above)"
+                "--prefill-chunk-adaptive: each pass takes the longest pending prompt while "
+                f"chunk x context <= {big} x {SAFE_CONTEXT_TOKENS}, else that ratio; the window "
+                "pool's prefill_chunk_budget still bounds it from above)"
             )
         else:
             logger.info_rank0(

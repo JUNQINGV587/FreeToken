@@ -547,7 +547,7 @@ def test_slot_mirror_tracks_eviction(checkpoint):
     assert tier._slot_owner[(1, 5)] == 1
 
 
-# ---------------------------------------------------------------- P1 telemetry / AUTOPIN
+# ---------------------------------------------------------------- P1 telemetry
 def test_route_histogram_observes_routing_and_decays(checkpoint):
     from freetoken.moe.disk_tier import DiskTier
 
@@ -567,34 +567,11 @@ def test_route_histogram_observes_routing_and_decays(checkpoint):
     assert tier.stats()["route_hist_total"] > 0
 
 
-def test_autopin_pinned_count_respects_budget_and_mass():
-    from freetoken.moe.disk_tier import autopin_pinned_count
-
-    # E=8, all routing mass on experts 0..1 -> tiny K even with a huge budget.
-    hist = torch.zeros((2, 8), dtype=torch.float64)
-    hist[:, 0] = 1000.0
-    hist[:, 1] = 1000.0
-    k = autopin_pinned_count(hist, budget_bytes=1 << 30, ram_row_bytes=1 << 20)
-    assert k == 2  # coverage knee: pinning beyond expert 1 buys nothing
-
-    # Uniform mass: K limited by the 0.5*budget*min(1, obs/200000) share.
-    hist = torch.ones((2, 8), dtype=torch.float64) * 1000.0  # 16000 obs
-    k = autopin_pinned_count(hist, budget_bytes=1 << 30, ram_row_bytes=1 << 20)
-    # share = 0.5 * 1GiB * 16000/200000 = ~40 MiB -> 40 rows, capped by E=8.
-    assert k == 8
-    hist = torch.ones((2, 8), dtype=torch.float64) * 10.0  # 160 obs -> cold
-    k = autopin_pinned_count(hist, budget_bytes=1 << 30, ram_row_bytes=1 << 20)
-    assert k == 0  # min(1, 160/200000) shrinks the share below one row
-
-    # No observations -> no pins.
-    assert autopin_pinned_count(torch.zeros((2, 8)), 1 << 30, 1 << 20) == 0
-
-
-def test_autopin_advice_and_histogram_persistence(checkpoint, tmp_path):
+def test_histogram_persistence_round_trip(checkpoint, tmp_path):
+    """The routing-mass histogram is PILOT heat telemetry; it must round-trip."""
     cache = _fake_cache()
     tier = _tier(checkpoint, cache)
     tier.prefetch_from_routing(0, torch.tensor([0, 1, 1], dtype=torch.int32))
-    assert 0 <= tier.autopin_advice(budget_bytes=1 << 30) <= 4
     p = tmp_path / "hist.json"
     tier.save_histogram(str(p))
     tier2 = _tier(checkpoint, _fake_cache())
@@ -603,50 +580,6 @@ def test_autopin_advice_and_histogram_persistence(checkpoint, tmp_path):
 
 
 # ---------------------------------------------------------------- P1 LFRU admission
-def test_tier_admission_semantics_match_colibri_contract():
-    from freetoken.moe import tier_admission as ta
-
-    # Hysteresis: 25% + 4 margin. cold=100 -> promote needs hot > 129.
-    assert not ta.should_promote(129, 100)
-    assert ta.should_promote(130, 100)
-    assert ta.should_promote(5, 0)          # fixed margin handles tiny samples
-    assert not ta.should_promote(4, 0)
-    assert ta.decay_value(7) == 3
-
-    # Sticky saturation: huge float mass clamps to uint32 max, never wraps.
-    h = ta.heat_u32(torch.tensor([1e30, 5.0]))
-    assert int(h[0]) == (1 << 32) - 1 and int(h[1]) == 5
-
-    # Recency is a tiebreak only: 1 frequency point (256) beats max recency (255).
-    fresh_cold = ta.lfru_score(heat=1, last=100, clock=100)   # 256|255
-    stale_hot = ta.lfru_score(heat=2, last=0, clock=100)      # 512|0
-    assert stale_hot > fresh_cold
-
-    # pick_lfru: pinned {0,1}, expert 2 much hotter -> swap coldest pinned out.
-    heat = torch.tensor([10, 50, 200], dtype=torch.int64)
-    last = torch.tensor([0, 0, 0], dtype=torch.int64)
-    swap = ta.pick_lfru(heat, last, clock=0, pinned=[0, 1])
-    assert swap is not None and swap[0] == 0 and swap[1] == 2 and swap[2] > 0
-    # Below the hysteresis margin -> no swap.
-    heat2 = torch.tensor([10, 12, 13], dtype=torch.int64)
-    assert ta.pick_lfru(heat2, last, clock=0, pinned=[0, 1]) is None
-    # pick_swap (frequency-only variant) same contract.
-    assert ta.pick_swap(heat, pinned=[0, 1]) == (0, 2, 190)
-    assert ta.pick_swap(torch.tensor([1, 1, 1]), pinned=[0, 1]) is None
-
-
-def test_disk_tier_pin_advice_uses_telemetry(checkpoint):
-    cache = _fake_cache()
-    tier = _tier(checkpoint, cache)  # ram_experts=2 -> pinned prefix [0, 1]
-    assert tier.pin_advice(0) is None  # no observations yet
-    for _ in range(300):
-        tier.prefetch_from_routing(0, torch.tensor([2, 2, 3], dtype=torch.int32))
-    advice = tier.pin_advice(0)
-    # Expert 2 dominates routing mass -> it should be advised into a RAM row,
-    # evicting the colder of the pinned {0, 1}.
-    assert advice is not None and advice[1] == 2 and advice[0] in (0, 1)
-
-
 def test_hits_bitmap_and_turn_persistence(checkpoint, tmp_path, monkeypatch):
     """HITS telemetry: source classification + per-turn JSONL persistence."""
     tele = tmp_path / "telemetry.jsonl"

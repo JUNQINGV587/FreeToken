@@ -180,37 +180,6 @@ def _read_safetensors_offsets(path: str) -> dict[str, tuple[int, int]]:
 
 
 
-def autopin_pinned_count(route_hist: "torch.Tensor", budget_bytes: int,
-                         ram_row_bytes: int) -> int:
-    """P1 AUTOPIN (colibri tier.h): pinned share = 0.5 x budget x
-    min(1, observations/200000), then the largest contiguous expert prefix
-    [0, K) whose measured routing mass fits that share.
-
-    route_hist: (L, E) float routing-mass histogram (decayed counts).
-    The prefix constraint matches the host-bank layout (RAM rows are a
-    contiguous prefix); arbitrary-set pinning needs a loader row remap and
-    is deliberately out of scope here.
-    """
-    import torch as _t
-    E = route_hist.shape[-1]
-    total_obs = float(route_hist.sum())
-    if total_obs <= 0 or ram_row_bytes <= 0:
-        return 0
-    pinned_budget = 0.5 * budget_bytes * min(1.0, total_obs / 200000.0)
-    k_max = min(E, int(pinned_budget // ram_row_bytes))
-    if k_max <= 0:
-        return 0
-    # Per-expert mass averaged over layers; prefix coverage of [0, K).
-    mass = route_hist.sum(dim=0) / route_hist.shape[0]
-    coverage = _t.cumsum(mass, dim=0) / mass.sum().clamp(min=1e-9)
-    # Pick the largest K <= k_max that still improves coverage meaningfully;
-    # beyond the mass knee extra pins buy nothing.
-    k = k_max
-    while k > 1 and float(coverage[k - 1]) - float(coverage[k - 2]) < 1e-4:
-        k -= 1
-    return k
-
-
 class Nvfp4DiskIndex:
     """(bank, layer, expert) -> per-segment (shard_idx, offset, nbytes) locations.
 
@@ -1328,24 +1297,6 @@ class DiskTier:
     def route_histogram(self) -> torch.Tensor:
         """Decayed (L, E) routing-mass snapshot for placement decisions."""
         return self._route_hist.clone()
-
-    def autopin_advice(self, budget_bytes: int) -> int:
-        """Recommended contiguous RAM prefix K from measured routing mass."""
-        row = self._row_bytes[0] + 2 * _ALIGN if len(self._row_bytes) else 0
-        ram_row = sum(self._row_bytes[b] for b in range(len(self._banks))
-                      if b not in getattr(self._index, "scalar_banks", ()))
-        return autopin_pinned_count(self._route_hist, budget_bytes,
-                                    max(ram_row, row, 1))
-
-    def pin_advice(self, layer_id: int) -> tuple[int, int, int] | None:
-        """LFRU admission (colibri tier.h): which currently pinned expert should
-        yield its RAM row to which hotter non-resident one. None = hysteresis
-        says stay. Decision only -- actuation needs the loader row remap."""
-        from freetoken.moe.tier_admission import heat_u32, pick_lfru
-
-        return pick_lfru(heat_u32(self._route_hist[layer_id]),
-                         self._route_last[layer_id], self._route_clock,
-                         list(range(self._ram)))
 
     def save_histogram(self, path: str) -> None:
         payload = {"layers": self._index.num_layers,

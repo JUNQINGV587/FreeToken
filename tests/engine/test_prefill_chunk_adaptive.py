@@ -43,10 +43,12 @@ from freetoken.scheduler.chunk_policy import (
     SAFE_PRODUCT,
     adaptive_prefill_budget,
     chunk_context_product,
+    mask_budget_bytes,
 )
 
 PAGE = 128  # the DSV4/DSV4.1 window page, i.e. the pool's currency
 SUB_BLOCK_ENV = "FREETOKEN_INDEXER_SUBBLOCK_BYTES"
+MASK_BUDGET_ENV = "FREETOKEN_PREFILL_MASK_BUDGET_MB"
 
 
 # --------------------------------------------------------------------------------------
@@ -101,6 +103,31 @@ def test_mask_budget_is_the_size_a_proven_configuration_produced():
     assert MASK_BUDGET_BYTES == BIG_CHUNK_TOKENS * SAFE_CONTEXT_TOKENS // 4
     assert BIG_CHUNK_PRODUCT == BIG_CHUNK_TOKENS * SAFE_CONTEXT_TOKENS
     assert BIG_CHUNK_PRODUCT == 3 * SAFE_PRODUCT
+
+
+def test_mask_budget_env_override(monkeypatch):
+    """``FREETOKEN_PREFILL_MASK_BUDGET_MB`` rescales the envelope at call time.
+
+    The SWA window pool, the ``--prefill-chunk-tokens`` ceiling and this mask budget are three
+    caps that must move together (notes/freetoken/20261003-dsv41-swa-pool-envelope.md): at a
+    105,241-token context the compiled-in 615 MiB budget caps a pass at 24,519 tokens, while
+    950 MiB lifts that cap to 37,861 -- above the 35,200 budget a 573-page pool provides.
+    """
+    assert mask_budget_bytes() == MASK_BUDGET_BYTES
+    assert chunk_context_product(105_241) == BIG_CHUNK_PRODUCT
+
+    monkeypatch.setenv(MASK_BUDGET_ENV, "950")
+    assert mask_budget_bytes() == 950 * 1_048_576
+    assert chunk_context_product(105_241) == 950 * 1_048_576 * 4
+    # ... and it flows into the pass budget: the mask cap clears the 573-page pool's 35,200.
+    assert chunk_context_product(105_241) // 105_241 == 37_861
+    assert adaptive_prefill_budget(105_241, 40_960) == 37_861
+
+    # Zero, negative and malformed values fall back to the compiled-in budget.
+    for bad in ("0", "-5", "not-a-number"):
+        monkeypatch.setenv(MASK_BUDGET_ENV, bad)
+        assert mask_budget_bytes() == MASK_BUDGET_BYTES, bad
+        assert chunk_context_product(105_241) == BIG_CHUNK_PRODUCT, bad
 
 
 def test_budget_crosses_over_exactly_at_the_envelope():

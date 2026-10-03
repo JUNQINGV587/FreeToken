@@ -29,6 +29,8 @@ run applies instead.
 
 from __future__ import annotations
 
+import os
+
 from freetoken.attention.indexer_memory import subblock_budget_bytes
 
 # The envelope measured safe on this box: 8,192 tokens of chunk against a 105,000-token context,
@@ -56,6 +58,30 @@ MASK_RATIO = 4
 MASK_BUDGET_BYTES = BIG_CHUNK_TOKENS * SAFE_CONTEXT_TOKENS // MASK_RATIO
 BIG_CHUNK_PRODUCT = MASK_BUDGET_BYTES * MASK_RATIO
 
+
+def mask_budget_bytes() -> int:
+    """Candidate-mask byte budget, overridable at call time via
+    ``FREETOKEN_PREFILL_MASK_BUDGET_MB`` (integer MiB, ``> 0``; anything else falls back to the
+    compiled-in ``MASK_BUDGET_BYTES``).
+
+    The mask budget is one of the three caps on a prefill pass (alongside the
+    ``--prefill-chunk-tokens`` ceiling and the window pool's ``prefill_chunk_budget``), and all
+    three must move together: raising the SWA window pool (``--swa-num-pages-override``) to buy a
+    bigger chunk is pointless unless the mask budget rises in step -- at a 105k context the mask
+    envelope ``budget * MASK_RATIO // context`` is the binding cap, not the pool. The env is read
+    on every call so a restarted engine (or a test) sees the current value. See
+    notes/freetoken/20261003-dsv41-swa-pool-envelope.md for the account.
+    """
+    raw = os.environ.get("FREETOKEN_PREFILL_MASK_BUDGET_MB", "")
+    if raw:
+        try:
+            mb = int(raw)
+        except ValueError:
+            mb = 0
+        if mb > 0:
+            return mb * 1_048_576
+    return MASK_BUDGET_BYTES
+
 # Below this the pass count (and therefore the disk-tier amplification) grows faster than the
 # indexer transient falls, so the rule stops shrinking. The usable context of this deployment is
 # bounded by the window pool well before SAFE_PRODUCT // MIN_CHUNK_TOKENS (~420k tokens), so the
@@ -72,7 +98,7 @@ def chunk_context_product(context_len: int) -> int:
     the policy it implements, and to leave a seam for an envelope that does vary with context.
     """
     if subblock_budget_bytes() > 0:
-        return BIG_CHUNK_PRODUCT
+        return mask_budget_bytes() * MASK_RATIO
     return SAFE_PRODUCT
 
 

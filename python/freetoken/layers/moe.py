@@ -452,6 +452,14 @@ class OffloadMoELayer(MoELayer):
         owner = self.owner_cache
         executor = owner.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
+        inner = owner._cache
+        if inner.disk_tier_enabled and inner._disk_tier._prefetch_window > 0:
+            # Same contract as _decode_owner: L's RAW routing predicts L+1's disk rows, so
+            # it must be issued BEFORE ensure_route_hybrid rewrites topk_ids in place (and
+            # masks weights) to the owner-local namespace. Gated on _prefetch_window
+            # because the call itself pays a D2H sync (route-histogram telemetry) even
+            # when nothing is issued -- see DiskTier._prefetch_window for why it is off.
+            inner._disk_tier.prefetch_from_routing(self.layer_id, topk_ids)
         update = owner.ensure_route_hybrid(self.layer_id, topk_weights, topk_ids)
         if owner.collect_stats:
             owner.record_decode_stats_hybrid(self.layer_id)

@@ -1352,6 +1352,16 @@ class OffloadMoeCache:
                 out["routing"] = self.decode_routing_stats()
             except Exception:  # noqa: BLE001 -- stats must never break the reply path
                 pass
+        # DIAGNOSTIC (captain, 2026-10-02): surface the disk tier's own ledger. The tier
+        # has always kept these counters (disk_tier.py:1392 stats()) but nothing read them,
+        # so the router-guided cross-layer prefetch was unobservable. route_hist_total is
+        # the tell for "did the hook run at all" -- prefetch_from_routing returns early
+        # while a CUDA graph is capturing, so with graphs on it only grows on eager steps.
+        if self._disk_tier is not None:
+            try:
+                out["disk_tier"] = self._disk_tier.stats()
+            except Exception:  # noqa: BLE001 -- diagnostics must not break serving
+                pass
         return out
 
     def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,

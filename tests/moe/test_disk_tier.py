@@ -681,6 +681,31 @@ def test_hits_bitmap_stash_classification(checkpoint):
     assert tier._turn_src[1, 3].item() == 1  # stash hit
 
 
+def test_mark_turn_src_survives_outside_inference_mode(checkpoint):
+    """Regression (2026-10-03): the doorbell thread writes the HITS bitmap.
+
+    ``_turn_src`` is built under the engine's inference mode, so it is an inference
+    tensor; a raw in-place write from the graph-doorbell service thread -- which runs
+    outside that scope -- raises ``RuntimeError: Inplace update to inference tensor
+    outside InferenceMode is not allowed``. That exception killed the service thread
+    and hung the engine in a prefill spin for 22 minutes. Both ``mark_turn_src`` and
+    ``end_turn`` must therefore be usable from that thread.
+    """
+    cache = _fake_cache()
+    tier = _tier_prefetch(checkpoint, cache, ram_experts=2, window=1)
+    with torch.inference_mode():  # exactly how the engine builds it
+        tier._turn_src = torch.full(
+            tier._turn_src.shape, -1, dtype=tier._turn_src.dtype,
+            device=tier._turn_src.device)
+    assert torch.is_inference(tier._turn_src)
+    with pytest.raises(RuntimeError):  # the pre-fix failure mode
+        tier._turn_src[1, 3] = 1
+    tier.mark_turn_src(1, 3, 1)
+    assert tier._turn_src[1, 3].item() == 1
+    tier.end_turn()  # must not raise from the doorbell thread either
+    assert tier._turn_src[1, 3].item() == -1
+
+
 # ------------------------------------------------------------- owner-local EP
 def _ownership(rank, world=2):
     from freetoken.moe.ownership import ExpertOwnership

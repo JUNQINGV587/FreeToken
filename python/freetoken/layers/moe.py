@@ -332,10 +332,14 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        if cache.disk_tier_enabled:
+        if cache.disk_tier_enabled and cache._disk_tier._prefetch_window > 0:
             # PILOT (P0-4): issue the next layer's predicted disk prefetch BEFORE
             # this layer's ensure rewrites topk_ids to slot ids -- the raw routing
             # is the predictor. Stash hits let L+1 skip its NVMe round trip.
+            # Gated on _prefetch_window: the call itself costs a D2H sync (the
+            # route-histogram telemetry) even when no prefetch is issued, and PILOT
+            # defaults to off -- see DiskTier._prefetch_window for the 1.01%
+            # adjacent-layer accuracy measurement that set that default.
             cache._disk_tier.prefetch_from_routing(self.layer_id, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
@@ -345,6 +349,15 @@ class OffloadMoELayer(MoELayer):
                 # .item()), which invalidates a capture; skip it while graphing
                 and not torch.cuda.is_current_stream_capturing()):
             cache._disk_tier.verify_decode_mapping(cache, self.layer_id, topk_ids)
+        # DIAGNOSTIC (captain, 2026-10-02): the tier snapshots its per-turn HITS bitmap
+        # (served_ram / served_stash / served_disk + prefetch hits) into
+        # disk_tier.end_turn(), but nothing ever called it -- so the router-guided
+        # prefetch had no per-turn visibility at all. Close the turn at the last MoE
+        # layer of an eager decode step when the telemetry path is set. Requires graphs
+        # off: a captured/replayed step never runs this Python at all.
+        if (cache.disk_tier_enabled and self.layer_id == cache.num_layers - 1
+                and os.environ.get("FT_DISK_TIER_TELEMETRY")):
+            cache._disk_tier.end_turn()
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -376,12 +389,23 @@ class OffloadMoELayer(MoELayer):
         Both admit the same rows and mask remote entries identically.
         """
         owner = self.owner_cache
+        inner = owner._cache
+        if inner.disk_tier_enabled and inner._disk_tier._prefetch_window > 0:
+            # PILOT on the owner path (the non-owner branch runs it before its own
+            # ensure): L's RAW routing predicts L+1's disk rows, so it must be issued
+            # BEFORE the admission kernel rewrites topk_ids in place to slot ids.
+            # Gated on _prefetch_window because the call itself costs a D2H sync
+            # (route-histogram telemetry) even when no prefetch is issued; an eager
+            # A/B measured 6799 issued / 27 useful at the measured 1.01% accuracy,
+            # so the default is off -- see DiskTier._prefetch_window.
+            # No-op inside capture -- with graphs on the replay-time trigger is the
+            # graph-doorbell host thread (moe/graph_fetch.py, FT_GRAPH_FETCH_PREFETCH).
+            inner._disk_tier.prefetch_from_routing(self.layer_id, topk_ids)
         if owner.graph_safe:
             update = owner.ensure_route_graph(self.layer_id, topk_weights, topk_ids)
         else:
             update = owner.ensure_route(self.layer_id, topk_weights, topk_ids)
         owner.copy_missing()
-        inner = owner._cache
         if (inner.disk_tier_enabled
                 and os.environ.get("FT_DISK_TIER_VERIFY")
                 # ``update.slot_ids[update.owned_mask]`` is a boolean-mask select:

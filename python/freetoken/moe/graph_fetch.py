@@ -188,6 +188,11 @@ class GraphFetchBridge:
 
         self._dbg = os.environ.get("FT_GRAPH_FETCH_DEBUG", "") == "1"
         self._trace = os.environ.get("FT_GRAPH_FETCH_TRACE", "") == "1"
+        # PILOT from the doorbell thread (opt-in): the request block already holds the
+        # layer's local disk row ids, so the identity-map prefetch for L+1 needs no extra
+        # device->host copy. Off by default: it competes for NVMe bandwidth with the very
+        # demand reads this thread is serving, so it is A/B-measured before shipping.
+        self._issue_prefetch = os.environ.get("FT_GRAPH_FETCH_PREFETCH", "0") == "1"
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._numpy_view = None
@@ -273,13 +278,32 @@ class GraphFetchBridge:
     def _serve(self) -> None:
         print(f"[graph-fetch] thread-entry dev={self._device} "
               f"pid={os.getpid()} tid={threading.get_native_id()}", flush=True)
-        try:
-            self._serve_inner()
-        except Exception:
-            import traceback
-            print(f"[graph-fetch] THREAD CRASHED dev={self._device}\n"
-                  + traceback.format_exc(), flush=True)
-            raise
+        # A dead service thread hangs the whole engine: every replayed graph spins on an
+        # ack that would never come. Observed 2026-10-03 -- an inference-mode RuntimeError
+        # inside _read_into_staging killed the thread and froze a prefill for 22 minutes.
+        # So: keep serving after a transient error, but give up loudly instead of
+        # spinning forever on a request that can never be served -- the same terminal
+        # contract as the count > k_max branch, which deliberately never acks.
+        fails = 0
+        while not self._stop.is_set():
+            try:
+                self._serve_inner()
+                if not self._stop.is_set():
+                    print(f"[graph-fetch] service thread stopping dev={self._device}: it "
+                          f"refused a request; the server will hang and must be "
+                          f"restarted", flush=True)
+                return
+            except Exception:
+                import traceback
+                fails += 1
+                print(f"[graph-fetch] THREAD ERROR ({fails}) dev={self._device}\n"
+                      + traceback.format_exc(), flush=True)
+                if fails > 3:
+                    print(f"[graph-fetch] service thread stopping dev={self._device} "
+                          f"after {fails} consecutive failures; the server will hang "
+                          f"and must be restarted", flush=True)
+                    return
+                time.sleep(0.05)
 
     def _serve_inner(self) -> None:
         print(f"[graph-fetch] thread-run dev={self._device} "
@@ -320,13 +344,48 @@ class GraphFetchBridge:
             # graph polls resp_host over PCIe — no CUDA op from this thread.
             self.resp_host[0] = seq
             served = seq
+            # Only after the ack is the graph unblocked, so neither of the two
+            # follow-ups below sits on the request's critical path (both concern the
+            # *next* layer anyway).
+            if self._issue_prefetch and count:
+                # PILOT on the captured path: the just-served disk rows ARE layer L's
+                # routing (the device only asks for rows it routed to), so they predict
+                # L+1's. Slab acquisition here never waits on a CUDA event -- see
+                # DiskTier.prefetch_from_local_ids.
+                self.tier.prefetch_from_local_ids(
+                    layer, [int(blk[2 + j]) for j in range(count)])
+            if layer == self.tier._index.num_layers - 1 and self.tier._telemetry_path:
+                # Close the per-turn HITS bitmap from here: with graphs on the Python
+                # decode path never runs, so nothing else would ever call this.
+                self.tier.end_turn()
 
     def _read_into_staging(self, layer: int, expert: int, j: int) -> None:
         """preadv one expert's rows (all banks) into pinned staging row j.
 
         ``expert`` is the LOCAL (slot-cache) id; _group_runs/_fill_scalar_row
-        apply the g0 translation themselves, exactly like the eager path."""
+        apply the g0 translation themselves, exactly like the eager path.
+
+        A stashed (PILOT-prefetched) row is served from its pinned slab instead of the
+        device -- the one way the prefetch can save NVMe traffic on the captured path."""
         tier = self.tier
+        entry = None
+        # getattr, not attribute access: the unit tests drive this method with a stub
+        # tier that has no PILOT state at all (tests/moe/test_graph_fetch.py::_FakeTier),
+        # and a raise from here means no ack, i.e. a hung engine (2026-10-03).
+        if getattr(tier, "_prefetch_window", 0) > 0 and hasattr(tier, "_stash"):
+            with tier._stash_lock:
+                entry = tier._stash.pop((layer, expert), None)
+        if entry is not None:
+            entry["future"].result()  # slab read done? (usually long done)
+            tier.stash_to_staging(
+                entry, layer, expert,
+                [self.staging_host[b][j] for b in range(len(tier._banks))])
+            tier._pf_hits += 1
+            # mark_turn_src, not a raw write: this thread runs outside the engine's
+            # inference mode, where writing the inference-mode _turn_src tensor raises
+            # "Inplace update to inference tensor outside InferenceMode" (2026-10-03).
+            tier.mark_turn_src(layer, expert, 1)  # served from stash (cf. fetch_pending)
+            return
         bounce = self._bounce
         scalar_banks = getattr(tier._index, "scalar_banks", ())
         for bank_idx, (_host, _gpu) in enumerate(tier._banks):

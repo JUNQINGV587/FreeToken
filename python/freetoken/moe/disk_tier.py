@@ -493,10 +493,16 @@ class DiskTier:
         # its (layer, expert) key suppresses duplicate reads vs the on-demand path
         # (P0-2 reservation). Layer L+1's fetch_pending consumes stash hits with a
         # fast pinned->slot H2D instead of an NVMe round trip.
-        # Default ON (user decision 2026-09-28): the e2e consistency gate proves
-        # token-identical output with window=1, and stash entries can never evict
-        # the demand set. Set FT_DISK_TIER_PREFETCH=0 to disable explicitly.
-        self._prefetch_window = int(os.environ.get("FT_DISK_TIER_PREFETCH", "1"))
+        # Default OFF (2026-10-03 measurement). The 2026-09-28 decision turned this on
+        # because it is *output-neutral*, not because it pays: the identity-map predictor
+        # is only 1.01% precise on DeepSeek-V4.1-Flash-NVFP4 (adjacent-layer top-k overlap,
+        # measured over two real decode route traces / 12k+ samples; an offline learned
+        # per-layer co-occurrence table -- colibri's COUPLE -- reaches 20.1%), and colibri's
+        # cited 62.3% top-8 overlap is a DSv4 figure that does not transfer. An eager A/B
+        # confirmed the consequence: prefetch_issued 6799 / prefetch_hits 27 / wasted 6772,
+        # i.e. ~99% of the issued reads are NVMe bandwidth stolen from the demand path on a
+        # device that is already saturated. Set FT_DISK_TIER_PREFETCH=1 to opt back in.
+        self._prefetch_window = int(os.environ.get("FT_DISK_TIER_PREFETCH", "0"))
         self._prefetch_pool = (
             ThreadPoolExecutor(max_workers=2, thread_name_prefix="disk-tier-pf")
             if self._prefetch_window > 0 else None
@@ -1104,26 +1110,50 @@ class DiskTier:
         except (RuntimeError, TypeError):
             return torch.zeros(self._slab_bytes(), dtype=torch.uint8)
 
+    def mark_turn_src(self, layer: int, expert: int, value: int) -> None:
+        """Record how one (layer, expert) row was served, for this turn's HITS bitmap.
+
+        Called from two very different contexts: the engine's decode step, which runs
+        inside its inference mode, and the graph-doorbell service thread, which runs
+        *outside* it. ``_turn_src`` is created under inference mode, and an in-place
+        write to an inference tensor from outside that scope raises ``RuntimeError:
+        Inplace update to inference tensor outside InferenceMode is not allowed`` --
+        which killed the doorbell thread and hung the engine in a prefill spin on
+        2026-10-03. Re-entering the scope here makes the write legal from either side.
+        """
+        src = self._turn_src
+        if src is None:
+            return
+        with torch.inference_mode():
+            src[layer, expert] = value
+
     def end_turn(self) -> dict:
         """Close the current telemetry turn: snapshot the HITS bitmap, persist
-        one JSONL record when FT_DISK_TIER_TELEMETRY is set, and reset."""
+        one JSONL record when FT_DISK_TIER_TELEMETRY is set, and reset.
+
+        Safe to call from the doorbell service thread: every tensor op runs inside an
+        explicit inference scope (see :meth:`mark_turn_src`).
+        """
         import numpy as np
         src = self._turn_src
-        hit = src >= 0
-        record = {
-            "turn": self._turn,
-            "served_ram": int((src == 0).sum()),
-            "served_stash": int((src == 1).sum()),
-            "served_disk": int((src == 2).sum()),
-            "pf_hits": self._pf_hits,
-            "pf_wasted": self._pf_wasted,
-            "layers": {
-                str(l): np.packbits(hit[l].numpy()).tobytes().hex()
-                for l in range(src.shape[0]) if bool(hit[l].any())
-            },
-        }
+        if src is None:
+            return {}
+        with torch.inference_mode():
+            hit = src >= 0
+            record = {
+                "turn": self._turn,
+                "served_ram": int((src == 0).sum()),
+                "served_stash": int((src == 1).sum()),
+                "served_disk": int((src == 2).sum()),
+                "pf_hits": self._pf_hits,
+                "pf_wasted": self._pf_wasted,
+                "layers": {
+                    str(l): np.packbits(hit[l].numpy()).tobytes().hex()
+                    for l in range(src.shape[0]) if bool(hit[l].any())
+                },
+            }
+            self._turn_src.fill_(-1)
         self._turn += 1
-        self._turn_src.fill_(-1)
         if self._telemetry_path:
             with open(self._telemetry_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
@@ -1160,6 +1190,29 @@ class DiskTier:
             # experts and renumber into the local slot-cache namespace.
             lo, hi = self._g0, self._g0 + self._local_num
             ids = {e - lo for e in ids if lo <= e < hi}
+        self._prefetch_local(layer_id, ids)
+
+    def prefetch_from_local_ids(self, layer_id: int, ids, *,
+                               allow_events: bool = False) -> None:
+        """PILOT trigger for callers that already hold LOCAL (bank row) ids.
+
+        The graph-doorbell request block carries the local row ids of the disk rows the
+        captured graph is about to need (``moe/graph_fetch.py``), so the host service
+        thread can predict layer L+1 with no extra device->host copy.
+
+        ``allow_events=False`` is the default HERE because ``ev.synchronize()`` from the
+        doorbell thread can queue behind the replayed graph whose spin kernel is waiting
+        for that very thread (the deadlock ``graph_fetch.GraphFetchBridge._bounce``
+        documents); a slab with a pending H2D is skipped instead of waited on.
+        """
+        if self._prefetch_window <= 0:
+            return
+        self._prefetch_local(layer_id, {int(e) for e in ids},
+                             allow_events=allow_events)
+
+    def _prefetch_local(self, layer_id: int, ids: set[int], *,
+                       allow_events: bool = True) -> None:
+        """Issue the identity-map prefetch for L+1..L+window given LOCAL ids."""
         for target in range(layer_id + 1,
                             min(layer_id + 1 + self._prefetch_window,
                                 self._index.num_layers)):
@@ -1181,6 +1234,9 @@ class DiskTier:
                         self._slabs_allocated += 1
                     slab, ev = slab_ent
                     if ev is not None:
+                        if not allow_events:
+                            self._slab_free.append(slab_ent)  # busy slab: skip it
+                            continue
                         ev.synchronize()  # pending H2D out of this slab
                     entry = {"slab": slab, "future": None, "groups": None}
                     self._stash[key] = entry
@@ -1239,6 +1295,28 @@ class DiskTier:
             ev.record()
         with self._stash_lock:
             self._slab_free.append((slab, ev))
+
+    def stash_to_staging(self, entry: dict, layer: int, expert: int,
+                         dst_rows) -> None:
+        """Stash hit on the graph-doorbell path: slab -> pinned staging rows.
+
+        The pinned->pinned analogue of :meth:`_stash_to_slot`. It makes NO CUDA calls
+        and recycles the slab WITHOUT arming an event, which is what lets the doorbell
+        host thread call it while a graph replay spins (``moe/graph_fetch.py``).
+        """
+        slab = entry["slab"]
+        scalar_banks = getattr(self._index, "scalar_banks", ())
+        for bank_idx in range(len(self._banks)):
+            if bank_idx in scalar_banks:
+                self._fill_scalar_row(bank_idx, layer, expert, dst_rows[bank_idx])
+        for slab_off, a0, bank_idx, members in entry["groups"]:
+            row = dst_rows[bank_idx]
+            for d0, d1, off, nbytes in members:
+                src = slab[slab_off + (off - a0): slab_off + (off - a0) + nbytes]
+                dst = row[d0:d1]
+                dst.copy_(src.view(dst.dtype).view(dst.shape))
+        with self._stash_lock:
+            self._slab_free.append((slab, None))  # CPU-only use: no event needed
 
     def prefetch_from_routing_cpu(self, layer_id: int, ids) -> None:
         """Test hook: prefetch with a plain iterable of ids (no GPU tensor)."""

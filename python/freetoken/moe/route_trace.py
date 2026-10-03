@@ -89,7 +89,11 @@ class RouteTraceRecorder:
         self._buf = bytearray()
         self._n = 0
         self._overflow = False
-        self._flush_every = 8192  # records per buffer flush (bounds memory + I/O size)
+        # DIAGNOSTIC (captain, 2026-10-02): 8192 records is ~6.4 prod-shape requests, and
+        # the tail below the next multiple only lands in close() -- which a SIGTERM'd
+        # server never reaches, so a short capture silently loses its last requests.
+        # Override the cadence for experiments: FT_ROUTE_TRACE_FLUSH=64.
+        self._flush_every = int(os.environ.get("FT_ROUTE_TRACE_FLUSH", "8192"))
         self._write_meta()
 
     def _write_meta(self) -> None:

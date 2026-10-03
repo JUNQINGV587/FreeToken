@@ -580,10 +580,12 @@ class DiskTier:
         return sc[(layer, bank_idx)]
 
     def _preload_scalars(self) -> dict:
-        """Read every expert's scalar-bank (weight_scale_2) values ONCE, merging
-        exactly-adjacent file runs to keep startup syscalls low. One fp32 scalar
-        per segment; blob layout per (layer, bank): expert-major, each expert's
-        segments concatenated in index order."""
+        """Read the scalar-bank (weight_scale_2) values for THIS rank's local
+        expert window ``[_g0, _g0 + _local_num)`` ONCE, merging exactly-adjacent
+        file runs to keep startup syscalls low. One fp32 scalar per segment;
+        blob layout per (layer, bank): local-expert-major, each expert's segments
+        concatenated in index order. With ``ownership=None`` the window is the
+        whole global range, which is byte-identical to reading every expert."""
         scalar_banks = getattr(self._index, "scalar_banks", ())
         out: dict = {}
         if not scalar_banks:
@@ -594,10 +596,10 @@ class DiskTier:
                 for bank_idx in scalar_banks:
                     stride = sum(nb for _, _, nb in
                                  self._index.row_segments(bank_idx, layer, 0))
-                    blob = bytearray(stride * self._index.num_experts)
+                    blob = bytearray(stride * self._local_num)
                     flat = []  # (shard_idx, file_off, nbytes, blob_pos)
-                    for e in range(self._index.num_experts):
-                        pos = e * stride
+                    for e in range(self._g0, self._g0 + self._local_num):
+                        pos = (e - self._g0) * stride
                         for (shard_idx, off, nb) in self._index.row_segments(
                                 bank_idx, layer, e):
                             flat.append((shard_idx, off, nb, pos))
@@ -631,12 +633,18 @@ class DiskTier:
     def _fill_scalar_row(self, bank_idx: int, layer: int, expert: int,
                          row: torch.Tensor) -> None:
         """Global-scale banks (weight_scale_2): fill the row from the preloaded
-        per-expert fp32 scalar blob -- no disk read, no staging."""
-        expert = expert + self._g0  # local (slot-cache) id -> global checkpoint row
-        segs = self._index.row_segments(bank_idx, layer, expert)
+        per-expert fp32 scalar blob -- no disk read, no staging. ``expert`` is a
+        LOCAL (slot-cache) id; the blob is keyed by that same local index (see
+        ``_preload_scalars``), while the disk layout lookup needs the global row.
+        The assert guards the callers that trust ``cache.src_indices``'s local
+        namespace without an explicit runtime re-check (``fetch_pending``)."""
+        assert 0 <= expert < self._local_num, (
+            f"scalar fill outside the local expert window: expert={expert} "
+            f"local_num={self._local_num}")
+        segs = self._index.row_segments(bank_idx, layer, expert + self._g0)
         stride = sum(nb for _, _, nb in segs)
         blob = self._scalar_blob(layer, bank_idx)
-        base = expert * stride
+        base = expert * stride  # blob is local-expert-major, not global
         for k, (d0, d1) in enumerate(self._dst_slices[bank_idx]):
             val = struct.unpack_from("<f", blob, base + 4 * k)[0]
             row[d0:d1].fill_(val)

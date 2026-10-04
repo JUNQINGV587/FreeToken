@@ -77,6 +77,7 @@ def iter_nvfp4_expert_pieces(
     primary: bool = True,
     ownership: ExpertOwnership | None = None,
     skip_experts_from: int | None = None,
+    pin_map: tuple[list[list[int]], int] | None = None,
 ):
     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
@@ -89,16 +90,31 @@ def iter_nvfp4_expert_pieces(
     rank-local bank rows ``[0, local_num_experts)``, so the pieces land in the owner-local banks
     the cache actually allocates. Without it every expert is loaded at its global row.
 
-    ``skip_experts_from`` (the disk tier): experts ``[skip_experts_from, E)`` are disk-resident.
-    The serial reader never calls ``get_tensor`` for them (no I/O); the parallel reader filters
-    them at the reader (the whole-shard read is unchanged, but no per-expert work happens). Each
-    skipped expert still yields an EMPTY piece so the bank fill completes the layer without
-    touching the (released) tail rows. Under ``ownership`` the skip range is global, and the
-    empty pieces are renumbered into rank-local rows like the read ones.
+    ``skip_experts_from`` (the disk tier, prefix layout): experts ``[skip_experts_from, E)`` are
+    disk-resident. The serial reader never calls ``get_tensor`` for them (no I/O); the parallel
+    reader filters them at the reader (the whole-shard read is unchanged, but no per-expert work
+    happens). Each skipped expert still yields an EMPTY piece so the bank fill completes the
+    layer without touching the (released) tail rows. Under ``ownership`` the skip range is
+    global, and the empty pieces are renumbered into rank-local rows like the read ones.
+
+    ``pin_map`` (the disk tier, learned pin set from --moe-ram-pin-file) replaces
+    ``skip_experts_from``: ``(row_map, ram_rows)`` where ``row_map[layer]`` is the
+    pinned-row layout (local id -> bank row, a permutation; see
+    moe.disk_tier.pin_rows_to_row_map). Local expert ``e`` of layer ``L`` is READ
+    into bank row ``row_map[L][e]`` iff that row is < ``ram_rows``; every other
+    expert yields an empty piece at its (released) bank row exactly like the
+    prefix skip. Mutually exclusive with ``skip_experts_from``.
     """
     from freetoken.models.loader import drop_page_cache as _drop
     from freetoken.models.loader import safetensors_weight_map
     from freetoken.moe.expert_pieces import per_expert_pieces
+
+    if skip_experts_from is not None and pin_map is not None:
+        raise ValueError("skip_experts_from and pin_map are mutually exclusive")
+    row_map = None
+    ram_rows = 0
+    if pin_map is not None:
+        row_map, ram_rows = pin_map
 
     drop = drop_page_cache or _drop
     folder = download_hf_weight(model_path)
@@ -118,12 +134,12 @@ def iter_nvfp4_expert_pieces(
         match = spec.key_pattern.match(name)
         if match is None:
             continue
-        if skip_experts_from is not None and int(match.group("expert")) >= skip_experts_from:
+        expert = int(match.group("expert"))
+        if skip_experts_from is not None and expert >= skip_experts_from:
             continue  # disk-resident: never read
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None:
             continue
-        expert = int(match.group("expert"))
         if ownership is not None and not ownership.owns(expert):
             continue
         proj = match.group("proj")
@@ -132,11 +148,19 @@ def iter_nvfp4_expert_pieces(
         kind = _canon_kind(spec, match.group("kind"))
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
-        wanted[name] = (bank_layer, expert - global_start, spec.proj_to_role[proj] + _kind_suffix(kind))
-    # Resident rows: owned experts below the disk-tier cutoff, counted in rank-local space.
-    resident_local = local_E
-    if skip_experts_from is not None:
-        resident_local = min(local_E, max(0, skip_experts_from - global_start))
+        dst = expert - global_start
+        if row_map is not None:
+            dst = row_map[bank_layer][dst]
+            if dst >= ram_rows:
+                continue  # disk-resident under the learned pin set: never read
+        wanted[name] = (bank_layer, dst, spec.proj_to_role[proj] + _kind_suffix(kind))
+    # Resident rows: owned experts kept in RAM, counted in rank-local space.
+    if row_map is not None:
+        resident_local = ram_rows
+    else:
+        resident_local = local_E
+        if skip_experts_from is not None:
+            resident_local = min(local_E, max(0, skip_experts_from - global_start))
     expected = _num_moe_layers(config) * resident_local * 9
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
@@ -166,9 +190,23 @@ def iter_nvfp4_expert_pieces(
             yield name, tensor
 
     pieces = per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
-    if skip_experts_from is not None:
+    if row_map is not None:
+        pieces = itertools.chain(
+            pieces, _pin_skip_pieces(config, row_map, ram_rows, local_E))
+    elif skip_experts_from is not None:
         pieces = itertools.chain(pieces, _disk_skip_pieces(config, skip_experts_from, global_start, global_start + local_E))
     return pieces
+
+
+def _pin_skip_pieces(config, row_map: list[list[int]], ram_rows: int, local_E: int):
+    """Empty pieces for the disk-resident rows of a learned pin set (the bank
+    fill marks them written without a checkpoint read; the rows are pinned-out
+    and released). Same role as ``_disk_skip_pieces`` for the prefix layout."""
+    for bank_layer in range(_num_moe_layers(config)):
+        for e in range(local_E):
+            row = row_map[bank_layer][e]
+            if row >= ram_rows:
+                yield bank_layer, row, row + 1, {}
 
 
 def _disk_skip_pieces(config, skip_from: int, global_start: int = 0, global_end: int | None = None):

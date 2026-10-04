@@ -66,6 +66,7 @@ from ..kernel.fast_index_copy import fast_index_copy_jit
 def _gf_request_kernel(
     num_indices_ptr, evict_slots_ptr, src_indices_ptr,
     req_ptr, req_slots_ptr, req_count_dev_ptr,
+    row_map_ptr,
     RAM_LOCAL: tl.constexpr, K_MAX: tl.constexpr, LAYER: tl.constexpr,
     TRACE: tl.constexpr,
 ):
@@ -75,8 +76,14 @@ def _gf_request_kernel(
 
     req block layout (int64, device): [0]=count (TRUE count, may exceed K_MAX
     so the thread can fail loud instead of silently dropping rows), [1]=layer,
-    [2:2+K_MAX]=disk expert rows, [2+K_MAX]=sequence (LAST: the captured D2H
+    [2:2+K_MAX]=disk expert rows (LOCAL expert ids -- the doorbell resolves
+    checkpoint rows from them), [2+K_MAX]=sequence (LAST: the captured D2H
     memcpy writes the block linearly, so a new seq implies all fields landed).
+
+    ``row_map`` is the tier's pinned-row layout for LAYER (local id -> bank
+    row; identity without a pin file): the RAM/disk split compares the BANK
+    ROW against RAM_LOCAL, the request block keeps the local id, and the
+    compacted RAM remainder stores the bank row for the host-bank PCIe copy.
     """
     n = tl.load(num_indices_ptr)
     w = 0
@@ -84,14 +91,15 @@ def _gf_request_kernel(
     for i in range(n):
         slot = tl.load(evict_slots_ptr + i)
         src = tl.load(src_indices_ptr + i)
-        if src >= RAM_LOCAL:
+        row = tl.load(row_map_ptr + src)
+        if row >= RAM_LOCAL:
             if c < K_MAX:
                 tl.store(req_slots_ptr + c, slot)
                 tl.store(req_ptr + 2 + c, src.to(tl.int64))
             c += 1
         else:
             tl.store(evict_slots_ptr + w, slot)
-            tl.store(src_indices_ptr + w, src)
+            tl.store(src_indices_ptr + w, row)
             w += 1
     tl.store(num_indices_ptr, w.to(tl.int64))
     cc = tl.minimum(c, K_MAX)
@@ -220,6 +228,7 @@ class GraphFetchBridge:
         _gf_request_kernel[(1,)](
             cache.num_indices, cache.evict_slots, cache.src_indices,
             self.req_dev, self.req_slots_dev, self.req_count_dev,
+            self.tier._row_map_dev[layer_id],
             RAM_LOCAL=self.tier._ram, K_MAX=self.k_max, LAYER=layer_id,
             TRACE=self._trace,
         )

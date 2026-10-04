@@ -53,6 +53,7 @@ def nvfp4_expert_spec_of(model_path: str, config):
 def iter_expert_pieces(
     model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8,
     chunk: int = 8 << 20, ownership=None, skip_experts_from: int | None = None,
+    pin_map: tuple[list[list[int]], int] | None = None,
 ) -> Iterator[Piece]:
     """The pieces of ``model_path``'s routed experts, stored as ``kind``.
 
@@ -67,7 +68,10 @@ def iter_expert_pieces(
 
     ``skip_experts_from`` (the disk tier): experts ``[skip_experts_from, E)`` are
     disk-resident -- the NVFP4 reader never reads their tensors and yields an empty
-    piece for each so the bank fill still completes the layer."""
+    piece for each so the bank fill still completes the layer.
+
+    ``pin_map`` (the disk tier, learned pin set): ``(row_map, ram_rows)`` replaces
+    ``skip_experts_from`` -- see ``moe.disk_tier.pin_rows_to_row_map``."""
     spec = get_model_spec(config.architectures[0])
     hook = _model_hook(spec, "iter_expert_pieces")
     if hook is not None:
@@ -81,7 +85,7 @@ def iter_expert_pieces(
             )
         pieces = hook(model_path, config, kind, **kw)
         if pieces is not None:
-            if skip_experts_from is not None:
+            if skip_experts_from is not None or pin_map is not None:
                 raise NotImplementedError(
                     f"{spec.module} owns its expert reader; the disk-tier row skip is only "
                     "implemented in the shared NVFP4 reader")
@@ -102,6 +106,7 @@ def iter_expert_pieces(
             model_path, config, spec_hook(model_path, config),
             parallel=parallel, workers=workers, chunk=chunk,
             ownership=ownership, skip_experts_from=skip_experts_from,
+            pin_map=pin_map,
         )
     raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
 

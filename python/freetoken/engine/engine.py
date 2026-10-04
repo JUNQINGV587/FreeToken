@@ -902,7 +902,9 @@ class Engine:
             object.__setattr__(config, "moe_prefill_overlap", False)
         disk_tier = None
         if config.moe_disk_tier in ("on", "auto"):
-            from freetoken.moe.disk_tier import DiskTierSpec, resolve_auto_ram_experts
+            from freetoken.moe.disk_tier import (
+                DiskTierSpec, load_ram_pin_doc, resolve_auto_ram_experts,
+                validate_ram_pin_doc)
 
             E = config.model_config.num_experts
             ram_experts = config.expert_ram_experts
@@ -942,11 +944,17 @@ class Engine:
                 # CUDA graphs are supported: capture records graph-doorbell fetch
                 # kernels (moe/graph_fetch.py) and a host service thread performs
                 # the actual disk reads at replay time.
+                pin_doc = None
+                if config.moe_ram_pin_file:
+                    pin_doc = load_ram_pin_doc(config.moe_ram_pin_file)
+                    problems.extend(validate_ram_pin_doc(
+                        pin_doc, E, config.model_config.num_moe_layers,
+                        config.moe_ep_size, ram_experts))
                 if problems:
                     raise ValueError(
                         f"--moe-disk-tier {config.moe_disk_tier}: unmet preconditions:\n  - "
                         + "\n  - ".join(problems))
-                disk_tier = DiskTierSpec(ram_experts=ram_experts)
+                disk_tier = DiskTierSpec(ram_experts=ram_experts, pin_doc=pin_doc)
         # Fast path: an FTW checkpoint loads its repacked banks directly.
         # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
         # expert-tensor granularity. Both pin-after-fill.
@@ -1083,11 +1091,19 @@ class Engine:
                                * config.model_config.num_experts_per_tok)
             cache.attach_disk_tier(
                 banks.disk_index, banks.disk_ram_experts,
-                workers=config.disk_fetch_workers, graph_k_max=graph_k_max)
-            logger.info_rank0(
-                f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
-                f"experts/layer pinned in RAM; the rest fetched from "
-                f"{config.model_path} on slot-cache miss")
+                workers=config.disk_fetch_workers, graph_k_max=graph_k_max,
+                pin_rows=banks.disk_pin_rows)
+            if banks.disk_pin_rows is not None:
+                logger.info_rank0(
+                    f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
+                    f"experts/layer pinned in RAM (learned pin set from "
+                    f"{config.moe_ram_pin_file}); the rest fetched from "
+                    f"{config.model_path} on slot-cache miss")
+            else:
+                logger.info_rank0(
+                    f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
+                    f"experts/layer pinned in RAM; the rest fetched from "
+                    f"{config.model_path} on slot-cache miss")
         elif disk_tier is not None:
             # The loader released experts [K, E) but no fetcher came back: serving would
             # multiply by zeroed rows and log nothing. Fail where the flag was set.

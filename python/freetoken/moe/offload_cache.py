@@ -804,9 +804,25 @@ class OffloadMoeCache:
             # gathered by the grouped GEMM.
             tier = self._disk_tier
             n = tier._ram if tier is not None else None
+            remapped = tier is not None and tier._remapped
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 if n is None:
                     buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                elif remapped:
+                    # Learned pin set: bank row r holds expert pin_ids[r], and the
+                    # buffer is addressed by expert id -- scatter instead of the
+                    # positional prefix copy. One H2D of the same n rows, then a
+                    # D2D index_copy (no extra PCIe traffic). index_copy_cuda has no
+                    # fp8 kernels, so fp8 banks go through a bit-exact uint8 view
+                    # (itemsize 1: the view is shape-preserving).
+                    tmp = per_layer[layer_id][:n].to(buffer.device, non_blocking=True)
+                    dst = buffer[buffer_id]
+                    if dst.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
+                                     torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
+                        dst.view(torch.uint8).index_copy_(
+                            0, tier._pin_ids_dev_i64[layer_id], tmp.view(torch.uint8))
+                    else:
+                        dst.index_copy_(0, tier._pin_ids_dev_i64[layer_id], tmp)
                 else:
                     buffer[buffer_id][:n].copy_(per_layer[layer_id][:n],
                                                 non_blocking=True)
@@ -1365,14 +1381,19 @@ class OffloadMoeCache:
         return out
 
     def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,
-                         ownership=None, graph_k_max: int | None = None) -> None:
+                         ownership=None, graph_k_max: int | None = None,
+                         pin_rows: list[list[int]] | None = None) -> None:
         """Enable the NVMe tier: disk-resident slot-cache misses are fetched from the
         original checkpoint before the PCIe copy path (see moe/disk_tier.py).
 
         ``ownership`` (owner-local EP): the cache's expert namespace is the local
         [0, local_num_experts) range; the disk tier translates local<->global at
         its boundaries. Never attach a disk tier built without ownership to an
-        owner-local cache -- the index would read the wrong checkpoint rows."""
+        owner-local cache -- the index would read the wrong checkpoint rows.
+
+        ``pin_rows`` (from --moe-ram-pin-file): the per-layer LOCAL experts the
+        loader packed into the pinned bank rows [0, ram_experts) -- the tier's
+        residency tests go through that layout instead of the prefix."""
         from freetoken.moe.disk_tier import DiskTier
 
         assert self.decode_target == "gpu", "disk tier v0 supports the gpu (offload) path only"
@@ -1382,7 +1403,7 @@ class OffloadMoeCache:
         # disk rows are patched into the borrowed buffer at layer entry
         # (DiskTier.fetch_routed_into via fetch_into_prefill_buffer).
         self._disk_tier = DiskTier(index, self, ram_experts, workers=workers,
-                                   ownership=ownership)
+                                   ownership=ownership, pin_rows=pin_rows)
         if graph_k_max:
             # CUDA-graph decode: record doorbell-fetch kernels during capture,
             # serve the disk reads from a host thread at replay time.
@@ -1652,14 +1673,15 @@ class OwnerOffloadMoeCache:
         )
 
     def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,
-                         graph_k_max: int | None = None) -> None:
+                         graph_k_max: int | None = None,
+                         pin_rows: list[list[int]] | None = None) -> None:
         """Attach the NVMe tier with the owner geometry, so the fetch path
         translates between the local slot-cache namespace and the global
         checkpoint rows (see DiskTier). Overrides the __getattr__ forward, which
         would otherwise build a DiskTier that misreads remote rows as local."""
         self._cache.attach_disk_tier(index, ram_experts, workers=workers,
                                      ownership=self.geometry.ownership,
-                                     graph_k_max=graph_k_max)
+                                     graph_k_max=graph_k_max, pin_rows=pin_rows)
 
     def ensure_experts_hybrid(self, *_args, **_kwargs) -> None:
         raise NotImplementedError(

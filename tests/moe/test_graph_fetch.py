@@ -44,7 +44,7 @@ def _make_disk_file(tmp_path, n_rows=16):
 class _FakeTier:
     """Minimal stand-in for DiskTier's internals used by GraphFetchBridge."""
 
-    def __init__(self, tmp_path, ram: int):
+    def __init__(self, tmp_path, ram: int, row_map: torch.Tensor | None = None):
         self._ram = ram
         self.ownership = None
         self._preadv_calls = 0
@@ -56,6 +56,14 @@ class _FakeTier:
         host_layers = [torch.zeros(16, ROW, dtype=torch.uint8) for _ in range(N_LAYERS)]
         gpu = torch.zeros(N_SLOTS, ROW, dtype=torch.uint8, device="cuda")
         self._banks = [(host_layers, gpu)]
+        # Pinned-row layout (local id -> bank row); identity without a pin set.
+        if row_map is None:
+            row_map = (
+                torch.arange(16, dtype=torch.int32, device="cuda")
+                .expand(N_LAYERS, -1).contiguous()
+            )
+        assert row_map.shape == (N_LAYERS, 16)
+        self._row_map_dev = row_map.to(device="cuda", dtype=torch.int32).contiguous()
 
     def _staging_ring(self):
         ring = getattr(self._staging, "ring", None)
@@ -184,6 +192,7 @@ def test_overflow_refuses_to_ack(tmp_path):
         _gf_request_kernel[(1,)](
             cache.num_indices, cache.evict_slots, cache.src_indices,
             b.req_dev, b.req_slots_dev, b.req_count_dev,
+            tier._row_map_dev[0],
             RAM_LOCAL=0, K_MAX=2, LAYER=0, TRACE=False)
         b.req_host.copy_(b.req_dev, non_blocking=True)
         torch.cuda.synchronize()
@@ -203,3 +212,36 @@ def test_spin_noop_when_doorbell_off(bridge):
                           bridge.doorbell_dev, SEQ_OFF=bridge.seq_off,
                           TRACE=False)
     torch.cuda.synchronize()  # returns at all == pass
+
+
+def test_request_kernel_remaps_through_row_map(tmp_path):
+    """Learned pin set: the split compares BANK ROWS, the request block keeps
+    LOCAL IDS, and the compacted RAM plan carries bank rows for the PCIe copy.
+
+    Pin set {2, 5, 9} (ram=3): row_map maps those experts to rows 0/1/2 and
+    every other expert to a row >= 3. srcs [0, 5, 2, 7] -> bank rows
+    [>=3, 1, 0, >=3], so 0 and 7 are disk-resident (requested by local id)
+    while 5 and 2 compact as bank rows 1 and 0."""
+    row_map = torch.full((N_LAYERS, 16), 3, dtype=torch.int32)
+    rest = [e for e in range(16) if e not in (2, 5, 9)]
+    for r, e in enumerate([2, 5, 9] + rest):
+        row_map[:, e] = r
+    tier = _FakeTier(tmp_path, ram=3, row_map=row_map)
+    cache = _FakeCache(tier)
+    b = GraphFetchBridge(tier, cache, k_max=K_MAX)
+    try:
+        _set_plan(cache, srcs=[0, 5, 2, 7], slots=[10, 11, 12, 13])
+        _launch_request(b, cache)
+        # RAM rows compacted in place as BANK ROWS (order kept).
+        assert int(cache.num_indices.item()) == 2
+        assert cache.evict_slots[:2].tolist() == [11, 12]
+        assert cache.src_indices[:2].tolist() == [1, 0]
+        # Disk rows recorded as LOCAL EXPERT IDS (the doorbell resolves the
+        # checkpoint row from the local id).
+        blk = b.req_host
+        assert int(blk[0]) == 2
+        assert blk[2:4].tolist() == [0, 7]
+        assert int(blk[b.seq_off]) == 1
+        assert b.req_slots_dev[:2].tolist() == [10, 13]
+    finally:
+        b.shutdown()

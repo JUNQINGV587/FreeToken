@@ -162,10 +162,10 @@ def _fake_cache(num_experts=E):
     return cache
 
 
-def _tier(checkpoint, cache, ram_experts=2, ownership=None):
+def _tier(checkpoint, cache, ram_experts=2, ownership=None, pin_rows=None):
     index = _index(checkpoint)
     tier = DiskTier(index, cache, ram_experts=ram_experts, workers=2,
-                    ownership=ownership)
+                    ownership=ownership, pin_rows=pin_rows)
     # Staging must hold the largest bank row's O_DIRECT super-block (a size
     # regression here overflows the buffer -> EFAULT/segfault at fetch time).
     max_row = max(
@@ -807,3 +807,171 @@ def test_auto_rejects_budget_below_one_aligned_prefix():
         auto_ram_experts(_ROW, _LAYERS, _EXPERTS, _RESERVE + _GIB, _RESERVE)
     with pytest.raises(ValueError, match="no RAM budget"):
         auto_ram_experts(_ROW, _LAYERS, _EXPERTS, _RESERVE, _RESERVE)
+
+
+# ------------------------------------------------------------- learned pin set
+def test_pin_rows_to_row_map_packs_pinned_prefix():
+    from freetoken.moe.disk_tier import pin_rows_to_row_map
+
+    # pin {1,3} of 4: rows 0/1 hold experts 1/3, the rest fill ascending.
+    rm = pin_rows_to_row_map([[1, 3], [0, 2]], 4)
+    assert rm[0] == [2, 0, 3, 1]  # e0->2, e1->0, e2->3, e3->1
+    assert rm[1] == [0, 2, 1, 3]  # e0->0, e1->2, e2->1, e3->3
+    # The contiguous prefix is the identity (the no-pin-file layout).
+    assert pin_rows_to_row_map([[0, 1], [0, 1]], 4) == [[0, 1, 2, 3]] * 2
+    # Empty pin set: identity map, every expert disk-resident (row >= 0... the
+    # caller compares against ram_rows == 0).
+    assert pin_rows_to_row_map([[], []], 4) == [[0, 1, 2, 3]] * 2
+    with pytest.raises(ValueError, match="unique sorted"):
+        pin_rows_to_row_map([[3, 1], [0, 1]], 4)
+    with pytest.raises(ValueError, match="unique sorted"):
+        pin_rows_to_row_map([[1, 1], [0, 1]], 4)
+    with pytest.raises(ValueError, match="unique sorted"):
+        pin_rows_to_row_map([[1, 4], [0, 1]], 4)
+
+
+def _pin_doc(tmp_path, budgets=(2, 2), e=E, layers=L, ep=2):
+    def rows(n):
+        return [list(range(n)) for _ in range(layers)]
+
+    doc = {
+        "format": "freetoken.ram_pin_set.v1",
+        "num_layers": layers,
+        "num_experts": e,
+        "ep": ep,
+        "budgets": list(budgets),
+        "sources": ["test"],
+        "ranks": {str(r): rows(budgets[r]) for r in range(ep)},
+    }
+    path = tmp_path / "pin.json"
+    path.write_text(json.dumps(doc))
+    return str(path), doc
+
+
+def test_load_ram_pin_doc_schema(tmp_path):
+    from freetoken.moe.disk_tier import load_ram_pin_doc
+
+    path, doc = _pin_doc(tmp_path)
+    assert load_ram_pin_doc(path)["budgets"] == [2, 2]
+    # A non-prefix pin set is accepted: unique sorted local ids in range
+    # (the local window is [0, E/ep) -- 4 here, so {1, 3} is a legal pin set).
+    _, doc = _pin_doc(tmp_path, budgets=(2, 2), e=8, layers=L, ep=2)
+    doc["ranks"]["0"] = [[1, 3]] * L
+    path = tmp_path / "pin2.json"
+    path.write_text(json.dumps(doc))
+    assert load_ram_pin_doc(path)["ranks"]["0"][0] == [1, 3]
+    for bad in (
+        {"format": "nope"},
+        {"budgets": [2]},                 # one budget for ep=2
+        {"ranks": {"0": [[0, 1]] * L}},   # rank 1 missing
+        {"ranks": {"0": [[0]] * L, "1": [[0, 1]] * L}},  # budget mismatch
+        {"ranks": {"0": [[1, 0]] * L, "1": [[0, 1]] * L}},  # unsorted
+        {"ranks": {"0": [[0, 4]] * L, "1": [[0, 1]] * L}},  # out of window
+    ):
+        _, doc2 = _pin_doc(tmp_path)
+        doc2.update(bad)
+        p = tmp_path / "bad.json"
+        p.write_text(json.dumps(doc2))
+        with pytest.raises(ValueError):
+            load_ram_pin_doc(str(p))
+
+
+def test_validate_ram_pin_doc_against_model_and_budget(tmp_path):
+    from freetoken.moe.disk_tier import validate_ram_pin_doc
+
+    _, doc = _pin_doc(tmp_path, budgets=(2, 2), e=4, layers=2, ep=2)
+    assert validate_ram_pin_doc(doc, 4, 2, 2, 4) == []
+    # A stale file fails the boot: budget 2 splits 1/1, not the file's 2/2.
+    assert validate_ram_pin_doc(doc, 4, 2, 2, 2)
+    assert validate_ram_pin_doc(doc, 8, 2, 2, 4)  # num_experts mismatch
+    assert validate_ram_pin_doc(doc, 4, 40, 2, 4)  # num_layers mismatch
+    assert validate_ram_pin_doc(doc, 4, 2, 4, 4)  # ep mismatch
+    # The production split (120 over EP=2) is 64/56, mirroring local_ram_experts.
+    _, doc2 = _pin_doc(tmp_path, budgets=(64, 56), e=384, layers=40, ep=2)
+    assert validate_ram_pin_doc(doc2, 384, 40, 2, 120) == []
+    assert validate_ram_pin_doc(doc2, 384, 40, 2, 128) != []  # splits 64/64
+
+
+def test_disk_tier_pin_rows_builds_row_map(checkpoint):
+    rows = [[1, 3], [0, 2]]
+    tier = _tier(checkpoint, _fake_cache(), ram_experts=2, pin_rows=rows)
+    assert tier._remapped
+    assert tier._row_map_cpu[0].tolist() == [2, 0, 3, 1]
+    assert tier._row_map_cpu[1].tolist() == [0, 2, 1, 3]
+    assert tier._pin_ids_cpu[0].tolist() == [1, 3]
+    assert tier._nonpin_dev[0].tolist() == [0, 2]
+    assert tier._nonpin_dev[1].tolist() == [1, 3]
+    assert tier.stats()["pin_remapped"] is True
+    # A prefix pin set is the identity: the no-pin-file layout, bit for bit.
+    tier2 = _tier(checkpoint, _fake_cache(), ram_experts=2,
+                  pin_rows=[[0, 1], [0, 1]])
+    assert not tier2._remapped
+    assert tier2._row_map_cpu[0].tolist() == [0, 1, 2, 3]
+    assert tier2.stats()["pin_remapped"] is False
+
+
+def test_routed_disk_uses_row_map(checkpoint):
+    tier = _tier(checkpoint, _fake_cache(), ram_experts=2,
+                 pin_rows=[[1, 3], [0, 2]])
+    # Layer 0 pins {1,3}: only 0 and 2 are disk-resident (unique, sorted).
+    disk0 = tier._routed_disk(0, torch.tensor([0, 1, 2, 3, 1]))
+    assert disk0.tolist() == [0, 2]
+    # Layer 1 pins {0,2}: only 1 and 3 are disk-resident.
+    disk1 = tier._routed_disk(1, torch.tensor([0, 1, 2, 3, 0]))
+    assert disk1.tolist() == [1, 3]
+
+
+def test_fetch_pending_remap_writes_bank_rows(checkpoint):
+    """Learned pin set {1,3} on layer 0 (rows [2,0,3,1]): expert 0/2 are
+    disk-resident, 1/3 pinned. The compacted RAM remainder must carry BANK
+    ROWS (0/1), not expert ids -- that is what the PCIe copy indexes."""
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2, pin_rows=[[1, 3], [0, 2]])
+    cache.src_indices[:3] = torch.tensor([0, 1, 3], dtype=torch.int32)
+    cache.evict_slots[:3] = torch.tensor([5, 6, 7], dtype=torch.int32)
+    cache.num_indices.fill_(3)
+
+    tier.fetch_pending(cache, 0)
+
+    # Expert 0 (row 2 >= ram) was disk-fetched into its slot.
+    expected = _expected_rows(0, 0)
+    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
+        assert torch.equal(
+            gpu_cache[5].contiguous().view(torch.uint8).reshape(-1), expected[bank_idx])
+    # The RAM remainder compacts to BANK ROWS [0, 1] (experts 1 and 3).
+    assert cache.num_indices.item() == 2
+    assert cache.src_indices[:2].tolist() == [0, 1]
+    assert cache.evict_slots[:2].tolist() == [6, 7]
+    # Layer 1's pin set {0,2} is independent: expert 1 is disk-resident there.
+    cache.src_indices[:1] = torch.tensor([1], dtype=torch.int32)
+    cache.evict_slots[:1] = torch.tensor([4], dtype=torch.int32)
+    cache.num_indices.fill_(1)
+    tier.fetch_pending(cache, 1)
+    assert cache.num_indices.item() == 0
+    expected = _expected_rows(1, 1)
+    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
+        assert torch.equal(
+            gpu_cache[4].contiguous().view(torch.uint8).reshape(-1), expected[bank_idx])
+
+
+def test_fetch_pending_remap_all_ram_still_translates(checkpoint):
+    """Regression for the W13 eager crash: when EVERY miss is pinned
+    (``disk == []``) the early return must still translate src_indices from
+    local expert ids to bank rows. The identity layout made the old early
+    return a harmless no-op; with a learned pin set it left expert ids (e.g.
+    118/155) in the PCIe copy plan, which then read the released,
+    non-registered host tail and faulted (async IMA, surfaced later during
+    CUDA graph capture at bs=4)."""
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2, pin_rows=[[1, 3], [0, 2]])
+    # Both misses are pinned experts on layer 0 (1 -> bank row 0, 3 -> row 1).
+    cache.src_indices[:2] = torch.tensor([1, 3], dtype=torch.int32)
+    cache.evict_slots[:2] = torch.tensor([5, 6], dtype=torch.int32)
+    cache.num_indices.fill_(2)
+
+    tier.fetch_pending(cache, 0)
+
+    # Nothing was disk-fetched, but the plan now carries BANK ROWS.
+    assert cache.num_indices.item() == 2
+    assert cache.src_indices[:2].tolist() == [0, 1]
+    assert cache.evict_slots[:2].tolist() == [5, 6]

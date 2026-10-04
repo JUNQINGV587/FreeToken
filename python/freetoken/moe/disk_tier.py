@@ -44,9 +44,124 @@ class DiskTierSpec:
 
     Experts ``[0, ram_experts)`` are pinned as usual; ``[ram_experts, E)`` keep
     their bank rows allocated but their pages are released after load and are
-    served from disk by :class:`DiskTier`."""
+    served from disk by :class:`DiskTier`.
+
+    ``pin_doc`` (optional, from ``--moe-ram-pin-file``): a validated
+    ``freetoken.ram_pin_set.v1`` document choosing WHICH local experts fill the
+    pinned rows, per layer per EP rank (a learned hot set instead of the
+    contiguous prefix). The bank layout is unchanged -- the pinned rows are
+    still the first ``ram_experts`` bank rows; only the local-id -> bank-row
+    mapping changes (see :func:`pin_rows_to_row_map`)."""
 
     ram_experts: int
+    pin_doc: dict | None = None
+
+
+def load_ram_pin_doc(path: str) -> dict:
+    """Load and validate a ``freetoken.ram_pin_set.v1`` pin-set document.
+
+    Structural validation only (schema/shape/window per rank); the caller
+    cross-checks num_layers/num_experts/ep/budgets against the model and the
+    resolved RAM budget. Raises ValueError on any malformed content -- a bad
+    pin file must fail the boot, never serve a wrong row."""
+    with open(path) as f:
+        doc = json.load(f)
+    try:
+        if doc["format"] != "freetoken.ram_pin_set.v1":
+            raise ValueError(f"unknown format {doc['format']!r}")
+        L = int(doc["num_layers"])
+        E = int(doc["num_experts"])
+        ep = int(doc["ep"])
+        budgets = [int(b) for b in doc["budgets"]]
+        ranks = doc["ranks"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{path}: malformed ram_pin_set document: {exc}") from exc
+    if not (L > 0 and E > 0 and ep > 0):
+        raise ValueError(f"{path}: num_layers/num_experts/ep must be positive")
+    if len(budgets) != ep:
+        raise ValueError(f"{path}: budgets has {len(budgets)} entries for ep={ep}")
+    if E % ep:
+        raise ValueError(f"{path}: num_experts {E} not divisible by ep {ep}")
+    local = E // ep
+    for rank in range(ep):
+        key = str(rank)
+        rows = ranks.get(key)
+        if not isinstance(rows, list) or len(rows) != L:
+            raise ValueError(f"{path}: ranks[{key!r}] must have {L} layer lists")
+        for layer, ids in enumerate(rows):
+            if (not isinstance(ids, list) or len(ids) != budgets[rank]
+                    or ids != sorted(set(ids))
+                    or any(not isinstance(e, int) or e < 0 or e >= local for e in ids)):
+                raise ValueError(
+                    f"{path}: ranks[{key!r}][{layer}] must be {budgets[rank]} unique "
+                    f"sorted local ids in [0, {local})")
+    return doc
+
+
+def validate_ram_pin_doc(doc: dict, num_experts: int, num_layers: int, ep: int,
+                         ram_experts: int) -> list[str]:
+    """Cross-check a loaded pin document against the model and the resolved RAM
+    budget. Returns a list of human-readable problems (empty = OK); the engine
+    reports them with the other unmet disk-tier preconditions, so a stale pin
+    file fails the boot with the full diagnosis instead of serving wrong rows.
+
+    The EP split of the pin budget is per-rank host RAM, so the doc's budgets
+    must match ``local_ram_experts`` per rank (validated here without the
+    ownership object: budget[rank] = ram budget that rank's host actually pins)."""
+    problems: list[str] = []
+    if doc["num_experts"] != num_experts:
+        problems.append(
+            f"--moe-ram-pin-file: num_experts {doc['num_experts']} != model {num_experts}")
+    if doc["num_layers"] != num_layers:
+        problems.append(
+            f"--moe-ram-pin-file: num_layers {doc['num_layers']} != model {num_layers}")
+    if doc["ep"] != ep:
+        problems.append(
+            f"--moe-ram-pin-file: ep {doc['ep']} != --moe-ep-size {ep}")
+    if not problems:
+        # Replicate local_ram_experts' per-rank split of the host-wide budget
+        # (the ownership object is not built yet at validation time; the EP
+        # group IS the owner world here).
+        local = num_experts // ep
+        share, rem = divmod(ram_experts, ep)
+        if share >= _AUTO_ALIGN:
+            share = share // _AUTO_ALIGN * _AUTO_ALIGN
+            rem = ram_experts - share * ep
+            expected = [min(local, share + (_AUTO_ALIGN if r < rem // _AUTO_ALIGN else 0))
+                        for r in range(ep)]
+        else:
+            expected = [min(local, share + (1 if r < rem else 0)) for r in range(ep)]
+        budgets = doc["budgets"]
+        if budgets != expected:
+            problems.append(
+                f"--moe-ram-pin-file: budgets {budgets} != resolved per-rank RAM "
+                f"budget {expected} (regenerate the pin file for this host)")
+    return problems
+
+
+def pin_rows_to_row_map(pin_rows: list[list[int]], local_num: int) -> list[list[int]]:
+    """Per-layer permutation ``local id -> bank row`` packing the pinned experts
+    into bank rows ``[0, len(pin_rows[layer]))``.
+
+    Bank row ``r`` of layer ``L`` holds local expert ``pin_rows[L][r]`` for
+    ``r < len(pin_rows[L])``; the remaining (disk-resident) experts fill rows
+    ``[len(pin_rows[L]), local_num)`` in ascending id order. The result is a
+    bijection, so ``row_map[e] >= len(pin_rows[L])`` is exactly "e is
+    disk-resident" -- the same shape of test the prefix layout gets from
+    ``e >= ram``. ``pin_rows`` must be sorted unique ids in range; raises
+    ValueError otherwise (a malformed pin set would serve wrong rows)."""
+    row_map: list[list[int]] = []
+    for layer, ids in enumerate(pin_rows):
+        if ids != sorted(set(ids)) or any(e < 0 or e >= local_num for e in ids):
+            raise ValueError(
+                f"pin_rows[{layer}] must be unique sorted local ids in [0, {local_num})")
+        pinned = set(ids)
+        rest = [e for e in range(local_num) if e not in pinned]
+        row = [0] * local_num
+        for r, e in enumerate(list(ids) + rest):
+            row[e] = r
+        row_map.append(row)
+    return row_map
 
 
 def release_bank_tails(banks_by_name: dict[str, list[HostBank]], num_experts: int,
@@ -394,7 +509,7 @@ class DiskTier:
     """Runtime fetcher: disk-resident slot-cache misses -> staging -> GPU slot."""
 
     def __init__(self, index: Nvfp4DiskIndex, cache, ram_experts: int, workers: int = 8,
-                 ownership=None) -> None:
+                 ownership=None, pin_rows: list[list[int]] | None = None) -> None:
         self._index = index
         # Owner-local EP: the slot cache (and therefore every miss/fetch/slot
         # identifier below) lives in the LOCAL expert namespace
@@ -412,6 +527,47 @@ class DiskTier:
         self._local_num = (ownership.local_num_experts if ownership is not None
                            else index.num_experts)
         self._ram = min(self._local_num, ram_experts)
+        # ---- pinned-row layout: local id -> bank row ---------------------------
+        # Default (pin_rows=None): the identity map -- local expert e sits in bank
+        # row e, so "RAM-resident" is the contiguous prefix ``e < _ram`` and every
+        # consumer below degenerates to exactly the pre-pin-set behavior.
+        # With a learned pin set (--moe-ram-pin-file), the loader wrote pinned
+        # expert ``pin_rows[L][r]`` into bank row ``r < _ram`` (see
+        # expert_banks), and every residency test here goes through the per-layer
+        # permutation ``_row_map``: RAM-resident iff ``_row_map[L][e] < _ram``.
+        # ``_pin_ids``/``_nonpin`` are the inverse map restricted to the two row
+        # ranges (identity slot of the expert in bank row r / the slots the
+        # prefill phantom cleanup must clear).
+        num_layers = index.num_layers
+        if pin_rows is None:
+            row_map = None
+        else:
+            if len(pin_rows) != num_layers or any(len(r) != self._ram for r in pin_rows):
+                raise ValueError(
+                    f"pin_rows must be {num_layers} layer lists of exactly "
+                    f"{self._ram} local ids")
+            row_map = pin_rows_to_row_map(pin_rows, self._local_num)
+        if row_map is None:
+            rm = torch.arange(self._local_num, dtype=torch.int32).expand(num_layers, -1)
+        else:
+            rm = torch.tensor(row_map, dtype=torch.int32)
+        self._row_map_cpu = rm.contiguous()
+        # A pin set that IS the contiguous prefix yields the identity map: keep
+        # the no-pin-file fast paths byte-identical for it (``_remapped`` gates
+        # the scatter/lookup branches everywhere below).
+        self._remapped = bool(
+            (self._row_map_cpu != torch.arange(self._local_num, dtype=torch.int32))
+            .any().item())
+        inv = torch.empty_like(self._row_map_cpu)
+        inv.scatter_(1, self._row_map_cpu.long(),
+                     torch.arange(self._local_num, dtype=torch.int32).expand(num_layers, -1))
+        self._ids_by_row_cpu = inv.to(torch.int32).contiguous()
+        self._pin_ids_cpu = self._ids_by_row_cpu[:, :self._ram].contiguous()
+        device = cache.banks[0][1].device  # == self._banks, rebound below
+        self._row_map_dev = self._row_map_cpu.to(device)
+        self._pin_ids_dev = self._pin_ids_cpu.to(device)
+        self._pin_ids_dev_i64 = self._pin_ids_dev.long()
+        self._nonpin_dev = self._ids_by_row_cpu[:, self._ram:].contiguous().to(device).long()
         self._graph_bridge = None
         self._banks = list(cache.banks)  # [(per_layer_host, gpu_cache)] in schema order
         self._row_bytes = [
@@ -834,22 +990,27 @@ class DiskTier:
     def verify_ram(self, cache, layer: int) -> None:
         """One-shot debug: after the PCIe copy, check a RAM-resident expert's slot rows
         against the checkpoint reference. Gated on FT_DISK_TIER_VERIFY."""
-        expert = min(10, self._ram - 1)  # a RAM-resident expert
-        print(f"[verify-ram] layer={layer} expert={expert} (RAM prefix)", flush=True)
+        pin_ids = self._pin_ids_cpu[layer]
+        expert = int(pin_ids[min(10, self._ram - 1)])  # a RAM-resident expert
+        print(f"[verify-ram] layer={layer} expert={expert} (pinned row "
+              f"{min(10, self._ram - 1)})", flush=True)
         self._verify_slot(cache, layer, expert)
         # Check ALL RAM experts: slot vs host row (host correctness established
         # separately). Count mismatches; identify the source of the first one.
+        # Bank row ``r`` holds expert ``pin_ids[r]`` (identity map without a pin
+        # file); its identity slot is the expert id.
         n_bad = 0
         identified = False
-        for e in range(self._ram):
+        for r in range(self._ram):
+            e = int(pin_ids[r])
             for bank_idx, (host_layer, gpu_cache) in enumerate(self._banks):
                 slot_row = gpu_cache[e].contiguous()
                 flat = slot_row.view(torch.uint8).reshape(-1)
-                hflat = host_layer[layer][e].contiguous().view(torch.uint8).reshape(-1)
+                hflat = host_layer[layer][r].contiguous().view(torch.uint8).reshape(-1)
                 if flat.numel() != hflat.numel() or not bool(torch.equal(flat.cpu(), hflat)):
                     n_bad += 1
                     if n_bad <= 12:
-                        print(f"[verify-ram] MISMATCH e={e} bank={bank_idx} "
+                        print(f"[verify-ram] MISMATCH e={e} row={r} bank={bank_idx} "
                               f"slot_head={flat[:8].tolist()} host_head={hflat[:8].tolist()}",
                               flush=True)
                     if not identified:
@@ -961,7 +1122,8 @@ class DiskTier:
         preserved, so the prefill GEMM is unchanged."""
         from freetoken.moe.offload_kernels import _materialize_layer_gpu
 
-        _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram)
+        _materialize_layer_gpu(cache, layer_id, materialize_count=self._ram,
+                               pin_ids=self._pin_ids_dev[layer_id])
         self.fetch_routed(cache, layer_id, expert_ids)
 
     def fetch_routed(self, cache, layer_id: int,
@@ -977,18 +1139,21 @@ class DiskTier:
         materialize kernel so the decode LRU sees the fetched experts.
         """
         # Prefill identity mapping owns ALL of slots [0, E) for this layer, but
-        # the kernel only scans slots < materialize_count, so the disk slots
-        # [ram, E) that still hold a previous layer's experts (previous prefill
+        # only the pinned experts' slots are materialized, so the non-pinned
+        # slots that still hold a previous layer's experts (previous prefill
         # layer or decode LRU) would keep their slot_for_id entries -- phantom
         # decode hits that read another layer's weights. Clear them first
-        # (device-side, no sync).
-        seg = cache.id_of_slot[self._ram:cache.num_experts]
+        # (device-side, no sync). With the default prefix layout the non-pinned
+        # slots are exactly [ram, E) (the old slice); a learned pin set scatters
+        # them, so the clear goes through the inverse row map either way.
+        idx = self._nonpin_dev[layer_id]
+        seg = cache.id_of_slot.index_select(0, idx)
         valid = seg >= 0
         cache.slot_for_id.view(-1)[seg[valid].long()] = -1
-        seg[valid] = -1
-        cache.usage[self._ram:cache.num_experts][valid] = 0
+        cache.id_of_slot[idx] = torch.where(valid, -1, seg)
+        cache.usage[idx] = torch.where(valid, 0, cache.usage[idx])
 
-        routed = self._routed_disk(expert_ids)
+        routed = self._routed_disk(layer_id, expert_ids)
         disk = routed
         if os.environ.get("FT_DISK_TIER_DEBUG") and layer_id < 3:
             print(f"[disk-tier dbg] layer={layer_id} routed={expert_ids.numel()} "
@@ -1018,16 +1183,22 @@ class DiskTier:
         cache.usage[disk] = cache.step
         return disk.to(dtype=torch.int32)
 
-    def _routed_disk(self, expert_ids: torch.Tensor) -> torch.Tensor:
+    def _routed_disk(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
         """Unique disk-resident rows in this layer's routing (GLOBAL ids under
-        owner-EP; renumbered to local rows, unowned experts dropped)."""
+        owner-EP; renumbered to local rows, unowned experts dropped).
+
+        "Disk-resident" goes through the pinned-row layout: with the default
+        identity map ``_row_map[layer][e] == e`` this is the prefix test
+        ``e >= _ram``; with a learned pin set it is whatever the pin file left
+        out."""
         routed = expert_ids.reshape(-1)
         if self._g0 or self._local_num != self._index.num_experts:
             # Owner-local EP: routing arrives GLOBAL; renumber to local rows and
             # drop the experts this rank does not own.
             routed = routed - self._g0
             routed = routed[(routed >= 0) & (routed < self._local_num)]
-        return torch.unique(routed[routed >= self._ram])
+        rows = self._row_map_dev[layer_id][routed.long()]
+        return torch.unique(routed[rows >= self._ram])
 
     def fetch_routed_into(self, cache, layer_id: int,
                           expert_ids: torch.Tensor, buffer_id: int) -> int:
@@ -1043,7 +1214,7 @@ class DiskTier:
         by the overlap ring (``_invalidate_prefill_buffer``), and decode never
         sees a phantom hit. Returns the fetched-expert count.
         """
-        disk = self._routed_disk(expert_ids)
+        disk = self._routed_disk(layer_id, expert_ids)
         if disk.numel() == 0:
             return 0
         device = self._banks[0][1].device
@@ -1195,7 +1366,7 @@ class DiskTier:
                                 self._index.num_layers)):
             with self._stash_lock:
                 for e in sorted(ids):
-                    if e < self._ram:
+                    if int(self._row_map_cpu[target][e]) < self._ram:
                         continue  # RAM-resident: PCIe fallback is already fast
                     if e in self._resident_disk[target]:
                         self._pf_skipped_resident += 1
@@ -1331,23 +1502,35 @@ class DiskTier:
         # Keep the host slot-occupancy mirror exact: this list is EVERY miss->slot
         # assignment for the layer, so retiring the old owner of each slot plus
         # recording the new one tracks residency precisely.
+        # RAM/disk classification goes through the pinned-row layout (identity
+        # map without a pin file, so ``rows == src`` and this is the old prefix
+        # test; a learned pin set scatters it).
+        rm = self._row_map_cpu[layer_id]
         for i in range(n):
             s = int(slots[i])
             old = self._slot_owner.pop((layer_id, s), None)
-            if old is not None and old >= self._ram:
+            if old is not None and int(rm[old]) >= self._ram:
                 self._resident_disk[layer_id].discard(old)
             e = int(src[i])
             self._slot_owner[(layer_id, s)] = e
-            if e >= self._ram:
+            if int(rm[e]) >= self._ram:
                 self._resident_disk[layer_id].add(e)
+        rows = rm[src.long()]
+        ram_mask = rows < self._ram
         # RAM-classified misses are served from the host bank over PCIe.
-        self._turn_src[layer_id][src[src < self._ram].long()] = 0
-        disk = [i for i in range(n) if int(src[i]) >= self._ram]
+        self._turn_src[layer_id][src[ram_mask].long()] = 0
+        disk = [i for i in range(n) if int(rows[i]) >= self._ram]
         if os.environ.get("FT_DISK_TIER_VERIFY") and (
                 layer_id == 0 or os.environ.get("FT_DISK_TIER_VERIFY_ALL_LAYERS")):
             print(f"[fetch-pend] layer={layer_id} n={n} ndisk={len(disk)} "
                   f"src_head={src[:4].tolist()}", flush=True)
         if not disk:
+            # Nothing to fetch -- but with a learned pin set the PCIe copy below
+            # resolves src_indices against HOST BANK ROWS, so the all-RAM plan
+            # must still be translated from local expert ids to bank rows.
+            # (Identity layout: rows == src, and this is the old no-op return.)
+            if self._remapped and n:
+                cache.src_indices[:n].copy_(rows.to(cache.src_indices.dtype))
             return
         futures = []
         for i in disk:
@@ -1400,7 +1583,9 @@ class DiskTier:
         ram = [i for i in range(n) if i not in disk_set]
         if ram:
             sel = torch.tensor(ram, dtype=torch.long)
-            cache.src_indices[:len(ram)].copy_(src[sel].to(cache.src_indices.dtype))
+            # The PCIe copy path resolves src_indices against the HOST BANK rows;
+            # with a remapped pin set the bank row is not the local expert id.
+            cache.src_indices[:len(ram)].copy_(rows[sel].to(cache.src_indices.dtype))
             cache.evict_slots[:len(ram)].copy_(slots[sel].to(cache.evict_slots.dtype))
         cache.num_indices.fill_(len(ram))
 
@@ -1437,4 +1622,5 @@ class DiskTier:
             "prefetch_wasted": self._pf_wasted,
             "prefetch_skipped_resident": self._pf_skipped_resident,
             "route_hist_total": float(self._route_hist.sum()),
+            "pin_remapped": self._remapped,
         }

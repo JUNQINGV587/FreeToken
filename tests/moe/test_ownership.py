@@ -495,3 +495,67 @@ def test_owner_reader_rejects_ownership_geometry_mismatch(tmp_path, monkeypatch)
                 ownership=ExpertOwnership(global_num_experts=8, world_size=2, rank=0),
             )
         )
+
+
+def test_owner_reader_pin_map_packs_pinned_expert_into_front_row(tmp_path, monkeypatch):
+    """Learned pin set: the pinned LOCAL expert is read into the compact front
+    bank row; every other owned expert yields an empty skip piece at its
+    (released) bank row -- the same contract as the prefix skip."""
+    from freetoken.moe.disk_tier import pin_rows_to_row_map
+
+    raw = _write_tiny_nvfp4_checkpoint(tmp_path)
+    monkeypatch.setattr(
+        "freetoken.models.nvfp4_banks.download_hf_weight", lambda _path: str(tmp_path)
+    )
+    config = SimpleNamespace(
+        num_experts=4,
+        hidden_size=16,
+        moe_intermediate_size=16,
+        num_moe_layers=1,
+    )
+    owner = ExpertOwnership(global_num_experts=4, world_size=2, rank=1)
+    # local {0,1} = global {2,3}; pin ONLY local 1 (global 3) in 1 RAM row.
+    row_map = pin_rows_to_row_map([[1]], owner.local_num_experts)
+    assert row_map == [[1, 0]]  # local 0 -> released row 1; local 1 -> row 0
+    pieces = list(
+        iter_nvfp4_expert_pieces(
+            str(tmp_path),
+            config,
+            _GENERIC_SPEC,
+            drop_page_cache=lambda _path: None,
+            primary=False,
+            ownership=owner,
+            pin_map=(row_map, 1),
+        )
+    )
+    # Bank row 0: the real global-expert-3 piece; bank row 1: the empty skip.
+    assert [(layer, e0, e1) for layer, e0, e1, _ in pieces] == [(0, 0, 1), (0, 1, 2)]
+    piece, skip = pieces[0][3], pieces[1][3]
+    for proj in ("gate", "up", "down"):
+        assert torch.equal(piece[proj][0], raw[f"layer.0.expert.3.{proj}.weight"])
+    assert skip == {}
+    # Global scale must follow the pinned expert (global 3), not the row index.
+    expected = raw["layer.0.expert.3.gate.weight_scale_2"].to(torch.float16)
+    assert torch.equal(piece["gate_global"][0], expected.expand_as(piece["gate_global"][0]))
+
+
+def test_reader_pin_map_and_skip_are_mutually_exclusive(tmp_path, monkeypatch):
+    _write_tiny_nvfp4_checkpoint(tmp_path)
+    monkeypatch.setattr(
+        "freetoken.models.nvfp4_banks.download_hf_weight", lambda _path: str(tmp_path)
+    )
+    config = SimpleNamespace(
+        num_experts=4, hidden_size=16, moe_intermediate_size=16, num_moe_layers=1,
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        list(
+            iter_nvfp4_expert_pieces(
+                str(tmp_path),
+                config,
+                _GENERIC_SPEC,
+                drop_page_cache=lambda _path: None,
+                primary=False,
+                skip_experts_from=2,
+                pin_map=([list(range(4))], 1),
+            )
+        )

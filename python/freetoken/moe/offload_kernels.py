@@ -204,10 +204,26 @@ def _ensure_experts_hybrid_cpu(
         flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
 
 
-def _materialize_layer_gpu(cache, layer_id: int, materialize_count: int | None = None) -> None:
-    # materialize_count < num_experts: the disk tier's RAM-resident prefix only; the
+def _identity_materialize_ids(cache) -> torch.Tensor:
+    """arange(num_experts) on the cache device, cached -- the default pin order
+    (identity slot == expert id == bank row) for ``_materialize_layer_gpu``."""
+    ids = getattr(cache, "_materialize_pin_ids", None)
+    if ids is None or ids.numel() < cache.num_experts:
+        ids = torch.arange(cache.num_experts, dtype=torch.int32,
+                           device=cache.slot_for_id.device)
+        cache._materialize_pin_ids = ids
+    return ids
+
+
+def _materialize_layer_gpu(cache, layer_id: int, materialize_count: int | None = None,
+                           pin_ids: torch.Tensor | None = None) -> None:
+    # materialize_count < num_experts: the disk tier's RAM-resident rows only; the
     # flat-id base still uses the full num_experts (the id space is layer * E + expert).
+    # pin_ids[r] = the LOCAL expert id materialized from bank row r (the disk
+    # tier's pinned-row layout; identity without a learned pin set).
     count = cache.num_experts if materialize_count is None else materialize_count
+    if pin_ids is None:
+        pin_ids = _identity_materialize_ids(cache)
     block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
     _materialize_layer_kernel[(1,)](
         cache.slot_for_id,
@@ -217,6 +233,7 @@ def _materialize_layer_gpu(cache, layer_id: int, materialize_count: int | None =
         cache.evict_slots,
         cache.src_indices,
         cache.num_indices,
+        pin_ids,
         layer_id,
         cache.num_experts,
         count,
@@ -275,6 +292,7 @@ def _materialize_layer_kernel(
     evict_slots_ptr,
     src_indices_ptr,
     num_indices_ptr,
+    pin_ids_ptr,
     layer_id: tl.constexpr,
     num_experts: tl.constexpr,
     materialize_count: tl.constexpr,
@@ -284,30 +302,33 @@ def _materialize_layer_kernel(
     off = tl.arange(0, BLOCK)
     expert_mask = off < materialize_count
     slot_mask = off < cache_size
-    slot = off
 
     base = layer_id * num_experts
-    old_id = tl.load(id_of_slot_ptr + slot, mask=slot_mask, other=-1)
+    # The identity slot of the expert in bank row ``off`` (== off when the pin
+    # layout is the identity prefix). ALL loads happen before any store.
+    mslot = tl.load(pin_ids_ptr + off, mask=expert_mask, other=0)
+    old_id = tl.load(id_of_slot_ptr + off, mask=slot_mask, other=-1)
+    old_m = tl.load(id_of_slot_ptr + mslot, mask=expert_mask, other=-1)
     # Flat ids make "belongs to this layer" a range check instead of a field compare.
     same_layer = slot_mask & (old_id >= base) & (old_id < base + num_experts)
-    tl.store(id_of_slot_ptr + slot, -1, mask=same_layer)
-    tl.store(usage_ptr + slot, 0, mask=same_layer)
+    tl.store(id_of_slot_ptr + off, -1, mask=same_layer)
+    tl.store(usage_ptr + off, 0, mask=same_layer)
     # Clear the forward entries too: with materialize_count < num_experts (disk tier)
-    # the identity store below only covers the prefix, so a stale slot_for_id for one
+    # the identity store below only covers the pinned rows, so a stale slot_for_id for one
     # of THIS layer's experts would otherwise survive and become a phantom decode hit
     # against whatever later occupies that slot.
     tl.store(slot_for_id_ptr + old_id, -1, mask=same_layer)
 
-    old_valid = expert_mask & (old_id >= 0) & (~same_layer)
-    tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid)
+    old_valid = expert_mask & (old_m >= 0) & ~((old_m >= base) & (old_m < base + num_experts))
+    tl.store(slot_for_id_ptr + old_m, -1, mask=old_valid)
 
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
-    tl.store(id_of_slot_ptr + slot, base + off, mask=expert_mask)
-    tl.store(slot_for_id_ptr + base + off, slot, mask=expert_mask)
-    tl.store(usage_ptr + slot, step, mask=expert_mask)
-    tl.store(evict_slots_ptr + off, slot, mask=expert_mask)
-    tl.store(src_indices_ptr + off, off, mask=expert_mask)  # layer-local row
+    tl.store(id_of_slot_ptr + mslot, base + mslot, mask=expert_mask)
+    tl.store(slot_for_id_ptr + base + mslot, mslot, mask=expert_mask)
+    tl.store(usage_ptr + mslot, step, mask=expert_mask)
+    tl.store(evict_slots_ptr + off, mslot, mask=expert_mask)
+    tl.store(src_indices_ptr + off, off, mask=expert_mask)  # host-bank row
     tl.store(num_indices_ptr, materialize_count)
 
 

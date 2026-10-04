@@ -876,6 +876,20 @@ def parse_args(
         default=ServerArgs.disk_fetch_workers,
         help="Disk-tier O_DIRECT fetch threads (default 8).",
     )
+    parser.add_argument(
+        "--moe-ram-pin-file",
+        type=str,
+        default=ServerArgs.moe_ram_pin_file,
+        help=(
+            "With --moe-disk-tier on: a freetoken.ram_pin_set.v1 JSON document "
+            "(tools/trace/make_ram_pin_set.py) naming the LEARNED per-layer "
+            "experts pinned in RAM, replacing the default contiguous id prefix "
+            "[0, N). The pinned rows are packed into the same N host-bank rows, "
+            "so the host RAM budget is unchanged; a mismatched file (model, "
+            "--moe-ep-size, resolved budget) fails the boot rather than serving "
+            "wrong rows. Omit to keep the prefix layout."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cpu-threads",

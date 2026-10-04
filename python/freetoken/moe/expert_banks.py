@@ -71,6 +71,10 @@ class ExpertBanks:
     # disk-resident and fetched on slot-cache miss).
     disk_index: object | None = field(default=None)
     disk_ram_experts: int = 0
+    # Learned pin set (None -> contiguous prefix [0, disk_ram_experts)): per-layer
+    # sorted lists of the LOCAL expert ids pinned in RAM, from --moe-ram-pin-file
+    # (see moe.disk_tier.load_ram_pin_doc).
+    disk_pin_rows: list[list[int]] | None = field(default=None)
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -264,6 +268,8 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     disk_index = None
     ram_prefix = None
     skip_experts_from = None
+    pin_rows = None
+    pin_map = None
     if disk_tier is not None:
         from freetoken.layers.quantization import QuantKind
 
@@ -283,7 +289,7 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
         # the release without an index would serve zeroed experts. Resolving the
         # spec through the family hook keeps the index and the loader reading
         # the same rows.
-        from freetoken.moe.disk_tier import Nvfp4DiskIndex, local_ram_experts
+        from freetoken.moe.disk_tier import Nvfp4DiskIndex, local_ram_experts, pin_rows_to_row_map
 
         disk_index = Nvfp4DiskIndex(model_path, model_config, source_spec)
         # The pin budget is host-wide (see local_ram_experts): each rank pins its
@@ -292,10 +298,22 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
         # global start plus that local share.
         ram_prefix = local_ram_experts(disk_tier.ram_experts, ownership)
         skip_experts_from = ram_prefix + (ownership.global_start if ownership is not None else 0)
+        # Learned pin set (--moe-ram-pin-file): this rank's per-layer LOCAL rows
+        # replace the contiguous prefix -- the loader reads pinned experts into
+        # the compact front rows [0, ram_prefix) via the row map, the contiguous
+        # host-bank pin/release contract is unchanged.
+        if disk_tier.pin_doc is not None:
+            pin_rows = disk_tier.pin_doc["ranks"][str(ownership.rank if ownership is not None else 0)]
+            local_num = E if E is not None else model_config.num_experts
+            # ram_prefix == 0 is fine: the row map is the identity and every
+            # expert is >= ram_rows, so all pieces are empty skips (the prefix
+            # flow would have used skip_experts_from == global_start).
+            pin_map = (pin_rows_to_row_map(pin_rows, local_num), ram_prefix)
+            skip_experts_from = None
 
     pieces = iter_expert_pieces(
         model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk,
-        ownership=ownership, skip_experts_from=skip_experts_from,
+        ownership=ownership, skip_experts_from=skip_experts_from, pin_map=pin_map,
     )
     banks = build_expert_banks(
         method, num_layers, pieces, device=device, layer_sink=layer_sink,
@@ -304,7 +322,8 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     if disk_index is not None:
         import dataclasses
 
-        banks = dataclasses.replace(banks, disk_index=disk_index, disk_ram_experts=ram_prefix)
+        banks = dataclasses.replace(banks, disk_index=disk_index, disk_ram_experts=ram_prefix,
+                                    disk_pin_rows=pin_rows)
     return banks
 
 

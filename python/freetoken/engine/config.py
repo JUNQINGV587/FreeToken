@@ -81,6 +81,10 @@ class EngineConfig:
     moe_disk_tier: str = "off"
     expert_ram_experts: int = 0
     disk_fetch_workers: int = 8
+    # Learned RAM pin set (None -> contiguous id prefix [0, expert_ram_experts)):
+    # path to a freetoken.ram_pin_set.v1 JSON document. The pinned experts are
+    # packed into the same host-bank rows, so the host budget is unchanged.
+    moe_ram_pin_file: str | None = None
     # auto mode only: host RAM kept out of the tier budget (GiB). The PLE context
     # table has its own disk backend (ple_backend) and is unaffected by all of this.
     disk_tier_auto_reserve_gb: float = 16.0

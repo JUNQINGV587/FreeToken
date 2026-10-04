@@ -31,6 +31,7 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models import mtp_dump
 
 from .args import DeepseekV41Args
 from .attention import Attention
@@ -279,6 +280,8 @@ class Transformer(BaseOP):
             if layer.engram is not None:
                 idx = layer.engram.layer_hash_index
                 h = layer.engram.forward(h, hashes[:, :, idx, :], engram_mask)
+            if mtp_dump.enabled() and i in mtp_dump.TARGET_LAYERS:
+                mtp_dump.capture(h, i, start_pos, None)
             h, pre_mix = layer.forward(h, start_pos, pre_mix, image_mask, trace=trace)
         assert layer is not None, "a model with no layers has no state to collapse"
         h = layer.hc_pre(h, pre_mix)
@@ -390,6 +393,8 @@ class Transformer(BaseOP):
                 fn = lambda x, _l=layer: _l.attn.decode_step(  # noqa: E731
                     x, pos, rows, cmp_stage_cap
                 )
+            if mtp_dump.enabled() and i in mtp_dump.TARGET_LAYERS:
+                mtp_dump.capture(h, i, start_pos, keep_rows)
             h, pre_mix = layer.forward(h, start_pos, pre_mix, image_mask, attn_fn=fn)
         assert layer is not None, "a model with no layers has no state to collapse"
         h = layer.hc_pre(h, pre_mix)
@@ -528,12 +533,14 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             last = torch.tensor(
                 [off + n - 1 for off, n, _ti, _sp in segments], dtype=torch.long, device=device
             )
-            return self.model.forward_paged(
+            logits = self.model.forward_paged(
                 input_ids.view(1, -1),
                 segments=segments,
                 flat_positions=batch.positions.long(),
                 keep_rows=last,
             )
+            mtp_dump.dump_prefill(batch, segments, logits)
+            return logits
         # DECODE (bs >= 1): per-row position (GPU int tensor -> no host syncs / graph safe). The
         # compressed staging cap is the max position any row reaches (eager); a static max_seq-1
         # under graph capture, so the captured static-shape graph serves any replay position.
@@ -543,13 +550,15 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             cmp_stage_cap = md.stage_width - 1
         else:
             cmp_stage_cap = int(pos.max().item())
-        return self.model.forward_paged(
+        logits = self.model.forward_paged(
             input_ids.view(B, 1),
             pos=pos,
             rows=torch.arange(B, device=device),
             engram_rows=md.table_rows,
             cmp_stage_cap=cmp_stage_cap,
         )
+        mtp_dump.dump_step(batch, md, pos, input_ids.view(B, 1), logits)
+        return logits
 
 
 def resolve_engram_tokenizer(config):

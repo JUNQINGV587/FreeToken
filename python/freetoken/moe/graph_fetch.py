@@ -52,8 +52,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import triton
@@ -178,15 +180,26 @@ class GraphFetchBridge:
                 self.staging_host.append(
                     torch.zeros(shape, dtype=row.dtype, pin_memory=True))
 
-            # Bridge-private preadv bounce buffer. The eager path's
-            # tier._staging_ring() guards buffer reuse with CUDA events
-            # recorded on the calling thread's stream; in this thread that
-            # event can end up queued behind the graph replay whose spin
-            # kernel is itself waiting for our ack (observed deadlock on
-            # TP rank>0: thread spinning in ev.synchronize forever).
-            # The bounce buffer is host-only scratch — no events needed.
-            self._bounce = torch.empty(self.tier._staging_size,
-                                       dtype=torch.uint8, pin_memory=True)
+            # Bridge-private preadv bounce slabs (O_DIRECT needs an aligned
+            # buffer), PRE-ALLOCATED here — the eager path's tier._staging_ring()
+            # guards buffer reuse with CUDA events recorded on the calling
+            # thread's stream; in a service thread that event can end up queued
+            # behind the graph replay whose spin kernel is itself waiting for
+            # our ack (observed deadlock on TP rank>0: thread spinning in
+            # ev.synchronize forever). The bounce is host-only scratch — no
+            # events needed. Pre-allocation is not a luxury: cudaHostAlloc from
+            # a service thread while a replay spins was empirically never
+            # scheduled (same transport limit as thread-issued copies), so the
+            # slabs must exist before enable(). One slab per row-pool worker
+            # plus one for the service thread itself; _bounce_buf hands them
+            # out via thread-local storage.
+            self._bounce_tls = threading.local()
+            self._bounce_slabs = queue.SimpleQueue()
+            for _ in range(
+                    1 + int(os.environ.get("FT_GRAPH_FETCH_WORKERS", "4"))):
+                self._bounce_slabs.put(
+                    torch.empty(self.tier._staging_size, dtype=torch.uint8,
+                                pin_memory=True))
 
         self.req_slots_dev = torch.zeros(self.k_max, dtype=torch.int32,
                                          device=device)
@@ -203,6 +216,16 @@ class GraphFetchBridge:
         self._issue_prefetch = os.environ.get("FT_GRAPH_FETCH_PREFETCH", "0") == "1"
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Row-level fetch pool: the W15 py-spy profile showed the doorbell
+        # service thread is the decode bottleneck (one python thread doing
+        # per-row preadv + member copies serially). Rows within one request
+        # are independent; the ack still waits for ALL of them (see
+        # _serve_inner), so the stream-ordering contract is unchanged.
+        # Threads spawn lazily on first submit, so an unused pool costs nothing.
+        self._row_workers = int(os.environ.get("FT_GRAPH_FETCH_WORKERS", "4"))
+        self._row_pool = ThreadPoolExecutor(
+            max_workers=self._row_workers,
+            thread_name_prefix="graph-fetch-row")
         self._numpy_view = None
         # Compile-warm both triton kernels OUTSIDE capture (first-call JIT
         # compilation does device work that is illegal inside graph capture).
@@ -259,6 +282,15 @@ class GraphFetchBridge:
             self._served = int(self.req_host[self.seq_off])
             self._stop.clear()
             if not os.environ.get("FT_GRAPH_FETCH_NOTHREAD"):
+                # Pre-spawn the row workers and their pinned bounce slabs NOW:
+                # a cudaHostAlloc issued by a service thread DURING a replay
+                # spin is the same class of CUDA call that was empirically
+                # never scheduled (2026-09-28 transport probe), so every slab
+                # must exist before the first request can arrive.
+                warm = [self._row_pool.submit(self._bounce_buf)
+                        for _ in range(self._row_workers)]
+                for f in warm:
+                    f.result()
                 self._thread = threading.Thread(
                     target=self._serve, name="graph-fetch", daemon=True)
                 self._thread.start()
@@ -273,6 +305,7 @@ class GraphFetchBridge:
         if t is not None:
             t.join(timeout=5)
             self._thread = None
+        self._row_pool.shutdown(wait=False)
 
     # -- host service thread ---------------------------------------------------
     # The thread makes ZERO CUDA calls: anything enqueued from here (memcpy or
@@ -287,6 +320,9 @@ class GraphFetchBridge:
     def _serve(self) -> None:
         print(f"[graph-fetch] thread-entry dev={self._device} "
               f"pid={os.getpid()} tid={threading.get_native_id()}", flush=True)
+        # Own bounce slab up front (see enable(): cudaHostAlloc is unsafe
+        # once a replay can be spinning).
+        self._bounce_buf()
         # A dead service thread hangs the whole engine: every replayed graph spins on an
         # ack that would never come. Observed 2026-10-03 -- an inference-mode RuntimeError
         # inside _read_into_staging killed the thread and froze a prefill for 22 minutes.
@@ -342,8 +378,19 @@ class GraphFetchBridge:
             # Staging reuse needs no fence: requests are strictly serialized
             # by the spin, so the previous request's install kernel (stream
             # order) has consumed the rows before this request could exist.
-            for j in range(count):
-                self._read_into_staging(layer, int(blk[2 + j]), j)
+            if count == 1:
+                self._read_into_staging(layer, int(blk[2]), 0)
+            else:
+                # Parallel rows: one row's preadv (DMA, GIL released) overlaps
+                # another row's memmove (CPU). f.result() re-raises a worker
+                # failure into _serve's error counter; the ack below only
+                # fires after every row of this request is staged.
+                futs = [self._row_pool.submit(
+                            self._read_into_staging, layer,
+                            int(blk[2 + j]), j)
+                        for j in range(count)]
+                for f in futs:
+                    f.result()
             if self._dbg:
                 print(f"[graph-fetch] served dev={self._device} seq={seq} layer={layer} "
                       f"count={count} rows={blk[2:2 + min(count, 8)].tolist()}",
@@ -395,7 +442,7 @@ class GraphFetchBridge:
             # "Inplace update to inference tensor outside InferenceMode" (2026-10-03).
             tier.mark_turn_src(layer, expert, 1)  # served from stash (cf. fetch_pending)
             return
-        bounce = self._bounce
+        bounce = self._bounce_buf()
         scalar_banks = getattr(tier._index, "scalar_banks", ())
         for bank_idx, (_host, _gpu) in enumerate(tier._banks):
             dst_row = self.staging_host[bank_idx][j]
@@ -409,7 +456,28 @@ class GraphFetchBridge:
                 mv = (ctypes.c_char * slen).from_address(bounce.data_ptr())
                 os.preadv(fd, [mv], a0)
                 tier._preadv_calls += 1
+                src_base = bounce.data_ptr() - a0
                 for d0, d1, off, nbytes in members:
-                    src = bounce[off - a0:off - a0 + nbytes]
-                    dst = dst_row[d0:d1]
-                    dst.copy_(src.view(dst.dtype).view(dst.shape))
+                    # Raw memmove, NOT torch copy_: the staging row is pinned
+                    # HOST memory, and copy_ routes float8 banks through a slow
+                    # elementwise kernel instead of memcpy (the doorbell service
+                    # thread spent ~34% of its samples in that copy_ -- W15
+                    # py-spy). ctypes releases the GIL, so this also overlaps
+                    # with the row pool's preadv DMA.
+                    ctypes.memmove(dst_row[d0:d1].data_ptr(),
+                                   src_base + off, nbytes)
+
+    def _bounce_buf(self) -> torch.Tensor:
+        """This thread's pinned preadv bounce slab, handed out from the pool
+        pre-allocated in __init__ (cudaHostAlloc from a service thread is
+        unsafe once a replay can spin — see __init__)."""
+        b = getattr(self._bounce_tls, "buf", None)
+        if b is None:
+            try:
+                b = self._bounce_slabs.get_nowait()
+            except queue.Empty:
+                raise RuntimeError(
+                    "graph-fetch bounce slab exhaustion: more fetch threads "
+                    "than pre-allocated slabs (1 + FT_GRAPH_FETCH_WORKERS)")
+            self._bounce_tls.buf = b
+        return b

@@ -74,6 +74,52 @@ def count_freq(records, lo: int, hi: int, num_layers: int, phases=(0,)):
     return freq
 
 
+def miss_freq(records, lo: int, hi: int, num_layers: int, pool: int, phases=(0,)):
+    """Per-layer Counter of LOCAL expert ids over the *slot-cache miss stream*.
+
+    Replays the trace through the unified-pool LRU mirror (``route_trace.LRU``,
+    same semantics as ``flashlib.lru_ensure``) and counts only activations the
+    pool would have MISSED -- the stream that actually reaches the disk tier.
+    A pin set learned on this stream covers rows too cold for the VRAM pool but
+    still recurring, instead of spending RAM rows on experts the pool holds
+    anyway (the unconditional histogram double-counts those).
+    """
+    lru = _ROUTE_TRACE.LRU(pool, hi - lo)
+    freq = [collections.Counter() for _ in range(num_layers)]
+    for ph, layer, ids in records:
+        if ph not in phases or layer >= num_layers:
+            continue
+        loc = sorted({e - lo for e in ids if lo <= e < hi})
+        if not loc:
+            continue
+        base = layer * lru.E
+        miss_ids = [e for e in loc if (base + e) not in lru.slot_of]
+        lru.ensure(layer, loc)
+        for e in miss_ids:
+            freq[layer][e] += 1
+    return freq
+
+
+def miss_coverage(records, pin_rows, lo: int, hi: int, num_layers: int, pool: int,
+                  phases=(0,)) -> tuple[float, int]:
+    """Share of slot-cache misses whose row is pinned (= served from RAM, not NVMe)."""
+    lru = _ROUTE_TRACE.LRU(pool, hi - lo)
+    hit = tot = 0
+    for ph, layer, ids in records:
+        if ph not in phases or layer >= num_layers:
+            continue
+        loc = sorted({e - lo for e in ids if lo <= e < hi})
+        if not loc:
+            continue
+        base = layer * lru.E
+        miss_ids = [e for e in loc if (base + e) not in lru.slot_of]
+        lru.ensure(layer, loc)
+        for e in miss_ids:
+            tot += 1
+            hit += e in pin_rows[layer]
+    return (hit / tot if tot else 0.0), tot
+
+
 def topk_per_layer(freq, budget: int, local_num: int) -> list[list[int]]:
     """Hottest ``budget`` local ids per layer, ascending.  Deterministic ties (lowest
     id); layers with fewer distinct ids seen are padded with the lowest unseen ids so
@@ -103,14 +149,22 @@ def coverage(records, pin_rows, lo: int, hi: int, phases=(0,)) -> tuple[float, i
     return (hit / tot if tot else 0.0), tot
 
 
-def build_doc(traces, ep: int, budgets, num_layers: int, num_experts: int, phases=(0,)):
-    """Learn per-rank pin rows from ``[(name, records), ...]``; return the JSON doc."""
+def build_doc(traces, ep: int, budgets, num_layers: int, num_experts: int, phases=(0,),
+              learn: str = "activations", pool: int = 1000):
+    """Learn per-rank pin rows from ``[(name, records), ...]``; return the JSON doc.
+
+    ``learn="activations"`` counts every routed expert (unconditional histogram);
+    ``learn="misses"`` counts only the slot-cache miss stream (see ``miss_freq``).
+    """
     ranks = {}
     for rank in range(ep):
         lo, hi = local_window(rank, ep, num_experts)
         freq = [collections.Counter() for _ in range(num_layers)]
         for _, records in traces:
-            layer_freq = count_freq(records, lo, hi, num_layers, phases)
+            if learn == "misses":
+                layer_freq = miss_freq(records, lo, hi, num_layers, pool, phases)
+            else:
+                layer_freq = count_freq(records, lo, hi, num_layers, phases)
             for layer in range(num_layers):
                 freq[layer].update(layer_freq[layer])
         ranks[str(rank)] = topk_per_layer(freq, budgets[rank], hi - lo)
@@ -120,6 +174,8 @@ def build_doc(traces, ep: int, budgets, num_layers: int, num_experts: int, phase
         "num_experts": num_experts,
         "ep": ep,
         "budgets": list(budgets),
+        "learn": learn,
+        "pool": pool,
         "sources": [name for name, _ in traces],
         "ranks": ranks,
     }
@@ -154,6 +210,12 @@ def main(argv=None) -> int:
     ap.add_argument("--budgets", required=True,
                     help="per-rank pin budgets, comma-separated (e.g. 64,56); one value = uniform")
     ap.add_argument("--phase", choices=sorted(PHASES), default="decode")
+    ap.add_argument("--learn-on", choices=("activations", "misses"), default="activations",
+                    help="activations = unconditional histogram (v1 behavior); misses = "
+                         "slot-cache miss stream via the LRU mirror (covers what the "
+                         "VRAM pool cannot hold, not what it already does)")
+    ap.add_argument("--pool", type=int, default=1000,
+                    help="unified slot-pool size for the miss-stream LRU mirror")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
@@ -184,28 +246,39 @@ def main(argv=None) -> int:
     flat = [(name, recs) for name, rank_recs in per_trace.items() for recs in [None]]  # placeholder
     combined = [(name, [ph_l_ids for recs in rank_recs for ph_l_ids in recs])
                 for name, rank_recs in per_trace.items()]
-    doc = build_doc(combined, args.ep, budgets, L, E, phases)
+    doc = build_doc(combined, args.ep, budgets, L, E, phases, learn=args.learn_on,
+                    pool=args.pool)
     validate_doc(doc)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(doc, indent=1) + "\n")
 
-    print(f"wrote {out}  (layers={L} experts={E} ep={args.ep} budgets={budgets} phase={args.phase})")
+    print(f"wrote {out}  (layers={L} experts={E} ep={args.ep} budgets={budgets} "
+          f"phase={args.phase} learn={args.learn_on} pool={args.pool})")
     for rank in range(args.ep):
         lo, hi = local_window(rank, args.ep, E)
         pin = [set(rows) for rows in doc["ranks"][str(rank)]]
         for name, rank_recs in per_trace.items():
             c, tot = coverage(rank_recs[rank], pin, lo, hi, phases)
-            print(f"  rank{rank} self-fit on {Path(name).parent.name}: {c:.4f} over {tot} acts")
+            extra = ""
+            if args.learn_on == "misses":
+                mc, mtot = miss_coverage(rank_recs[rank], pin, lo, hi, L, args.pool, phases)
+                extra = f" | miss-stream cov {mc:.4f} over {mtot} misses"
+            print(f"  rank{rank} self-fit on {Path(name).parent.name}: {c:.4f} over {tot} acts{extra}")
         if len(per_trace) > 1:
             for name, rank_recs in per_trace.items():
                 others = [(n, rr) for n, rr in per_trace.items() if n != name]
                 sub = build_doc([(n, [x for recs in rrs for x in recs]) for n, rrs in others],
-                                args.ep, budgets, L, E, phases)
+                                args.ep, budgets, L, E, phases, learn=args.learn_on,
+                                pool=args.pool)
                 sub_pin = [set(rows) for rows in sub["ranks"][str(rank)]]
                 c, tot = coverage(rank_recs[rank], sub_pin, lo, hi, phases)
-                print(f"  rank{rank} leave-out {Path(name).parent.name}: {c:.4f} over {tot} acts")
+                extra = ""
+                if args.learn_on == "misses":
+                    mc, mtot = miss_coverage(rank_recs[rank], sub_pin, lo, hi, L, args.pool, phases)
+                    extra = f" | miss-stream cov {mc:.4f} over {mtot} misses"
+                print(f"  rank{rank} leave-out {Path(name).parent.name}: {c:.4f} over {tot} acts{extra}")
     return 0
 
 

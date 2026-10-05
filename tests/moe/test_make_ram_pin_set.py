@@ -133,3 +133,64 @@ def test_cli_end_to_end(tmp_path):
     assert doc["ranks"]["0"][0] == [0, 1]  # counts: 0->2, 1->1, 2->1 (tie -> lowest)
     assert doc["ranks"]["1"][0] == [0, 1]  # globals 4,5 -> locals 0,1
     assert "self-fit" in rc.stdout
+
+
+def test_miss_freq_counts_only_slot_misses():
+    # window [0,4), pool of 2 slots: first sighting of an id misses, repeats hit.
+    recs = [
+        (0, 0, (0, 1)),      # both miss (cold pool)
+        (0, 0, (0, 1)),      # both hit
+        (0, 0, (1, 2)),      # 1 hits, 2 misses (pool was {0,1}, evicts 0)
+        (0, 0, (0,)),        # 0 misses again (was evicted)
+        (1, 0, (2, 3)),      # prefill phase ignored
+        (0, 1, (7,)),        # out of window
+    ]
+    freq = _gen.miss_freq(recs, 0, 4, L, pool=2, phases=(0,))
+    assert freq[0] == {0: 2, 1: 1, 2: 1}
+    assert freq[1] == {}
+
+
+def test_miss_coverage_reports_ram_served_share():
+    recs = [(0, 0, (0, 1)), (0, 0, (0, 1)), (0, 0, (2,))]
+    pin = [set(), {0, 1, 2}, set()]
+    # misses: rec1 {0,1}, rec3 {2} -- pinning layer 0 would catch all, pinning
+    # layer 1 (nonsense) catches none.
+    c0, tot = _gen.miss_coverage(recs, [ {0, 1, 2}, set(), set()], 0, 4, L, pool=4)
+    assert (c0, tot) == (1.0, 3)
+    c1, _ = _gen.miss_coverage(recs, pin, 0, 4, L, pool=4)
+    assert c1 == 0.0
+
+
+def test_build_doc_miss_mode_validates():
+    r0, r1 = _records([(0, 0, (0, 1)), (0, 0, (1, 2)), (0, 1, (3,))])
+    doc = _gen.build_doc([("t", r0 + r1)], 2, [2, 2], L, E, learn="misses", pool=2)
+    _gen.validate_doc(doc)
+    assert doc["learn"] == "misses" and doc["pool"] == 2
+    # rank0 window [0,4): misses are 0,1 (first rec) then 2 (second rec, pool=2
+    # evicts) -- top-2 must come from {0,1,2} and match the frequency order.
+    assert set(doc["ranks"]["0"][0]) <= {0, 1, 2}
+    assert doc["ranks"]["0"][0][0] == 0  # hottest miss first after ascending sort
+
+
+def test_cli_miss_mode_end_to_end(tmp_path):
+    base = tmp_path / "route.bin"
+    recs0, recs1 = _records([(0, 0, (0, 1)), (0, 0, (2,)), (0, 1, (1, 3))])
+    for rank, recs in ((0, recs0), (1, recs1)):
+        with open(f"{base}.rank{rank}", "wb") as f:
+            for ph, layer, ids in recs:
+                f.write(_HDR.pack(ph, layer, len(ids)))
+                f.write(struct.pack(f"<{len(ids)}i", *ids))
+    (tmp_path / "route.bin.rank0.meta.json").write_text(json.dumps(
+        {"num_layers": L, "num_experts": E, "cache_size": 2, "top_k": 2}))
+    (tmp_path / "route.bin.rank1.meta.json").write_text(json.dumps(
+        {"num_layers": L, "num_experts": E, "cache_size": 2, "top_k": 2}))
+    out = tmp_path / "pin.json"
+    r = subprocess.run(
+        [sys.executable, str(_ROOT / "tools/trace/make_ram_pin_set.py"),
+         "--trace", str(base), "--ep", "2", "--budgets", "2",
+         "--learn-on", "misses", "--pool", "2", "--out", str(out)],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    doc = json.loads(out.read_text())
+    _gen.validate_doc(doc)
+    assert "miss-stream cov" in r.stdout

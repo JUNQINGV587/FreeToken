@@ -2404,3 +2404,94 @@ def test_hybrid_target_keeps_the_real_split():
     snap = cache.stats_snapshot()
     assert snap["fetched_per_layer"] == pytest.approx(0.5)
     assert snap["fetch_rate"] == pytest.approx(5 / 8)
+
+
+def _ttl_cache():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    return OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6,
+                           device=torch.device("cpu"))
+
+
+def test_stats_snapshot_ttl_caches_within_window():
+    """W20: the scheduler stamps stats_snapshot on every reply batch; within the
+    TTL the same dict comes back (no GPU syncs). Past the TTL the stamp keeps
+    serving the bounded-stale dict while a daemon thread rebuilds -- the syncs
+    never land on the caller."""
+    import time as _time
+
+    cache = _ttl_cache()
+    assert cache._stats_ttl_s == pytest.approx(2.0)  # default (must be >> token period)
+    snap1 = cache.stats_snapshot()
+    assert snap1["resident"] == 0
+    cache.usage[0] = 1  # simulate an insert between stamps
+    snap2 = cache.stats_snapshot()
+    assert snap2 is snap1  # cached: identical object, no rebuild
+    assert snap2["resident"] == 0  # stale-but-bounded, by design
+    cache._stats_cache = (0.0, snap1)  # backdate past the TTL
+    snap3 = cache.stats_snapshot()
+    assert snap3 is snap1  # still the stale dict; the rebuild runs in the background
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if cache.stats_snapshot()["resident"] == 1:
+            break
+        _time.sleep(0.02)
+    else:
+        raise AssertionError("background stats rebuild never landed")
+    assert cache.stats_snapshot() is not snap1  # a fresh dict replaced the stale one
+
+
+def test_stats_snapshot_gen_guard_blocks_stale_background_build():
+    """An invalidation during an in-flight background build must win: the build's
+    result is dropped instead of resurrecting pre-reset values."""
+    import time as _time
+
+    cache = _ttl_cache()
+    snap1 = cache.stats_snapshot()
+    cache._stats_cache = (0.0, snap1)  # force a background rebuild on next call
+    cache.stats_snapshot()  # spawns the builder
+    cache.reset_stats()     # invalidate while it may be in flight
+    snap2 = cache.stats_snapshot()  # cache is None -> synchronous fresh build
+    assert snap2["prefill_hit_rows"] == 0
+    _time.sleep(0.3)  # let any in-flight builder finish
+    for _ in range(50):   # the stored snapshot must stay the post-reset one
+        assert cache.stats_snapshot()["prefill_hit_rows"] == 0
+        _time.sleep(0.01)
+
+
+def test_stats_snapshot_ttl_zero_disables(monkeypatch):
+    """FT_STATS_SNAPSHOT_TTL_S=0 restores the always-fresh behaviour."""
+    monkeypatch.setenv("FT_STATS_SNAPSHOT_TTL_S", "0")
+    cache = _ttl_cache()
+    assert cache._stats_ttl_s == 0.0
+    assert cache.stats_snapshot()["resident"] == 0
+    cache.usage[0] = 1
+    assert cache.stats_snapshot()["resident"] == 1
+
+
+def test_stats_snapshot_invalidated_by_reset_stats():
+    """reset_stats() must not let a cached snapshot survive the wipe."""
+    cache = _ttl_cache()
+    cache.prefill_hit_rows = 5
+    assert cache.stats_snapshot()["prefill_hit_rows"] == 5
+    cache.prefill_hit_rows = 9
+    assert cache.stats_snapshot()["prefill_hit_rows"] == 5  # cached
+    cache.reset_stats()
+    assert cache.stats_snapshot()["prefill_hit_rows"] == 0  # fresh after reset
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_stats_snapshot_invalidated_by_reset():
+    """reset() runs a GPU wipe of the slot map; the TTL snapshot must not survive."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6,
+                            device=torch.device("cuda"))
+    cache.usage[0] = 1
+    assert cache.stats_snapshot()["resident"] == 1
+    cache.usage[2] = 1
+    assert cache.stats_snapshot()["resident"] == 1  # cached
+    cache.reset()
+    assert cache.stats_snapshot()["resident"] == 0  # reset() wiped usage + cache

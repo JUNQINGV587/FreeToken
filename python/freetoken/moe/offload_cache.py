@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Iterator
@@ -237,6 +238,22 @@ class OffloadMoeCache:
             device=self.device,
         )
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
+        # stats_snapshot TTL cache (W20, 2026-10-05): the scheduler stamps this dict
+        # onto every reply batch; without a TTL each stamp pays GPU syncs
+        # (usage.gt(0).sum().item() + lru_stats.sum) measured at ~17% of the decode
+        # core time on production (py-spy, delta42). Consumers (shell status bar,
+        # /v1/stats) do not need per-token freshness. FT_STATS_SNAPSHOT_TTL_S=0
+        # disables caching (always rebuild). Any reset/rebuild invalidates.
+        # NOTE: the TTL must be >> the token period (~250 ms at 4 t/s) or the cache
+        # expires every step and the syncs come straight back (measured: 0.25 s
+        # still showed 15% stats_snapshot on the delta43 py-spy) -- hence 2.0 s.
+        self._stats_ttl_s = max(
+            0.0, float(os.environ.get("FT_STATS_SNAPSHOT_TTL_S", "2.0"))
+        )
+        self._stats_cache: tuple[float, dict] | None = None
+        self._stats_lock = threading.Lock()
+        self._stats_building = False
+        self._stats_gen = 0  # bumped by reset/rebuild so an in-flight build can't resurrect pre-reset values
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
         # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
@@ -598,6 +615,8 @@ class OffloadMoeCache:
         self.stat_missing_layer.zero_()
         # a rebuild is a cold start for the cache; carrying pre-rebuild hit/miss counts over would skew every post-rebuild stats report
         self.lru_stats.zero_()
+        self._stats_cache = None  # reallocated + zeroed -- drop the TTL snapshot
+        self._stats_gen += 1
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
@@ -1149,10 +1168,14 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self._stats_cache = None  # usage was just wiped -- drop the TTL snapshot
+        self._stats_gen += 1
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self._stats_cache = None  # counters zeroed below -- drop the TTL snapshot
+        self._stats_gen += 1
         self.lru_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
@@ -1332,7 +1355,62 @@ class OffloadMoeCache:
         ``cache_size`` capacity and ``total_experts`` expert-layer pairs) is always
         available; miss/fetch counters require ``collect_stats``, and the routing
         concentration block requires ``collect_decode_freq``. All values are
-        since-process-start (or the last rebuild/reset), like the other getters."""
+        since-process-start (or the last rebuild/reset), like the other getters.
+
+        The whole snapshot is TTL-cached (``self._stats_ttl_s``) and, past the TTL,
+        rebuilt on a DAEMON THREAD: a build's .item() syncs wait for the queued decode
+        replays to drain (~120 ms measured), which on the scheduler thread directly
+        delayed the next replay launch (py-spy: 15% at TTL=0.25 s, 6% at 2.0 s on the
+        scheduler profile). Every consumer (shell status bar, /v1/stats via
+        StatsTracker.moe_stats) reads the last stamped dict, so serving a bounded-stale
+        copy while a side thread pays the syncs takes the whole cost off the decode
+        critical path. FT_STATS_SNAPSHOT_TTL_S=0 disables caching (always builds
+        synchronously, the pre-W20 behaviour). reset()/reset_stats()/rebuild()
+        invalidate and bump ``_stats_gen`` so an in-flight build cannot resurrect
+        pre-reset values."""
+        if self._stats_ttl_s <= 0:
+            return self._build_stats_snapshot()
+        with self._stats_lock:
+            cached = self._stats_cache
+            if cached is not None:
+                ts, out = cached
+                if time.monotonic() - ts < self._stats_ttl_s:
+                    return out
+                if not self._stats_building:
+                    self._stats_building = True
+                    threading.Thread(
+                        target=self._rebuild_stats_bg,
+                        daemon=True,
+                        name="moe-stats-snapshot",
+                    ).start()
+                return out  # bounded-stale while the background build pays the syncs
+        # First build ever (or right after an invalidation): synchronous, so callers
+        # never observe an empty/partial snapshot.
+        out = self._build_stats_snapshot()
+        with self._stats_lock:
+            self._stats_cache = (time.monotonic(), out)
+        return out
+
+    def _rebuild_stats_bg(self) -> None:
+        gen = self._stats_gen
+        try:
+            if self.device.type == "cuda":
+                with torch.cuda.device(self.device):
+                    out = self._build_stats_snapshot()
+            else:
+                out = self._build_stats_snapshot()
+            with self._stats_lock:
+                if gen == self._stats_gen:
+                    self._stats_cache = (time.monotonic(), out)
+        except Exception:  # noqa: BLE001 -- stats must never break serving
+            logger.exception("background moe stats snapshot failed; keeping the previous one")
+        finally:
+            with self._stats_lock:
+                self._stats_building = False
+
+    def _build_stats_snapshot(self) -> dict:
+        """The expensive build behind stats_snapshot(): one device sync per counter
+        group. Callers go through stats_snapshot() (TTL cache + background rebuild)."""
         out: dict = {
             "cache_size": self.cache_size,
             "total_experts": self.num_layers * self.num_experts,

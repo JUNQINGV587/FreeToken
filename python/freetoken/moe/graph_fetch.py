@@ -141,6 +141,19 @@ def _gf_spin_kernel(resp_ptr, req_ptr, doorbell_ptr, SEQ_OFF: tl.constexpr,
                         tl.atomic_add(resp_ptr, 0, sem="acquire", scope="sys"))
 
 
+# W21 (2026-10-05): the doorbell service threads polled at ~µs cadence with
+# time.sleep(0) -- millions of GIL acquisitions per second per thread, showing as
+# 8-13% per thread on the production py-spy and churning the GIL under the main
+# scheduler thread. The GPU->host direction forces polling (a device kernel writes
+# the doorbell; there is no syscall on the waker side), so the only lever is
+# backoff: stay hot for FT_FETCH_SPIN_HOT polls after the last served request
+# (covers the inter-layer doorbell burst of a decode replay), then nap
+# FT_FETCH_SPIN_NAP_S between polls. Worst added ack latency is one nap (~50 µs)
+# on the first doorbell after a long idle -- ~0.02% of a 250 ms token.
+_SPIN_HOT = int(os.environ.get("FT_FETCH_SPIN_HOT", "16384"))
+_SPIN_NAP_S = float(os.environ.get("FT_FETCH_SPIN_NAP_S", "0.00005"))
+
+
 class GraphFetchBridge:
     """Per-rank doorbell + staging + host service thread for one DiskTier."""
 
@@ -357,10 +370,15 @@ class GraphFetchBridge:
         seq_off = self.seq_off
         served = self._served
         polls = 0
+        idle = 0
         while not self._stop.is_set():
             seq = int(blk[seq_off])
             if seq == served:
                 polls += 1
+                idle += 1
+                if idle > _SPIN_HOT:
+                    time.sleep(_SPIN_NAP_S)  # quiet period: back off the GIL storm
+                    continue
                 if self._dbg and polls % 1000000 == 0:
                     print(f"[graph-fetch] alive dev={self._device} pid={os.getpid()}: "
                           f"served={served} "
@@ -368,6 +386,7 @@ class GraphFetchBridge:
                           flush=True)
                 time.sleep(0)  # yield the GIL between polls (~µs cadence)
                 continue
+            idle = 0
             count = int(blk[0])
             layer = int(blk[1])
             if count > self.k_max:  # impossible by construction; never ack

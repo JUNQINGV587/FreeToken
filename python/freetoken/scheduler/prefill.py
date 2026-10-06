@@ -8,7 +8,11 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
-from .chunk_policy import adaptive_prefill_budget
+from .chunk_policy import (
+    adaptive_prefill_budget,
+    contention_capped_budget,
+    contention_chunk_cap_tokens,
+)
 from .mm import mm_chunk_end, mm_rows_after
 from .utils import PendingReq
 
@@ -296,6 +300,18 @@ class PrefillManager:
     # historical fixed-budget behaviour exactly.
     adaptive_chunk: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
+    # Passes whose budget was cut by contention_chunk_cap_tokens (FREETOKEN_LONG_PREFILL_WHEN_WAITING)
+    contention_capped_passes: int = 0
+
+    @property
+    def has_new_waiting(self) -> bool:
+        """True if any pending request has not started prefill yet (chunked_req unset).
+
+        The decode-share waiting exception (dsv41 D130) keys on this: a fresh arrival
+        rides along in the next pass and must never be held back by decode allowance,
+        while a chunked continuation (chunked_req set) is exactly what the share delays.
+        """
+        return any(req.chunked_req is None for req in self.pending_list)
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
@@ -323,6 +339,16 @@ class PrefillManager:
             prefill_budget = adaptive_prefill_budget(
                 max(req.input_len for req in self.pending_list), prefill_budget
             )
+
+        # Contention cap (dsv41 port): with >= 2 requests competing for prefill passes,
+        # clamp the chunk so a long prompt yields passes to the others sooner. A lone
+        # prompt keeps the full budget -- the cap buys interactivity, not memory.
+        capped = contention_capped_budget(
+            prefill_budget, len(self.pending_list), contention_chunk_cap_tokens()
+        )
+        if capped < prefill_budget:
+            prefill_budget = capped
+            self.contention_capped_passes += 1
 
         # estimated offset due to in-flight decode
         adder = PrefillAdder(

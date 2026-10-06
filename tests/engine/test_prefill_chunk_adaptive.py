@@ -36,6 +36,7 @@ from types import SimpleNamespace
 from freetoken.scheduler.chunk_policy import (
     BIG_CHUNK_PRODUCT,
     BIG_CHUNK_TOKENS,
+    CONTENTION_CAP_ENV,
     MASK_BUDGET_BYTES,
     MIN_CHUNK_TOKENS,
     SAFE_CHUNK_TOKENS,
@@ -43,6 +44,8 @@ from freetoken.scheduler.chunk_policy import (
     SAFE_PRODUCT,
     adaptive_prefill_budget,
     chunk_context_product,
+    contention_capped_budget,
+    contention_chunk_cap_tokens,
     mask_budget_bytes,
 )
 
@@ -392,3 +395,64 @@ def test_scheduler_returns_none_for_an_empty_queue(monkeypatch):
     manager, seen = _manager(monkeypatch, adaptive=True)
     assert manager.schedule_next_batch(24_576) is None
     assert seen == {}
+
+
+# --------------------------------------------------------------------------------------
+# contention chunk cap (FREETOKEN_LONG_PREFILL_WHEN_WAITING, dsv41 port)
+# --------------------------------------------------------------------------------------
+
+
+def test_contention_cap_env_is_off_by_default_and_parses(monkeypatch):
+    monkeypatch.delenv(CONTENTION_CAP_ENV, raising=False)
+    assert contention_chunk_cap_tokens() == 0
+    monkeypatch.setenv(CONTENTION_CAP_ENV, "7168")
+    assert contention_chunk_cap_tokens() == 7168
+    for raw in ("0", "-5", "junk"):
+        monkeypatch.setenv(CONTENTION_CAP_ENV, raw)
+        assert contention_chunk_cap_tokens() == 0, raw
+
+
+def test_contention_capped_budget_requires_competition():
+    assert contention_capped_budget(24_576, 2, 7168) == 7168
+    assert contention_capped_budget(24_576, 1, 7168) == 24_576, (
+        "a lone prompt keeps the big chunk -- the cap buys interactivity, not memory"
+    )
+    assert contention_capped_budget(4096, 5, 7168) == 4096, "the cap never raises a budget"
+    assert contention_capped_budget(24_576, 5, 0) == 24_576, "cap 0 is off"
+
+
+def test_scheduler_caps_the_chunk_only_while_requests_contend(monkeypatch):
+    monkeypatch.setenv(CONTENTION_CAP_ENV, "7168")
+    monkeypatch.delenv(SUB_BLOCK_ENV, raising=False)
+
+    solo, seen = _manager(monkeypatch, adaptive=False)
+    solo.pending_list = [_pending(105_241)]
+    solo.schedule_next_batch(24_576)
+    assert seen["token_budget"] == 24_576
+    assert solo.contention_capped_passes == 0
+
+    contended, seen = _manager(monkeypatch, adaptive=False)
+    contended.pending_list = [_pending(105_241), _pending(2_000)]
+    contended.schedule_next_batch(24_576)
+    assert seen["token_budget"] == 7168
+    assert contended.contention_capped_passes == 1
+
+
+def test_scheduler_contention_cap_composes_with_the_adaptive_budget(monkeypatch):
+    """The cap applies after the adaptive envelope, so the smaller of the two wins."""
+    monkeypatch.setenv(CONTENTION_CAP_ENV, "7168")
+    monkeypatch.setenv(SUB_BLOCK_ENV, "0")  # conservative envelope: 8173 at 105,241 tokens
+    manager, seen = _manager(monkeypatch, adaptive=True)
+    manager.pending_list = [_pending(105_241), _pending(2_000)]
+    manager.schedule_next_batch(24_576)
+    assert seen["token_budget"] == 7168, "cap 7168 < adaptive 8173"
+
+
+def test_scheduler_contention_cap_off_by_default(monkeypatch):
+    monkeypatch.delenv(CONTENTION_CAP_ENV, raising=False)
+    monkeypatch.delenv(SUB_BLOCK_ENV, raising=False)
+    manager, seen = _manager(monkeypatch, adaptive=False)
+    manager.pending_list = [_pending(105_241), _pending(2_000)]
+    manager.schedule_next_batch(24_576)
+    assert seen["token_budget"] == 24_576
+    assert manager.contention_capped_passes == 0

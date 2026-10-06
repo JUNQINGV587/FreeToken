@@ -126,3 +126,43 @@ def adaptive_prefill_budget(
     product = chunk_context_product(ctx) if safe_product is None else max(int(safe_product), 0)
     cap = product // ctx
     return min(ceiling, max(min_chunk, cap))
+
+
+# ---------------------------------------------------------------------------
+# Contention chunk cap (dsv41 port: DSV41_LONG_PREFILL_WHEN_WAITING)
+# ---------------------------------------------------------------------------
+#
+# On this box one prefill pass takes seconds, and the chunked loop only revisits the queue
+# after a pass completes. A lone 100k-token prompt at the big chunk is the fast path; the
+# same chunk while a second request waits means that request sits behind a ~10 s pass.
+# With >= 2 requests competing, cap the chunk so each pass yields the queue sooner -- at
+# 7,168 tokens a pass is roughly 2-3 s on a hot cache -- while a lone prompt keeps the
+# full budget. This is an interactivity knob, independent of the memory envelope above.
+
+CONTENTION_CAP_ENV = "FREETOKEN_LONG_PREFILL_WHEN_WAITING"
+
+
+def contention_chunk_cap_tokens() -> int:
+    """Chunk ceiling while requests contend for prefill passes (0 = off).
+
+    ``FREETOKEN_LONG_PREFILL_WHEN_WAITING`` (integer tokens, > 0). Read on every call so a
+    restarted engine (or a test) sees the current value, same contract as
+    ``mask_budget_bytes``.
+    """
+    raw = os.environ.get(CONTENTION_CAP_ENV, "")
+    if raw:
+        try:
+            cap = int(raw)
+        except ValueError:
+            cap = 0
+        if cap > 0:
+            return cap
+    return 0
+
+
+def contention_capped_budget(budget: int, pending: int, cap: int) -> int:
+    """``min(budget, cap)`` while >= 2 requests contend for prefill passes; otherwise the
+    budget is untouched, so a lone long prompt keeps the big chunk it was tuned for."""
+    if cap > 0 and pending >= 2:
+        return min(budget, cap)
+    return budget

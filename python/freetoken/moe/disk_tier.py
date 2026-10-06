@@ -619,6 +619,22 @@ class DiskTier:
         self._fetches = 0
         self._fetch_bytes = 0
         self._preadv_calls = 0
+        # Doorbell (graph_fetch) telemetry: the doorbell path never touches
+        # _fetches/_fetch_bytes (those are eager-only), so decode fetch volume
+        # was a blind spot (W22). The bridge reports each served request here.
+        # _db_row_bytes = disk bytes per expert row across all cache banks.
+        # Convert mode counts each scale bank's full native row (the doorbell
+        # actually reads half) -- known ~7% over-count in the experimental
+        # ds_fp4 mode; exact for native.
+        self._db_row_bytes = 0
+        for _bi in range(len(self._banks)):
+            _db = self._disk_bank[_bi] if self._convert else _bi
+            self._db_row_bytes += sum(
+                nb for _, _, nb in self._index.row_segments(_db, 0, 0))
+        self._db_requests = 0
+        self._db_rows = 0
+        self._db_bytes = 0
+        self._db_host_us = 0
         self._scalar_preload_reads = 0
         self._scalars: dict | None = None
         self._scalars_lock = threading.Lock()
@@ -1723,6 +1739,15 @@ class DiskTier:
                     self._prefetch_pool.submit(_recycle)
                 self._stash.clear()
 
+    def record_doorbell(self, rows: int, host_us: int) -> None:
+        """One served doorbell request (graph_fetch hot path; GIL-serialized
+        caller). ``host_us`` is the full request latency on the service thread
+        (all rows staged), so it includes preadv waits and memmoves."""
+        self._db_requests += 1
+        self._db_rows += rows
+        self._db_bytes += rows * self._db_row_bytes
+        self._db_host_us += host_us
+
     def stats(self) -> dict:
         return {
             "experts_fetched": self._fetches,
@@ -1735,4 +1760,8 @@ class DiskTier:
             "prefetch_skipped_resident": self._pf_skipped_resident,
             "route_hist_total": float(self._route_hist.sum()),
             "pin_remapped": self._remapped,
+            "doorbell_requests": self._db_requests,
+            "doorbell_rows": self._db_rows,
+            "doorbell_bytes": self._db_bytes,
+            "doorbell_host_ms": self._db_host_us / 1000.0,
         }

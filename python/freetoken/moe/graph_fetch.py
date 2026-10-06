@@ -459,6 +459,7 @@ class GraphFetchBridge:
                 time.sleep(0)  # yield the GIL between polls (~µs cadence)
                 continue
             idle = 0
+            t_serve0 = time.perf_counter_ns()
             count = int(blk[0])
             layer = int(blk[1])
             if count > self.k_max:  # impossible by construction; never ack
@@ -491,6 +492,10 @@ class GraphFetchBridge:
             # graph polls resp_host over PCIe — no CUDA op from this thread.
             self.resp_host[0] = seq
             served = seq
+            # Doorbell telemetry (W22 blind spot): rows + full host-side
+            # latency of this request. CPU-only accounting, off the ack path.
+            self.tier.record_doorbell(
+                count, (time.perf_counter_ns() - t_serve0) // 1000)
             # Only after the ack is the graph unblocked, so neither of the two
             # follow-ups below sits on the request's critical path (both concern the
             # *next* layer anyway).

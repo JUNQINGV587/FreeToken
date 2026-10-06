@@ -1525,6 +1525,13 @@ class OffloadMoeCache:
                 # Graph-doorbell fetch: record request/spin/install kernels;
                 # the disk reads themselves are served by the host service
                 # thread at replay time (preadv is not capturable).
+                # DEFAULT-ON decision (M1, 2026-10-07): production
+                # (/data/build/start_ftprod_full0913tp2.sh: --moe-disk-tier auto
+                # --cuda-graph-max-bs 8) has never set FT_GRAPH_FETCH_OFF, and
+                # the 20261002 graphs4 battery arm ran with the doorbell hot,
+                # so the doorbell IS the graph-mode disk path; the env is a
+                # debug escape hatch (eager fetch_pending fallback), read once
+                # per capture set, not a supported production toggle.
                 if not os.environ.get("FT_GRAPH_FETCH_OFF"):
                     self._disk_tier.graph_stage_fetch(self, layer_id)
             else:

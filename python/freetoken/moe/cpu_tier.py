@@ -396,8 +396,12 @@ class CpuTier:
     # ------------------------------------------------------------------
     # construction
     # ------------------------------------------------------------------
-    def attach(self) -> None:
-        """Register the pin row map and build the protocol buffers."""
+    def attach(self, top_k: int) -> None:
+        """Register the pin row map and build the protocol buffers.
+
+        ``top_k`` sizes the pick capacity (max_tokens * top_k pairs); the hidden
+        and intermediate sizes come from the bank shapes.
+        """
         cache = self._cache
         disk = self._disk
         assert cache is not None and disk is not None
@@ -405,10 +409,11 @@ class CpuTier:
         self._row_map = disk._row_map_dev  # [L, local_num] int32 device
         max_bs = int(getattr(cache, "cuda_graph_max_bs", 0) or 0)
         self._max_tokens = max(max_bs, 64)
-        self._top_k = max(int(getattr(cache, "top_k", 0) or 0), 1)
+        self._top_k = max(int(top_k), 1)
         self._max_picks = self._max_tokens * self._top_k
         plan = int(cache.src_indices.numel())
-        self._hidden = int(cache.hidden_size)
+        gu0 = cache.bank_sources["gate_up_packed"][0]
+        self._hidden = int(gu0.shape[2] * 2)
         dev = cache.slot_for_id.device
         self._ctrl_host = alloc_pinned_tensor((_CTRL_LEN,), dtype=torch.int64)
         self._ctrl_host.zero_()
@@ -649,6 +654,9 @@ class CpuTier:
             "isa": svc.isa_name() if svc is not None else None,
             "cost": dict(self._cost),
             "fatal": int(svc.fatal()) if svc is not None else 0,
+            # Per-layer route classification [layer][hits, misses, picks, calls]
+            # -- the online-admission signal item 5 (route recorder) consumes.
+            "per_layer": dev[:, :4].cpu().tolist(),
         }
 
     summary = stats
@@ -813,7 +821,7 @@ def bench_isa_tiers(cache, layer_id: int = 0, iters: int = 20,
     for isa in isas:
         os.environ["FREETOKEN_CPU_MOE_ISA"] = isa
         tier = CpuTier(cache, cache._disk_tier)
-        tier.attach()
+        tier.attach(top_k=8)
         try:
             tier.start()
             svc = tier._service

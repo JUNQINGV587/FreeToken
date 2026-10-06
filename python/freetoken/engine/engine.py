@@ -1470,6 +1470,12 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        if self.moe_offload_cache is not None:
+            # Same contract for the graph-doorbell disk fetch: a fired watchdog
+            # (wedged service thread) or an over-k_max refusal means the replay
+            # was released from its spin with incomplete staging; fail the step
+            # here, before its tokens are sampled.
+            self.moe_offload_cache.raise_if_unhealthy()
 
         for req in batch.reqs:
             req.complete_one()

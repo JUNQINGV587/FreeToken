@@ -1448,16 +1448,28 @@ class OffloadMoeCache:
             except Exception:  # noqa: BLE001 -- stats must never break the reply path
                 pass
         # DIAGNOSTIC (captain, 2026-10-02): surface the disk tier's own ledger. The tier
-        # has always kept these counters (disk_tier.py:1392 stats()) but nothing read them,
+        # has always kept these counters (disk_tier.py stats()) but nothing read them,
         # so the router-guided cross-layer prefetch was unobservable. route_hist_total is
         # the tell for "did the hook run at all" -- prefetch_from_routing returns early
         # while a CUDA graph is capturing, so with graphs on it only grows on eager steps.
+        # The doorbell_* keys carry the graph-fetch ledger: requests/rows/bytes/host_ms
+        # (host side), spins/wait_ms/wait_ms_peak (GPU-side spin, pinned mirror), and
+        # timeouts (watchdog fires; must stay 0).
         if self._disk_tier is not None:
             try:
                 out["disk_tier"] = self._disk_tier.stats()
             except Exception:  # noqa: BLE001 -- diagnostics must not break serving
                 pass
         return out
+
+    def raise_if_unhealthy(self) -> None:
+        """Per-forward engine health check: surfaces a fired graph-doorbell
+        watchdog (or an over-k_max refusal) as a loud error between replay and
+        sampling, so a step whose fetch was poisoned never ships its tokens.
+        No-op without a disk tier / bridge. Cheap (one python bool), called
+        once per forward like cpu_executor.raise_if_unhealthy."""
+        if self._disk_tier is not None:
+            self._disk_tier.raise_if_unhealthy()
 
     def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,
                          ownership=None, graph_k_max: int | None = None,

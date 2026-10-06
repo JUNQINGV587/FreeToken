@@ -644,6 +644,10 @@ class DiskTier:
         self._db_rows = 0
         self._db_bytes = 0
         self._db_host_us = 0
+        # Doorbell requests that were never served: watchdog timeout (service
+        # thread wedged) or count > k_max refusal. >0 means the engine is
+        # raising per forward and the server needs a restart.
+        self._db_timeouts = 0
         self._scalar_preload_reads = 0
         self._scalars: dict | None = None
         self._scalars_lock = threading.Lock()
@@ -1835,8 +1839,21 @@ class DiskTier:
         self._db_bytes += rows * self._db_row_bytes
         self._db_host_us += host_us
 
+    def record_doorbell_timeout(self) -> None:
+        """One doorbell request that was never served (watchdog timeout or
+        count > k_max refusal); see GraphFetchBridge._watchdog. GIL-serialized
+        like record_doorbell."""
+        self._db_timeouts += 1
+
+    def raise_if_unhealthy(self) -> None:
+        """Per-forward engine health check for the graph-doorbell bridge (see
+        GraphFetchBridge.raise_if_unhealthy); no-op without a bridge."""
+        bridge = getattr(self, "_graph_bridge", None)
+        if bridge is not None:
+            bridge.raise_if_unhealthy()
+
     def stats(self) -> dict:
-        return {
+        out = {
             "experts_fetched": self._fetches,
             "bytes_fetched": self._fetch_bytes,
             "preadv_calls": self._preadv_calls,
@@ -1851,4 +1868,13 @@ class DiskTier:
             "doorbell_rows": self._db_rows,
             "doorbell_bytes": self._db_bytes,
             "doorbell_host_ms": self._db_host_us / 1000.0,
+            "doorbell_timeouts": self._db_timeouts,
         }
+        bridge = getattr(self, "_graph_bridge", None)
+        if bridge is not None:
+            # GPU-side spin wait, mean/peak over the process lifetime, off the
+            # bridge's pinned stats mirror (zero CUDA calls; the dsv41
+            # gpu_wait_ms caliber). Keys: doorbell_spins, doorbell_wait_ms,
+            # doorbell_wait_ms_peak.
+            out.update(bridge.spin_stats())
+        return out

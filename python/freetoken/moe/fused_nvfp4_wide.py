@@ -59,8 +59,11 @@ def _prefill_config_wide(M: int) -> Dict[str, int]:
         cfg = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
                    GROUP_SIZE_M=8, num_warps=8, num_stages=2)
     else:
-        cfg = dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                   GROUP_SIZE_M=8, num_warps=4, num_stages=2)
+        # v41-geometry re-sweep (20261006, L20, M=25088 full-MoE, E=96):
+        # BM=128/NW=4/NS=1 = 123.0 ms vs BM=64/NW=4/NS=2 148.3 ms (-17.1%).
+        # BLOCK_SIZE_KB stays 32 (bit contract C2: outputs identical).
+        cfg = dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
+                   GROUP_SIZE_M=8, num_warps=4, num_stages=1)
     return cfg
 
 

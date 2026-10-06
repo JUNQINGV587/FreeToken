@@ -570,14 +570,29 @@ class DiskTier:
         self._nonpin_dev = self._ids_by_row_cpu[:, self._ram:].contiguous().to(device).long()
         self._graph_bridge = None
         self._banks = list(cache.banks)  # [(per_layer_host, gpu_cache)] in schema order
+        # ---- DS-FP4 conversion mode (triton_dsfp4 kernel): the slot cache and the
+        # pinned RAM banks hold DS-FP4 rows (e2m1 + per-32 e8m0, global folded) while
+        # the checkpoint rows the index addresses stay native NVFP4. Packed banks map
+        # 1:1 (same bytes); scale extents are read whole and repacked on the host by
+        # nvfp4_to_dsfp4.convert_scale_rows before the H2D. ``_disk_bank`` translates
+        # cache-bank index -> NVFP4 disk-bank index; ``_scale_convert`` names, per
+        # cache scale bank, (its disk scale bank, the scalar-preload bank with the
+        # per-expert globals the fold needs).
+        self._convert = getattr(cache, "quant_format", None) == "ds_fp4"
+        self._disk_bank = (0, 1, 3, 4) if self._convert else None
+        self._scale_convert = {1: (1, 2), 3: (4, 5)} if self._convert else {}
         self._row_bytes = [
             b[0][0][0].numel() * b[0][0][0].element_size() for b in self._banks
         ]  # full expert-row bytes per bank (staging must hold the biggest one)
-        # Per-bank destination row slices (gate|up split at the row midpoint).
+        # Per-bank destination row slices (gate|up split at the row midpoint), keyed
+        # by the DISK bank's segment count (identical to the cache bank's outside
+        # conversion mode; inside it the cache banks are the DS-FP4 four and the disk
+        # banks the NVFP4 six, so the lookup must go through ``_disk_bank``).
         self._dst_slices: list[list[tuple[int, int]]] = []
         for bank_idx, (host_layer, _gpu) in enumerate(self._banks):
             row = host_layer[0][0]
-            if len(_NVP4_BANK_SEGS[bank_idx]) == 2:
+            disk_bank = self._disk_bank[bank_idx] if self._convert else bank_idx
+            if len(_NVP4_BANK_SEGS[disk_bank]) == 2:
                 mid = row.shape[0] // 2
                 self._dst_slices.append([(0, mid), (mid, row.shape[0])])
             else:
@@ -628,6 +643,14 @@ class DiskTier:
         # i.e. ~99% of the issued reads are NVMe bandwidth stolen from the demand path on a
         # device that is already saturated. Set FT_DISK_TIER_PREFETCH=1 to opt back in.
         self._prefetch_window = int(os.environ.get("FT_DISK_TIER_PREFETCH", "0"))
+        if self._convert and self._prefetch_window > 0:
+            # The PILOT slab machinery is written against the native 6-bank NVFP4
+            # layout (scalar-bank skip, no scale repack). It is default-OFF and
+            # measured NO-GO on v41 (1.01% predictor precision); rather than teach
+            # dead code the conversion, refuse the combination.
+            print("[disk-tier] DS-FP4 conversion mode: PILOT prefetch unsupported, "
+                  "forcing FT_DISK_TIER_PREFETCH=0", flush=True)
+            self._prefetch_window = 0
         self._prefetch_pool = (
             ThreadPoolExecutor(max_workers=2, thread_name_prefix="disk-tier-pf")
             if self._prefetch_window > 0 else None
@@ -805,12 +828,16 @@ class DiskTier:
             val = struct.unpack_from("<f", blob, base + 4 * k)[0]
             row[d0:d1].fill_(val)
 
-    def _group_runs(self, bank_idx: int, layer: int, expert: int):
+    def _group_runs(self, bank_idx: int, layer: int, expert: int,
+                    disk_bank: int | None = None):
         """Merged preadv groups for one non-scalar bank: [(shard, a0, a1,
         [(d0, d1, off, nbytes)])]. Sorts by file position and merges EXACTLY
-        adjacent segments into one read (P0-3)."""
+        adjacent segments into one read (P0-3). ``disk_bank`` (DS-FP4 conversion
+        mode) decouples the checkpoint row being read from the cache bank whose
+        ``_dst_slices`` the members target."""
         expert = expert + self._g0  # local (slot-cache) id -> global checkpoint row
-        segs = self._index.row_segments(bank_idx, layer, expert)
+        segs = self._index.row_segments(bank_idx if disk_bank is None else disk_bank,
+                                        layer, expert)
         runs = []
         for (d0, d1), (shard_idx, off, nbytes) in zip(
                 self._dst_slices[bank_idx], segs):
@@ -847,6 +874,7 @@ class DiskTier:
         ring = self._staging_ring()
         ri = getattr(self._staging, "ri", 0)
         scalar_banks = getattr(self._index, "scalar_banks", ())
+        disk_bytes = 0
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
             if dst_buffers is None:
                 row = gpu_cache[slot]
@@ -854,10 +882,20 @@ class DiskTier:
                 # Overlap prefill: write directly into the borrowed buffer row
                 # (position == expert id); the identity slots are untouched.
                 row = dst_buffers[bank_idx][buffer_id][expert]
-            if bank_idx in scalar_banks:
+            if not self._convert and bank_idx in scalar_banks:
+                # Native mode only: cache bank == disk bank, and the global-scale
+                # banks are blob fills. In conversion mode the (0..3) cache banks
+                # would collide with the NVFP4 scalar ids {2, 5} -- every cache row
+                # here is a real disk read.
                 self._fill_scalar_row(bank_idx, layer, expert, row)
                 continue
-            groups = self._group_runs(bank_idx, layer, expert)
+            if bank_idx in self._scale_convert:
+                ri, disk_bytes = self._fetch_scale_convert(
+                    layer, expert, row, bank_idx, ring, ri, disk_bytes)
+                continue
+            groups = self._group_runs(
+                bank_idx, layer, expert,
+                disk_bank=self._disk_bank[bank_idx] if self._convert else None)
             for shard_idx, a0, a1, members, _exact_end in groups:
                 staging, ev = ring[ri]
                 if ev is not None:
@@ -879,12 +917,69 @@ class DiskTier:
                     dst = row[d0:d1]
                     dst.copy_(src.view(dst.dtype).view(dst.shape),
                               non_blocking=True)
+                    disk_bytes += nbytes
                 if ev is not None:
                     # Arm: the next reuse of this buffer waits for this copy.
                     ev.record()
         self._staging.ri = ri
         self._fetches += 1
-        self._fetch_bytes += sum(self._row_bytes)
+        # Conversion mode reports the NVMe-side bytes actually read (the NVFP4
+        # extents incl. the dropped odd scale columns); the native path keeps the
+        # cache-row accounting it always had.
+        self._fetch_bytes += disk_bytes if self._convert else sum(self._row_bytes)
+
+    def _fetch_scale_convert(self, layer: int, expert: int, row: torch.Tensor,
+                             cache_bank: int, ring: list, ri: int,
+                             disk_bytes: int) -> tuple[int, int]:
+        """DS-FP4 conversion mode: read one NVFP4 scale extent (per-16 e4m3) and
+        repack it to per-32 e8m0 with the per-expert global folded into the
+        exponent (moe.nvfp4_to_dsfp4), then hand the smaller row to the H2D copy.
+        The repack runs on the host between the preadv and the copy; the sync
+        copy from the pageable converter output costs ~100us per row, noise
+        against the ~19MB row's disk time, and adds zero buffer-reuse races."""
+        from freetoken.moe.nvfp4_to_dsfp4 import convert_scale_rows, global_exponent
+
+        disk_bank, blob_bank = self._scale_convert[cache_bank]
+        segs = self._index.row_segments(disk_bank, layer, expert + self._g0)
+        slices = self._dst_slices[cache_bank]
+        if len(segs) != len(slices):
+            raise RuntimeError(
+                f"scale convert: {len(segs)} disk segments vs {len(slices)} dst "
+                f"slices (cache bank {cache_bank}, disk bank {disk_bank})")
+        # Per-expert globals from the scalar preload blob: fp32, local-expert-major,
+        # one value per segment (gate, up) or a single one (down).
+        blob = self._scalar_blob(layer, blob_bank)
+        vals = struct.unpack_from(f"<{len(segs)}f", blob, expert * 4 * len(segs))
+        for k, (shard_idx, off, nbytes) in enumerate(segs):
+            d0, d1 = slices[k]
+            rows = d1 - d0
+            if nbytes % rows:
+                raise RuntimeError(
+                    f"scale convert: segment {nbytes}B not divisible by {rows} rows")
+            staging, ev = ring[ri]
+            if ev is not None:
+                ev.synchronize()
+            ri = (ri + 1) % len(ring)
+            fd, direct = self._fd(shard_idx)
+            if direct:
+                a0 = off & ~(_ALIGN - 1)
+                a1 = (off + nbytes + _ALIGN - 1) & ~(_ALIGN - 1)
+            else:
+                a0, a1 = off, off + nbytes
+            slen = a1 - a0
+            mv = (ctypes.c_char * slen).from_address(staging.addr)
+            try:
+                os.preadv(fd, [mv], a0)
+            except OSError:
+                raise _preadv_error(self, staging, shard_idx, off, a0, slen, direct)
+            self._preadv_calls += 1
+            src = (staging.tensor[off - a0:off - a0 + nbytes].numpy()
+                   .reshape(rows, nbytes // rows))
+            conv = convert_scale_rows(src, global_exponent(vals[k]))
+            dst = row[d0:d1]
+            dst.copy_(torch.from_numpy(conv).view(dst.dtype).view(dst.shape))
+            disk_bytes += nbytes
+        return ri, disk_bytes
 
     def _sync_fetches(self) -> None:
         """Wait for the pool threads' async H2D copies to land.
@@ -934,26 +1029,43 @@ class DiskTier:
 
     def _ref_row(self, bank_idx: int, layer: int, expert: int, row_bytes: int,
                  row_el: int, row_leading: int) -> torch.Tensor:
-        """Reference row bytes for (bank, layer, expert) straight from the checkpoint."""
+        """Reference row bytes for (bank, layer, expert) straight from the checkpoint.
+        DS-FP4 conversion mode: packed banks read the identical NVFP4 extent; scale
+        banks are repacked (per-16 e4m3 + per-expert fp32 global) -> per-32 e8m0 so
+        the reference matches the DS-FP4 row the slot is expected to hold."""
         expert = expert + self._g0  # local (slot-cache) id -> global checkpoint row
+        disk_bank = self._disk_bank[bank_idx] if self._convert else bank_idx
         ref = torch.zeros(row_bytes, dtype=torch.uint8)
-        segs = self._index.row_segments(bank_idx, layer, expert)
-        for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
+        segs = self._index.row_segments(disk_bank, layer, expert)
+        gexp = None
+        if bank_idx in self._scale_convert:
+            from freetoken.moe.nvfp4_to_dsfp4 import convert_scale_rows, global_exponent
+            import numpy as _np2
+            blob = self._scalar_blob(layer, self._scale_convert[bank_idx][1])
+            # NOTE: `expert` was already globalized above; the blob is local-major.
+            vals = struct.unpack_from(f"<{len(segs)}f", blob,
+                                      (expert - self._g0) * 4 * len(segs))
+            gexp = [global_exponent(v) for v in vals]
+        for k, ((d0, d1), (shard_idx, off, nbytes)) in enumerate(
+                zip(self._dst_slices[bank_idx], segs)):
             fd, direct = self._fd(shard_idx)
             a0 = off if not direct else (off & ~(_ALIGN - 1))
             slen = nbytes if not direct else (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
             buf = os.pread(fd, slen, a0)
             row_off = off - a0
             seg = buf[row_off:row_off + nbytes]
-            if bank_idx in (2, 5):
+            if gexp is not None:
+                src = _np2.frombuffer(seg, dtype=_np2.uint8).reshape(d1 - d0, -1)
+                seg = convert_scale_rows(src, gexp[k]).tobytes()
+            elif not self._convert and bank_idx in (2, 5):
                 import struct as _st
                 import numpy as _np
                 f16 = _np.float16(_st.unpack("<f", seg[:4])[0]).tobytes()
                 for r in range(d0, d1):
                     ref[r * row_el:(r + 1) * row_el] = torch.frombuffer(f16, dtype=torch.uint8)
-            else:
-                dst_off = d0 * row_leading * row_el
-                ref[dst_off:dst_off + len(seg)] = torch.frombuffer(seg, dtype=torch.uint8)
+                continue
+            dst_off = d0 * row_leading * row_el
+            ref[dst_off:dst_off + len(seg)] = torch.frombuffer(seg, dtype=torch.uint8)
         return ref
 
     def _identify_overwriter(self, layer: int, bank_idx: int, expert: int,

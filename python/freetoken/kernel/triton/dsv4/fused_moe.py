@@ -166,6 +166,22 @@ def _fp4_bf16_bits(nib, shift):
 
 
 @triton.jit
+def _fp4_e4m3_bytes(nib):
+    """E2M1 nibble [tile] -> e4m3 byte bits (int32). Exact, no scale fold:
+    e4m3 is an exact superset of e2m1 -- normal codes (1+m/2)*2^(e-1) map to
+    E=e+6, M=4m; the subnormal 0.5*m codes map to E=6 (value 2^-1) for m=1 and
+    +0 for m=0, which m*0x30 covers. The per-32 e8m0 scale is instead applied
+    to the fp32 partial dot (pow2 multiply of the accumulator is exact), which
+    is what lets the dot itself run on the FP8 tensor cores (sm89 mma.sync
+    m16n8k32.e4m3): BLOCK_SIZE_K=32 == one scale block == one MMA K."""
+    sign = (nib & 0x8) << 4
+    e = (nib >> 1) & 0x3
+    m = nib & 0x1
+    mag = tl.where(e == 0, m * 0x30, ((e + 6) << 3) + (m << 2))
+    return sign + mag
+
+
+@triton.jit
 def _prefill_dsfp4_moe_kernel(
     a_ptr,             # [M, K] activations (compute dtype, FP8 round-tripped)
     packed_ptr,        # [S, N, K // 2] uint8
@@ -180,6 +196,8 @@ def _prefill_dsfp4_moe_kernel(
     EM,
     num_valid_tokens,
     stride_am, stride_ak,
+    as_ptr,            # [M, K//128] uint8 act_quant ue8m0 codes (FP8_MMA only)
+    stride_asm, stride_asb,
     stride_pe, stride_pn, stride_pkb,
     stride_se, stride_sn, stride_sblk,
     stride_cm, stride_cn,
@@ -190,7 +208,18 @@ def _prefill_dsfp4_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    FP8_MMA: tl.constexpr = False,
 ):
+    # FP8_MMA: B stays e4m3 (exact e2m1 superset) and A is the act_quant_fp8
+    # output -- RAW e4m3 grid values with the per-128 block scale carried
+    # separately (the round-trip variant folds the block scale into the value,
+    # which would saturate e4m3 at ±448). One 32-wide K block per dot == one
+    # e8m0 weight scale block == sm89 mma.sync K=32, and both scales multiply
+    # the fp32 partial dot (exact pow2). Result equals the bf16 path up to
+    # fp32 accumulation order.
+    if FP8_MMA:
+        tl.static_assert(BLOCK_SIZE_K == 32)
+        tl.static_assert(K % 128 == 0)
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -244,21 +273,45 @@ def _prefill_dsfp4_moe_kernel(
             mask=(offs_n[:, None] < N) & (byte_idx[None, :] * 2 < K),
             other=0,
         ).to(tl.int32)
-        sblk = k_start // 32 + offs_sb
-        codes = tl.load(
-            scale_base + sblk[None, :] * stride_sblk,
-            mask=(offs_n[:, None] < N) & (sblk[None, :] * 32 < K),
-            other=127,
-        )
-        shift = (codes.to(tl.int32) - 127) << 7  # [BN, NSB] exponent-field add
-        shift = tl.reshape(
-            tl.broadcast_to(shift[:, :, None], (BLOCK_SIZE_N, NSB, 16)), (BLOCK_SIZE_N, KB)
-        )
-        bits = tl.interleave(
-            _fp4_bf16_bits(packed & 0x0F, shift), _fp4_bf16_bits((packed >> 4) & 0x0F, shift)
-        )
-        b = tl.reshape(bits, (BLOCK_SIZE_N, BLOCK_SIZE_K)).to(tl.uint16).to(compute_type, bitcast=True)
-        accumulator += tl.dot(a, tl.trans(b))
+        if FP8_MMA:
+            a8 = a.to(tl.float8e4nv)  # raw e4m3 grid (or exact bf16 fallback)
+            acodes = tl.load(
+                as_ptr + route_rows * stride_asm + (k_start // 128) * stride_asb,
+                mask=route_mask, other=127,
+            )  # [BM] ue8m0 act codes, uniform over the 32-wide K block
+            sca = tl.exp2((acodes.to(tl.int32) - 127).to(tl.float32))  # [BM]
+            # 1-D scale loads: the [BN, 1] -> (1, BN) reshape of the shared
+            # 2-D load misindexes under broadcast multiply (measured: constant
+            # scales pass, per-(n, kblk) variation lands on wrong elements).
+            wcode = tl.load(
+                scale_ptr + slot * stride_se + offs_n * stride_sn
+                + (k_start // 32) * stride_sblk,
+                mask=offs_n < N, other=127,
+            )  # [BN]
+            scw = tl.exp2((wcode.to(tl.int32) - 127).to(tl.float32))  # [BN]
+            bits8 = tl.interleave(
+                _fp4_e4m3_bytes(packed & 0x0F),
+                _fp4_e4m3_bytes((packed >> 4) & 0x0F),
+            )
+            b8 = tl.reshape(bits8, (BLOCK_SIZE_N, BLOCK_SIZE_K)).to(tl.uint8)
+            b8 = b8.to(tl.float8e4nv, bitcast=True)
+            accumulator += tl.dot(a8, tl.trans(b8)) * (sca[:, None] * scw[None, :])
+        else:
+            sblk = k_start // 32 + offs_sb
+            codes = tl.load(
+                scale_base + sblk[None, :] * stride_sblk,
+                mask=(offs_n[:, None] < N) & (sblk[None, :] * 32 < K),
+                other=127,
+            )
+            shift = (codes.to(tl.int32) - 127) << 7  # [BN, NSB] exponent-field add
+            shift = tl.reshape(
+                tl.broadcast_to(shift[:, :, None], (BLOCK_SIZE_N, NSB, 16)), (BLOCK_SIZE_N, KB)
+            )
+            bits = tl.interleave(
+                _fp4_bf16_bits(packed & 0x0F, shift), _fp4_bf16_bits((packed >> 4) & 0x0F, shift)
+            )
+            b = tl.reshape(bits, (BLOCK_SIZE_N, BLOCK_SIZE_K)).to(tl.uint16).to(compute_type, bitcast=True)
+            accumulator += tl.dot(a, tl.trans(b))
         a_ptrs += BLOCK_SIZE_K * stride_ak
 
     if MUL_ROUTED_WEIGHT:

@@ -245,3 +245,123 @@ def test_request_kernel_remaps_through_row_map(tmp_path):
         assert b.req_slots_dev[:2].tolist() == [10, 13]
     finally:
         b.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# DS-FP4 conversion mode (triton_dsfp4): the doorbell stages NATIVE NVFP4 scale
+# bytes and installs them through the device-side convert kernel.
+
+
+class _FakeConvertTier:
+    """Fake tier in conversion mode: bank0 packed (identical on disk), bank1
+    scale (cache row [4,4] e8m0; native NVFP4 row [4,8] e4m3, gate|up halves
+    with different globals)."""
+
+    PACK_ROWS, PACK_COLS = 2, 2048        # 4096 B (fast_index_copy min geometry)
+    SC_ROWS, SC_COLS = 4, 4               # cache scale row 16 B; native 32 B
+    EXPERT_BYTES = PACK_ROWS * PACK_COLS + SC_ROWS * SC_COLS * 2
+
+    def __init__(self, tmp_path):
+        import struct as st
+        self._ram = 0
+        self.ownership = None
+        self._preadv_calls = 0
+        self._convert = True
+        self._disk_bank = (0, 1, 3, 4)
+        self._scale_convert = {1: (1, 2)}
+        self._dst_slices = [[(0, self.PACK_ROWS)],
+                            [(0, 2), (2, 4)]]
+        self._index = SimpleNamespace(scalar_banks=frozenset({2, 5}),
+                                      num_layers=N_LAYERS)
+        self._telemetry_path = None
+        self._staging_size = 4096
+        # Disk: per expert [packed 64B = byte expert][scale 32B = byte 64]
+        path = tmp_path / "fake_disk_conv.bin"
+        buf = bytearray()
+        for e in range(16):
+            buf += bytes([e % 256]) * 4096
+            buf += bytes([64]) * 32      # e4m3 0x40 = 2^1, positive pow2
+        path.write_bytes(bytes(buf))
+        self._path = str(path)
+        # Scalar preload blob: fp32, local-expert-major, (gate, up) = (2^-13, 2^-5)
+        self._blob = b"".join(st.pack("<2f", 2.0 ** -13, 2.0 ** -5)
+                              for _ in range(16))
+        host_packed = [torch.zeros(16, self.PACK_ROWS, self.PACK_COLS,
+                                   dtype=torch.uint8) for _ in range(N_LAYERS)]
+        gpu_packed = torch.zeros(N_SLOTS, self.PACK_ROWS, self.PACK_COLS,
+                                 dtype=torch.uint8, device="cuda")
+        host_scale = [torch.zeros(16, self.SC_ROWS, self.SC_COLS,
+                                  dtype=torch.uint8) for _ in range(N_LAYERS)]
+        gpu_scale = torch.zeros(N_SLOTS, self.SC_ROWS, self.SC_COLS,
+                                dtype=torch.uint8, device="cuda")
+        self._banks = [(host_packed, gpu_packed), (host_scale, gpu_scale)]
+        self._row_map_dev = (
+            torch.arange(16, dtype=torch.int32, device="cuda")
+            .expand(N_LAYERS, -1).contiguous())
+
+    def _fd(self, shard_idx):
+        return os.open(self._path, os.O_RDONLY), False
+
+    def _scalar_blob(self, layer, bank):
+        assert (layer, bank) == (0, 2) or bank == 2
+        return self._blob
+
+    def _group_runs(self, bank_idx, layer, expert, disk_bank=None):
+        base = expert * self.EXPERT_BYTES
+        if bank_idx == 0:
+            assert disk_bank == 0
+            yield 0, base, base + 4096, [(0, 2, base, 4096)], base + 4096
+        else:
+            assert disk_bank == 1
+            yield 0, base + 4096, base + 4112, [(0, 2, base + 4096, 16)], base + 4112
+            yield 0, base + 4112, base + 4128, [(2, 4, base + 4112, 16)], base + 4128
+
+    def _fill_scalar_row(self, *a, **k):  # pragma: no cover
+        raise AssertionError("scalar banks must not be filled in convert mode")
+
+    def mark_turn_src(self, *a, **k):
+        pass
+
+    def end_turn(self):
+        pass
+
+
+def test_convert_mode_doorbell_stages_and_installs(tmp_path):
+    """End-to-end doorbell round-trip in conversion mode: request kernel ->
+    thread stages native scale bytes + per-half global exponents -> device
+    convert-install folds the global and halves the scale width."""
+    tier = _FakeConvertTier(tmp_path)
+    cache = _FakeCache(tier)
+    b = GraphFetchBridge(tier, cache, k_max=K_MAX)  # __init__ compile-warms
+    try:
+        # Convert-mode staging: scale bank stages the DOUBLE-width native row.
+        assert tuple(b.staging_host[1].shape) == (K_MAX, 4, 8)
+        assert 1 in b._gexp_host
+        b.enable()
+        _set_plan(cache, srcs=[5], slots=[20])
+        _launch_request(b, cache)
+        assert int(b.req_host[0]) == 1
+        deadline = time.time() + 10
+        while int(b.resp_host[0]) < 1 and time.time() < deadline:
+            time.sleep(0.001)
+        b.disable()
+        assert int(b.resp_host[0]) == 1, "service thread never acked"
+
+        # Staging holds the NATIVE bytes; gexp the two per-half exponents.
+        assert b.staging_host[1][0].unique().tolist() == [64]
+        assert b._gexp_host[1][0].tolist() == [-13, -5]
+
+        # The eager stage_fetch already installed (spin ordered before install):
+        # bank0 verbatim, bank1 converted per half: E=8 -> 8+120+gexp.
+        gpu_packed, gpu_scale = tier._banks[0][1], tier._banks[1][1]
+        assert gpu_packed[20].cpu().unique().tolist() == [5]
+        got = gpu_scale[20].cpu()
+        assert got[0].unique().tolist() == [115]   # gate half: 8+120-13
+        assert got[1].unique().tolist() == [115]
+        assert got[2].unique().tolist() == [123]   # up half: 8+120-5
+        assert got[3].unique().tolist() == [123]
+        # Native byte 64 is NOT what the cache holds (no verbatim install).
+        assert 64 not in got.unique().tolist()
+    finally:
+        b.disable()
+        b.shutdown()

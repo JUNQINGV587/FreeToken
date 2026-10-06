@@ -264,7 +264,9 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
         return build_expert_banks(method, num_layers, None, device=device, dummy=True, num_experts=E)
 
     # Disk tier: v0 speaks the native NVFP4 (triton) bank layout -- the index and
-    # the fetch path are written against it. Fail before any bank is allocated.
+    # the fetch path are written against it. The triton_dsfp4 variant reads the same
+    # native NVFP4 disk rows and converts them to DS-FP4 in the fetch path (see
+    # moe.nvfp4_to_dsfp4), so it is admitted too. Fail before any bank is allocated.
     disk_index = None
     ram_prefix = None
     skip_experts_from = None
@@ -273,7 +275,7 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     if disk_tier is not None:
         from freetoken.layers.quantization import QuantKind
 
-        if method.kind is not QuantKind.NVFP4 or method.kernel.name != "triton":
+        if method.kind is not QuantKind.NVFP4 or method.kernel.name not in ("triton", "triton_dsfp4"):
             raise NotImplementedError(
                 f"disk tier requires the native NVFP4 layout (got kind={method.kind!r}, "
                 f"kernel={method.kernel.name!r})")

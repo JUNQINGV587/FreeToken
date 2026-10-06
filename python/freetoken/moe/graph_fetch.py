@@ -53,6 +53,7 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -154,6 +155,59 @@ _SPIN_HOT = int(os.environ.get("FT_FETCH_SPIN_HOT", "16384"))
 _SPIN_NAP_S = float(os.environ.get("FT_FETCH_SPIN_NAP_S", "0.00005"))
 
 
+@triton.jit
+def _gf_scale_convert_install_kernel(
+    dst_ptr,           # [S, ROWS*COLS_OUT] uint8 gpu scale bank (row = slot)
+    slots_ptr,         # [K_MAX] int32 -> cache slot
+    src_ptr,           # [K_MAX, ROWS*2*COLS_OUT] uint8 pinned native staging
+    gexp_ptr,          # [K_MAX, 2] int32 pinned: per-half global exponents
+    count_ptr,         # [1] int64
+    ROWS: tl.constexpr, HALF: tl.constexpr, COLS_OUT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """DS-FP4 conversion-mode install for scale banks: staged NVFP4 per-16 e4m3
+    bytes become per-32 e8m0 codes with the per-expert global folded into the
+    exponent: out[j] = (in[2j] >> 3) + 120 + gexp (positive pow2 e4m3 bytes only;
+    the model-wide audit gate in tools/trace/audit_nvfp4_pow2.py is what licenses
+    skipping per-byte verification here). Reads pinned staging + pinned gexp over
+    PCIe — the same zero-copy contract as the fast_index_copy_jit install. The
+    gate|up halves of a row can carry DIFFERENT globals (two disk segments), so
+    the exponent is per half; single-segment banks write both halves equal."""
+    pid = tl.program_id(0)
+    r = pid % ROWS
+    i = pid // ROWS
+    count = tl.load(count_ptr)
+    if i < count:
+        slot = tl.load(slots_ptr + i).to(tl.int64)
+        g = tl.load(gexp_ptr + i * 2 + tl.where(r < HALF, 0, 1))
+        cols = tl.arange(0, BLOCK)
+        src_row = src_ptr + i * (ROWS * 2 * COLS_OUT) + r * (2 * COLS_OUT)
+        dst_row = dst_ptr + slot * (ROWS * COLS_OUT) + r * COLS_OUT
+        for c0 in range(0, COLS_OUT, BLOCK):
+            idx = c0 + cols
+            m = idx < COLS_OUT
+            b = tl.load(src_row + idx * 2, mask=m, other=0)
+            e = (b.to(tl.int32) >> 3) + 120 + g
+            tl.store(dst_row + idx, e.to(tl.uint8), mask=m)
+
+
+def _gf_scale_convert_install(dst_bank: torch.Tensor, slots: torch.Tensor,
+                              src_staging: torch.Tensor,
+                              gexp_host: torch.Tensor,
+                              count: torch.Tensor) -> None:
+    """Install wrapper: dst_bank = gpu scale cache (any 1-byte dtype, viewed as
+    uint8), src_staging = [k_max, ROWS, 2*COLS_OUT] pinned native bytes."""
+    if dst_bank.dtype != torch.uint8:
+        dst_bank = dst_bank.view(torch.uint8)
+    k_max, rows, cols2 = src_staging.shape
+    cols = cols2 // 2
+    _gf_scale_convert_install_kernel[(k_max * rows,)](
+        dst_bank, slots, src_staging, gexp_host, count,
+        ROWS=rows, HALF=rows // 2, COLS_OUT=cols, BLOCK=128,
+        num_warps=1,
+    )
+
+
 class GraphFetchBridge:
     """Per-rank doorbell + staging + host service thread for one DiskTier."""
 
@@ -184,11 +238,24 @@ class GraphFetchBridge:
             # into it and the captured install kernel reads it over PCIe (same
             # zero-copy contract the eager path has with host banks). Same
             # dtype/shape as a host-bank row so fast_index_copy_jit sees
-            # exactly the same contract.
+            # exactly the same contract — EXCEPT in DS-FP4 conversion mode,
+            # where the scale banks stage the NATIVE NVFP4 per-16 bytes (twice
+            # the cache row width, uint8) plus a per-half global-exponent side
+            # buffer, and the install converts on device instead of copying.
             # tier._banks entries are (per-layer [host tensors], gpu_cache).
+            self._convert = bool(getattr(tier, "_convert", False))
+            self._scale_convert = dict(getattr(tier, "_scale_convert", None) or {})
+            self._gexp_host: dict[int, torch.Tensor] = {}
             self.staging_host = []
-            for host_layers, _gpu_cache in tier._banks:
+            for bank_idx, (host_layers, _gpu_cache) in enumerate(tier._banks):
                 row = host_layers[0][0]  # layer 0, expert 0 -> one row
+                if bank_idx in self._scale_convert:
+                    self.staging_host.append(torch.zeros(
+                        (self.k_max, row.shape[0], row.shape[1] * 2),
+                        dtype=torch.uint8, pin_memory=True))
+                    self._gexp_host[bank_idx] = torch.zeros(
+                        (self.k_max, 2), dtype=torch.int32, pin_memory=True)
+                    continue
                 shape = (self.k_max,) + tuple(row.shape)
                 self.staging_host.append(
                     torch.zeros(shape, dtype=row.dtype, pin_memory=True))
@@ -278,6 +345,11 @@ class GraphFetchBridge:
         # Install reads PINNED HOST staging over PCIe — the probe-proven
         # host->device direction that needs zero CUDA calls from the thread.
         for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
+            if bank_idx in self._scale_convert:
+                _gf_scale_convert_install(
+                    gpu_cache, self.req_slots_dev, self.staging_host[bank_idx],
+                    self._gexp_host[bank_idx], self.req_count_dev)
+                continue
             fast_index_copy_jit(gpu_cache, self.req_slots_dev,
                                 self.staging_host[bank_idx],
                                 self.staging_idx_dev, self.req_count_dev)
@@ -465,11 +537,38 @@ class GraphFetchBridge:
         scalar_banks = getattr(tier._index, "scalar_banks", ())
         for bank_idx, (_host, _gpu) in enumerate(tier._banks):
             dst_row = self.staging_host[bank_idx][j]
-            if bank_idx in scalar_banks:
+            if not getattr(self, "_convert", False) and bank_idx in scalar_banks:
+                # Native mode only: cache bank == disk bank. In conversion mode
+                # the four cache banks collide with the NVFP4 scalar ids {2, 5}
+                # -- every staged row here is a real disk read (same guard as
+                # DiskTier._fetch_expert_inner). getattr default: the CPU
+                # staging tests build the bridge with object.__new__.
                 tier._fill_scalar_row(bank_idx, layer, expert, dst_row)
                 continue
-            for shard_idx, a0, a1, members, _end in tier._group_runs(
-                    bank_idx, layer, expert):
+            sc = getattr(self, "_scale_convert", {}).get(bank_idx)
+            if sc is not None:
+                # DS-FP4 conversion: stage the NATIVE per-16 scale extents
+                # (double-width staging) and publish the per-half global
+                # exponents for the device-side convert-install kernel. The
+                # globals come from the host-resident preload blob, not disk.
+                from .nvfp4_to_dsfp4 import global_exponent
+                disk_bank, blob_bank = sc
+                blob = tier._scalar_blob(layer, blob_bank)
+                nseg = len(tier._dst_slices[bank_idx])
+                vals = struct.unpack_from(f"<{nseg}f", blob, expert * 4 * nseg)
+                gh = self._gexp_host[bank_idx][j]
+                gh[0] = global_exponent(vals[0])
+                gh[1] = global_exponent(vals[-1])
+                groups = tier._group_runs(bank_idx, layer, expert,
+                                          disk_bank=disk_bank)
+            else:
+                # Native mode keeps the exact old call signature (unit stubs
+                # implement _group_runs without the disk_bank kwarg).
+                groups = (tier._group_runs(bank_idx, layer, expert,
+                                           disk_bank=tier._disk_bank[bank_idx])
+                          if getattr(self, "_convert", False)
+                          else tier._group_runs(bank_idx, layer, expert))
+            for shard_idx, a0, a1, members, _end in groups:
                 fd, _direct = tier._fd(shard_idx)
                 slen = a1 - a0
                 mv = (ctypes.c_char * slen).from_address(bounce.data_ptr())

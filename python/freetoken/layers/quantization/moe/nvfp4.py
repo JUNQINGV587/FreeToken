@@ -27,6 +27,7 @@ from freetoken.utils import init_logger
 from ..registry import LayerKind, register_method
 from ..scheme import NVFP4_GROUP as GROUP, QuantKind
 from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .mxfp4 import TritonMxfp4MoEKernel
 
 logger = init_logger(__name__)
 
@@ -581,9 +582,38 @@ class B12xNvfp4MoEKernel(MoEKernel):
         return b12x_fused_experts(x, t["gate_up"], t["gate_up_scale"], view.alphas[0], t["down"], t["down_scale"], view.alphas[1], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input)
 
 
+class TritonNvfp4Dsfp4MoEKernel(TritonMxfp4MoEKernel):
+    """NVFP4 checkpoint losslessly repacked into DS-FP4 (per-32 e8m0) banks.
+
+    V4.1's NVFP4 scales are all powers of two at an effective per-32 granularity
+    (see moe.nvfp4_to_dsfp4), so the banks can drop the per-16 e4m3 + per-tensor
+    global layout for the e8m0 one BIT-EXACTLY and run the DS-FP4 kernels
+    (moe.fused_ds_fp4) -- the same OCP MXFP4 recipe DeepGEMM implements for
+    SM90/SM100, on sm89 through Triton. The checkpoint on disk stays NVFP4: the
+    repack happens in the pack below and in the disk tier's fetch path. Opt-in
+    only: --quant-backend moe.nvfp4=triton_dsfp4."""
+
+    name = "triton_dsfp4"
+    cpu_format = "ds_fp4"
+
+    def worth_it(self, cfg: MoEConfig) -> bool:
+        return False  # opt-in: never auto-selected over the native layout
+
+    def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        reason = super().unusable_reason(cfg)
+        return f"triton ds_fp4-converted nvfp4 MoE kernel: {reason}" if reason else None
+
+    def pack(self, pieces, cfg: MoEConfig, out):
+        from freetoken.moe.nvfp4_to_dsfp4 import convert_pieces
+
+        if pieces:
+            pieces = convert_pieces(pieces, verify=True)
+        return super().pack(pieces, cfg, out)
+
+
 @register_method(QuantKind.NVFP4, LayerKind.MOE)
 class Nvfp4MoEMethod(MoEMethod):
-    candidates = (TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel)
+    candidates = (TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel, TritonNvfp4Dsfp4MoEKernel)
 
     def create_weights(self, layer) -> None:
         raise NotImplementedError("NVFP4 experts are served from the offload cache, not resident")

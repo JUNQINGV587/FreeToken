@@ -33,6 +33,12 @@ LEGACY_FORMAT = {
     (QuantKind.NVFP4, "marlin"): "nvfp4_marlin",
     (QuantKind.NVFP4, "b12x"): "nvfp4_b12x",
     (QuantKind.MXFP4, "triton_gptoss"): "mxfp4_triton",
+    # NVFP4 checkpoint losslessly repacked to the DS-FP4 bank layout (V4.1, see
+    # moe.nvfp4_to_dsfp4): kind stays NVFP4 (disk tier, owner EP), banks are ds_fp4.
+    (QuantKind.NVFP4, "triton_dsfp4"): "ds_fp4",
+    # NOTE: kept after the nvfp4 alias so the reverse map resolves "ds_fp4" to the
+    # native MXFP4 (kind, kernel) -- the FTW reload of a real V4 checkpoint must
+    # not come back as the converted-nvfp4 variant.
     (QuantKind.MXFP4, "triton"): "ds_fp4",
 }
 _KIND_KERNEL = {fmt: kk for kk, fmt in LEGACY_FORMAT.items()}

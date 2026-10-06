@@ -9,10 +9,13 @@ streamed full-layer position (== expert id) for the grouped prefill path.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 
 from freetoken.kernel.triton.dsv4.fp8_linear import (
+    act_quant_fp8,
     act_quant_fp8_inplace,
     act_quant_fp8_roundtrip,
 )
@@ -34,6 +37,8 @@ def _compute_type(dtype: torch.dtype):
         torch.bfloat16: tl.bfloat16,
         torch.float16: tl.float16,
         torch.float32: tl.float32,
+        # FP8_MMA A-side (native fp8 act_quant output); unused by the bf16 path.
+        torch.float8_e4m3fn: tl.float8e4nv,
     }[dtype]
 
 
@@ -153,7 +158,10 @@ def _grouped_prefill(
     kernel_top_k: int,
     mul_routed_weight: bool,
     cfg: dict,
+    fp8_mma: bool = False,
+    a_scale: torch.Tensor | None = None,  # [A_rows, K//128] ue8m0 (fp8_mma only)
 ) -> None:
+    assert not fp8_mma or a_scale is not None
     N = packed_cache.shape[1]
     K = packed_cache.shape[2] * 2
     EM = sorted_ids.shape[0]
@@ -166,6 +174,8 @@ def _grouped_prefill(
         sorted_ids, expert_ids, num_tokens_post_padded,
         N, K, EM, num_valid,
         a.stride(0), a.stride(1),
+        a_scale if fp8_mma else a,
+        a_scale.stride(0) if fp8_mma else 0, a_scale.stride(1) if fp8_mma else 0,
         packed_cache.stride(0), packed_cache.stride(1), packed_cache.stride(2),
         scale_u8.stride(0), scale_u8.stride(1), scale_u8.stride(2),
         c.stride(-2), c.stride(-1),
@@ -175,7 +185,10 @@ def _grouped_prefill(
         GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
-        compute_type=_compute_type(a.dtype),
+        # Output dtype, not A's: with fp8_mma the A operand is e4m3 but the
+        # accumulator must store as c's dtype (else fp32->e4m3 saturation/rounding).
+        compute_type=_compute_type(c.dtype),
+        FP8_MMA=fp8_mma,
         num_warps=cfg.get("num_warps", 4),
         num_stages=cfg.get("num_stages", 3),
     )
@@ -207,30 +220,53 @@ def routed_experts_fp4_prefill(
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
     routes = T * top_k
-    # One static config for every density (no autotune): the kernel is
-    # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
-    # as tighter tiles while keeping the wgmma-wide M tile on sm_90.
+    # FT_DSFP4_FP8=1 (P4, DeepGEMM recipe on Ada): run the grouped GEMM on the
+    # FP8 tensor cores -- B stays e4m3 (exact e2m1 superset), one 32-wide K
+    # block per dot == one e8m0 scale block == sm89 mma.sync K=32, and the
+    # scale multiplies the fp32 partial dot (exact pow2). A-side values are
+    # FP8 round-tripped already, so the in-kernel bf16->e4m3 cast is exact.
+    fp8_mma = os.environ.get("FT_DSFP4_FP8", "0") == "1"
+    # One static config per MMA path (no autotune). sm89 sweep at v41
+    # geometry (T=25088, H=5120, I=2304, 192 slots, gate_up + down): the
+    # dequant-floor-bound kernel wants wide M tiles with few warps --
+    # BM=128/BK=128/NW=4/NS=1 measures -30% on both GEMMs vs the old
+    # BM=64/BK=64/NW=8 (67.2 vs 47.0 TF gate_up, 67.3 vs 47.2 TF down).
+    # FP8_MMA keeps BK=32 (== one e8m0 block == one mma.sync K) and is
+    # slower than tuned bf16 on sm89 (58.9 TF best) -- kept as an experiment
+    # behind FT_DSFP4_FP8, not the default.
     cfg = dict(
-        BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
-        num_warps=8, num_stages=1,
+        BLOCK_SIZE_M=128, BLOCK_SIZE_N=64,
+        BLOCK_SIZE_K=32 if fp8_mma else 128,
+        GROUP_SIZE_M=8,
+        num_warps=4, num_stages=1,
     )
     sorted_ids, expert_ids, ntpp = moe_align_block_size(slots, cfg["BLOCK_SIZE_M"], num_rows)
     tw = topk_weights.reshape(-1).contiguous()
 
-    x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
+    if fp8_mma:
+        # Raw e4m3 grid + separate per-128 ue8m0 scales (the round-trip folds
+        # the block scale into the value, which saturates e4m3 at ±448).
+        xq, xs = act_quant_fp8(x, 128)
+    else:
+        xq = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip
+        xs = None
     gate_up = torch.empty((T, top_k, two_I), dtype=x.dtype, device=x.device)
     _grouped_prefill(
-        x, gate_up_packed, gate_up_scale, gate_up, tw,
-        sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg,
+        xq, gate_up_packed, gate_up_scale, gate_up, tw,
+        sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg, fp8_mma, xs,
     )
     act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
 
     act = act.reshape(routes, I)
-    act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
+    if fp8_mma:
+        actq, acts = act_quant_fp8(act, 128)
+    else:
+        act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
+        actq, acts = act, None
     down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
     _grouped_prefill(
-        act, down_packed, down_scale, down, tw,
-        sorted_ids, expert_ids, ntpp, routes, 1, True, cfg,
+        actq, down_packed, down_scale, down, tw,
+        sorted_ids, expert_ids, ntpp, routes, 1, True, cfg, fp8_mma, acts,
     )
     return down.sum(dim=1)  # [T, H]
 

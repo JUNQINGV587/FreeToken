@@ -837,7 +837,8 @@ class OffloadMoeCache:
                     tmp = per_layer[layer_id][:n].to(buffer.device, non_blocking=True)
                     dst = buffer[buffer_id]
                     if dst.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
-                                     torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
+                                     torch.float8_e4m3fnuz, torch.float8_e5m2fnuz,
+                                     torch.float8_e8m0fnu):  # ds_fp4 scale banks
                         dst.view(torch.uint8).index_copy_(
                             0, tier._pin_ids_dev_i64[layer_id], tmp.view(torch.uint8))
                     else:
@@ -1475,7 +1476,11 @@ class OffloadMoeCache:
         from freetoken.moe.disk_tier import DiskTier
 
         assert self.decode_target == "gpu", "disk tier v0 supports the gpu (offload) path only"
-        assert self.quant_format == "nvfp4", f"disk tier v0 supports native nvfp4 banks (got {self.quant_format!r})"
+        # "ds_fp4" here is the triton_dsfp4 conversion mode: the cache rows are DS-FP4
+        # while the checkpoint rows the index addresses stay native NVFP4 -- the tier
+        # converts in its fetch path (moe.nvfp4_to_dsfp4).
+        assert self.quant_format in ("nvfp4", "ds_fp4"), \
+            f"disk tier v0 supports native nvfp4 banks (got {self.quant_format!r})"
         # Prefill overlap is supported: the overlap ring streams only the pinned
         # RAM prefix (prefix-only copy in prefetch_prefill_layer) and the routed
         # disk rows are patched into the borrowed buffer at layer entry

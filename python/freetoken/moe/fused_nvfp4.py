@@ -255,8 +255,11 @@ def _prefill_config(M: int) -> Dict[str, int]:
         cfg = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
                    GROUP_SIZE_M=8, num_warps=8, num_stages=2)
     else:
+        # v41-geometry re-sweep (20261006, L20, M=25088 full-MoE): NW=4/NS=1
+        # measures -8.1% vs NW=8/NS=2 (531.6 vs 578.1 ms). BLOCK_SIZE_KB
+        # stays 32, so outputs are unchanged.
         cfg = dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                   GROUP_SIZE_M=8, num_warps=8, num_stages=2)
+                   GROUP_SIZE_M=8, num_warps=4, num_stages=1)
     bm_override = int(os.environ.get("FREETOKEN_NVFP4_PREFILL_BM", "0"))
     if bm_override > 0 and M > 64:
         cfg["BLOCK_SIZE_M"] = bm_override

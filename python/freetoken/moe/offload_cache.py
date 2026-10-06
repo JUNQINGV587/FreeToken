@@ -10,6 +10,7 @@ from typing import Iterator
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
 
+from . import cache_admission as _cache_admission
 from . import prefill_profile
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
@@ -370,6 +371,64 @@ class OffloadMoeCache:
         self._prof = prefill_profile.get_profiler()
         self._prof_hit_rows_start = 0
         self._prof_total_rows_start = 0
+        # Item 5 (dsv41 port): elastic release/rewarm + route-count online
+        # admission. Pure host-side policy objects (moe/cache_admission.py);
+        # default-off, and off leaves every path byte-identical.
+        self._elastic_guard: _cache_admission.ElasticCacheGuard | None = None
+        if _cache_admission.VRAM_ELASTIC:
+            self._elastic_guard = _cache_admission.ElasticCacheGuard(
+                num_layers=self.num_layers,
+                num_experts=self.num_experts,
+                cache_size=self.cache_size,
+                borrowed_slots=(
+                    self._prefill_depth * self.num_experts if self.prefill_overlap else 0
+                ),
+            )
+        self._admission: _cache_admission.OnlineAdmission | None = None
+        if _cache_admission.ONLINE_ADMISSION:
+            self._admission = _cache_admission.OnlineAdmission(
+                num_layers=self.num_layers, num_experts=self.num_experts
+            )
+
+    # ------------------------------------------------------------------
+    # item 5 (dsv41 port): elastic release/rewarm + online admission hooks.
+    # Host bookkeeping only -- no stream semantics, no device syncs. The
+    # scheduler/engine call sites and the CUDA apply (unmap + empty_cache +
+    # re-add) are GPU-battery wiring; with the envs off these are unreachable.
+    # ------------------------------------------------------------------
+    @property
+    def elastic_guard(self) -> _cache_admission.ElasticCacheGuard | None:
+        return self._elastic_guard
+
+    @property
+    def admission(self) -> _cache_admission.OnlineAdmission | None:
+        return self._admission
+
+    def note_prefill_step(self, tokens: int) -> list[int] | None:
+        """Prefill-step hook for the elastic guard: the slots to release, or None."""
+        guard = self._elastic_guard
+        if guard is None:
+            return None
+        if self.id_of_slot.is_cuda:
+            # The release plan reads the slot map on the host; the device-side
+            # plan/apply is GPU-battery wiring. Calm/step tracking still runs.
+            return guard.note_prefill(tokens, None)
+        return guard.note_prefill(tokens, self.id_of_slot)
+
+    def note_decode_step(self) -> list[int] | None:
+        """Decode-step hook: the rewarm keep set once calm, else None."""
+        if self._admission is not None:
+            self._admission.note_step()
+        guard = self._elastic_guard
+        if guard is None:
+            return None
+        return guard.note_decode()
+
+    def admission_update(self, route_counts, miss_counts=None):
+        """One admission cycle's per-row counts; swaps once the period elapses."""
+        if self._admission is None:
+            return []
+        return self._admission.update(route_counts, miss_counts)
 
     @property
     def prefill_depth(self) -> int:
@@ -452,6 +511,11 @@ class OffloadMoeCache:
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
+        if self._elastic_guard is not None:
+            # one slot holds one row of every bank; feeds the rewarmed-bytes profile
+            self._elastic_guard.slot_bytes = sum(
+                cache[0].numel() * cache.element_size() for cache in self.bank_caches.values()
+            )
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
@@ -636,6 +700,12 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        if self._elastic_guard is not None:
+            # the guard's release scope is geometry-derived; keep it in sync
+            self._elastic_guard.cache_size = cache_size
+            self._elastic_guard.borrowed_slots = (
+                self._prefill_depth * self.num_experts if self.prefill_overlap else 0
+            )
         if self._disk_tier is not None:
             self._disk_tier.refresh(self)  # slot caches were reallocated
 
@@ -1463,6 +1533,11 @@ class OffloadMoeCache:
                 out["cpu_tier"] = self._cpu_tier.stats()
             except Exception:  # noqa: BLE001 -- diagnostics must not break serving
                 pass
+        # item 5 policy counters (dsv41 ec_summary() field contract, item 5.3.5)
+        if self._elastic_guard is not None:
+            out["elastic"] = self._elastic_guard.summary()
+        if self._admission is not None:
+            out["admission"] = self._admission.summary()
         return out
 
     def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,
@@ -1493,6 +1568,15 @@ class OffloadMoeCache:
         # (DiskTier.fetch_routed_into via fetch_into_prefill_buffer).
         self._disk_tier = DiskTier(index, self, ram_experts, workers=workers,
                                    ownership=ownership, pin_rows=pin_rows)
+        # Item 5: hand the effective pin layout (pin file or the identity prefix)
+        # to the policy guards -- releases freeze exactly these rows, admission
+        # swaps exactly this set.
+        if self._elastic_guard is not None or self._admission is not None:
+            pin_layout = self._disk_tier._pin_ids_cpu.tolist()
+            if self._elastic_guard is not None:
+                self._elastic_guard.set_pin_rows(pin_layout)
+            if self._admission is not None:
+                self._admission.set_pin_rows(pin_layout)
         if graph_k_max:
             # CUDA-graph decode: record doorbell-fetch kernels during capture,
             # serve the disk reads from a host thread at replay time.

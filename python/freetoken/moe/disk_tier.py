@@ -611,11 +611,20 @@ class DiskTier:
                   f"ram={self._ram} g0={self._g0} local_num={self._local_num} host_row_shapes={host_shapes} "
                   f"host_row_bytes={self._row_bytes} disk_row_bytes={disk_bytes}", flush=True)
         max_row = max(self._row_bytes)
+        self._fd_lock = threading.Lock()
+        self._fds: dict[int, tuple[int, bool]] = {}
+        if not self._convert:
+            # R1x: cross-bank merging makes the worst-case READ extent bigger
+            # than any single bank row (v41: the contiguous w1|w2|3 run is
+            # ~17.7 MiB vs the biggest bank's 5.9). Every staging/bounce
+            # buffer derives from _staging_size, and the layout is uniform
+            # across rows/layers, so one probe row sizes them all. Runs after
+            # _fds init: _row_groups -> _group_runs -> _fd.
+            max_row = max(max_row, max(
+                a1 - a0 for _s, a0, a1, _m, _e in self._row_groups(0, 0)))
         self._staging_size = ((max_row + _ALIGN - 1) // _ALIGN + 2) * _ALIGN
         self._staging = threading.local()
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="disk-tier")
-        self._fd_lock = threading.Lock()
-        self._fds: dict[int, tuple[int, bool]] = {}
         self._fetches = 0
         self._fetch_bytes = 0
         self._preadv_calls = 0
@@ -877,6 +886,43 @@ class DiskTier:
                                [(d0, d1, off, nbytes)], off + nbytes])
         return groups
 
+    def _row_groups(self, layer: int, expert: int):
+        """Cross-bank merged read plan for one row -- NATIVE mode only (R1x).
+
+        Same [shard, a0, a1, members, exact_end] shape as _group_runs, but the
+        members carry their bank: (bank_idx, d0, d1, off, nbytes). The v41
+        checkpoint lays each expert's w1|w2|w3 weights down as one contiguous
+        run (and the three per-16 scales as another), while _group_runs only
+        merges within a bank -- so a row costs 6 preadv. Merging exactly
+        adjacent runs ACROSS banks (same shard, prev exact_end == next off,
+        the within-bank rule) cuts that to 2 syscalls with identical bytes;
+        non-adjacent layouts simply don't merge. Scalar banks stay blob fills
+        and are not part of the plan."""
+        scalar_banks = getattr(self._index, "scalar_banks", ())
+        runs = []
+        for bank_idx in range(len(self._banks)):
+            if bank_idx in scalar_banks:
+                continue
+            for shard_idx, a0, a1, members, _end in self._group_runs(
+                    bank_idx, layer, expert):
+                for (d0, d1, off, nbytes) in members:
+                    runs.append((shard_idx, a0, a1, off, nbytes,
+                                 bank_idx, d0, d1))
+        runs.sort(key=lambda t: (t[0], t[3]))
+        groups = []  # [shard, a0, a1, [(bank_idx, d0, d1, off, nbytes)], exact_end]
+        for shard_idx, a0, a1, off, nbytes, bank_idx, d0, d1 in runs:
+            if (groups and groups[-1][0] == shard_idx
+                    and groups[-1][4] == off):
+                g = groups[-1]
+                g[2] = max(g[2], a1)
+                g[4] = off + nbytes
+                g[3].append((bank_idx, d0, d1, off, nbytes))
+            else:
+                groups.append([shard_idx, a0, a1,
+                               [(bank_idx, d0, d1, off, nbytes)],
+                               off + nbytes])
+        return groups
+
     def _fetch_expert(self, layer: int, expert: int, slot: int,
                       dst_buffers: list | None = None, buffer_id: int = 0) -> None:
         # The server runs under inference_mode; the fetch pool threads do not,
@@ -891,6 +937,47 @@ class DiskTier:
         ri = getattr(self._staging, "ri", 0)
         scalar_banks = getattr(self._index, "scalar_banks", ())
         disk_bytes = 0
+        if not self._convert:
+            # R1x native path: blob-fill the scalar banks, then serve every
+            # disk bank from ONE cross-bank merged plan (6 -> 2 preadv/row on
+            # the v41 layout; identical bytes, see _row_groups).
+            rows = {}
+            for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
+                if dst_buffers is None:
+                    row = gpu_cache[slot]
+                else:
+                    row = dst_buffers[bank_idx][buffer_id][expert]
+                if bank_idx in scalar_banks:
+                    self._fill_scalar_row(bank_idx, layer, expert, row)
+                else:
+                    rows[bank_idx] = row
+            for shard_idx, a0, a1, members, _end in self._row_groups(
+                    layer, expert):
+                staging, ev = ring[ri]
+                if ev is not None:
+                    ev.synchronize()
+                ri = (ri + 1) % len(ring)
+                fd, direct = self._fd(shard_idx)
+                slen = a1 - a0
+                mv = (ctypes.c_char * slen).from_address(staging.addr)
+                try:
+                    os.preadv(fd, [mv], a0)
+                except OSError:
+                    raise _preadv_error(self, staging, shard_idx,
+                                        members[0][3], a0, slen, direct)
+                self._preadv_calls += 1
+                for bank_idx, d0, d1, off, nbytes in members:
+                    src = staging.tensor[off - a0:off - a0 + nbytes]
+                    dst = rows[bank_idx][d0:d1]
+                    dst.copy_(src.view(dst.dtype).view(dst.shape),
+                              non_blocking=True)
+                    disk_bytes += nbytes
+                if ev is not None:
+                    ev.record()
+            self._staging.ri = ri
+            self._fetches += 1
+            self._fetch_bytes += sum(self._row_bytes)
+            return
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
             if dst_buffers is None:
                 row = gpu_cache[slot]

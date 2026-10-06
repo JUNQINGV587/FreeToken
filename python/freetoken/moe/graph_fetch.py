@@ -540,6 +540,27 @@ class GraphFetchBridge:
             return
         bounce = self._bounce_buf()
         scalar_banks = getattr(tier._index, "scalar_banks", ())
+        _row_groups = getattr(tier, "_row_groups", None)
+        if _row_groups is not None and not getattr(self, "_convert", False):
+            # R1x native path: one cross-bank merged plan (6 -> 2 preadv/row
+            # on the v41 layout, identical bytes). getattr: the CPU staging
+            # tests drive this with stub tiers that only know _group_runs.
+            for bank_idx in scalar_banks:
+                tier._fill_scalar_row(bank_idx, layer, expert,
+                                      self.staging_host[bank_idx][j])
+            for shard_idx, a0, a1, members, _end in _row_groups(
+                    layer, expert):
+                fd, _direct = tier._fd(shard_idx)
+                slen = a1 - a0
+                mv = (ctypes.c_char * slen).from_address(bounce.data_ptr())
+                os.preadv(fd, [mv], a0)
+                tier._preadv_calls += 1
+                src_base = bounce.data_ptr() - a0
+                for bank_idx, d0, d1, off, nbytes in members:
+                    ctypes.memmove(
+                        self.staging_host[bank_idx][j][d0:d1].data_ptr(),
+                        src_base + off, nbytes)
+            return
         for bank_idx, (_host, _gpu) in enumerate(tier._banks):
             dst_row = self.staging_host[bank_idx][j]
             if not getattr(self, "_convert", False) and bank_idx in scalar_banks:

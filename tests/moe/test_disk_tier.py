@@ -433,14 +433,15 @@ def _packed_checkpoint(tmp_path):
 
 
 def test_adjacent_segments_share_one_preadv(tmp_path):
-    """Real-checkpoint packing makes an expert's gate|up weights (and scales)
-    exactly adjacent, so they merge into one read per bank: banks 0/1/3/4 cost
-    1 preadv each, scalar banks cost 0 -> 4 calls per fetch (was 9)."""
+    """Real-checkpoint packing makes an expert's segments exactly adjacent --
+    first within each bank (P0-3, 9 -> 4 preadv), and with R1x also ACROSS
+    banks, so the fully-packed layout here collapses to a single merged
+    extent: 1 call per fetch."""
     checkpoint = _packed_checkpoint(tmp_path)
     cache = _fake_cache()
     tier = _tier(checkpoint, cache)
     tier._fetch_expert(0, 0, 0)
-    assert tier.stats()["preadv_calls"] == 4, tier.stats()
+    assert tier.stats()["preadv_calls"] == 1, tier.stats()
     # The merged reads still land the exact bytes (all 6 banks, both slices).
     expected = _expected_rows(0, 0)
     for bank_idx, (_host_layer, gpu_cache) in enumerate(cache.banks):
@@ -975,3 +976,75 @@ def test_fetch_pending_remap_all_ram_still_translates(checkpoint):
     assert cache.num_indices.item() == 2
     assert cache.src_indices[:2].tolist() == [0, 1]
     assert cache.evict_slots[:2].tolist() == [5, 6]
+
+
+class _SegIndex:
+    """Handcrafted segment layouts for _row_groups merge-math tests."""
+    scalar_banks = (2, 5)
+
+    def __init__(self, segs):
+        self._segs = segs
+
+    def row_segments(self, bank_idx, layer, expert):
+        return self._segs[(bank_idx, layer, expert)]
+
+
+def _row_groups_tier(segs, n_banks=6):
+    t = object.__new__(DiskTier)
+    t._index = _SegIndex(segs)
+    t._convert = False
+    t._g0 = 0
+    t._banks = [None] * n_banks
+    t._dst_slices = [[(0, 100)]] * n_banks
+    t._fd = lambda shard: (None, False)  # direct=False: exact (unaligned) extents
+    return t
+
+
+def _per_bank_members(t, layer, expert):
+    out = []
+    for b in range(len(t._banks)):
+        if b in t._index.scalar_banks:
+            continue
+        for _s, _a0, _a1, members, _e in t._group_runs(b, layer, expert):
+            for (d0, d1, off, nbytes) in members:
+                out.append((b, d0, d1, off, nbytes))
+    return sorted(out)
+
+
+def test_row_groups_merges_cross_bank_adjacency():
+    # v41-style: banks 0/1/3 (weights) contiguous 1000..4000; bank 4 (scale) far away.
+    segs = {(0, 0, 0): [(0, 1000, 1000)], (1, 0, 0): [(0, 2000, 1000)],
+            (3, 0, 0): [(0, 3000, 1000)], (4, 0, 0): [(0, 9000, 500)]}
+    t = _row_groups_tier(segs)
+    groups = t._row_groups(0, 0)
+    assert len(groups) == 2
+    shard, a0, a1, members, end = groups[0]
+    assert (shard, a0, a1, end) == (0, 1000, 4000, 4000)
+    assert sorted(m[0] for m in members) == [0, 1, 3]
+    # Byte conservation: identical member multiset as the per-bank plan.
+    merged = sorted((m[0], m[1], m[2], m[3], m[4])
+                    for g in groups for m in g[3])
+    assert merged == _per_bank_members(t, 0, 0)
+
+
+def test_row_groups_no_merge_across_gap_or_shard():
+    # 1-byte gap between bank 0 and 1; bank 3 on another shard: no cross-bank merge.
+    segs = {(0, 0, 0): [(0, 1000, 1000)], (1, 0, 0): [(0, 2001, 1000)],
+            (3, 0, 0): [(1, 500, 1000)], (4, 0, 0): [(0, 3001, 500)]}
+    t = _row_groups_tier(segs)
+    groups = t._row_groups(0, 0)
+    # bank1+bank4 are adjacent (2001+1000==3001) -> one merged group; bank0 and
+    # bank3 stand alone: 3 groups, vs 4 per-bank groups.
+    assert len(groups) == 3
+    assert len(_per_bank_members(t, 0, 0)) == 4
+    merged = sorted((m[0], m[1], m[2], m[3], m[4])
+                    for g in groups for m in g[3])
+    assert merged == _per_bank_members(t, 0, 0)
+
+
+def test_row_groups_excludes_scalar_banks():
+    segs = {(0, 0, 0): [(0, 1000, 1000)], (1, 0, 0): [(0, 2000, 1000)],
+            (3, 0, 0): [(0, 3000, 1000)], (4, 0, 0): [(0, 9000, 500)]}
+    t = _row_groups_tier(segs)
+    members = [m for g in t._row_groups(0, 0) for m in g[3]]
+    assert all(m[0] not in (2, 5) for m in members)

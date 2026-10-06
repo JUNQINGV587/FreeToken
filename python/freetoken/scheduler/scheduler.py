@@ -494,6 +494,7 @@ class Scheduler(SchedulerIOMixin):
             moe_stats = self._moe_stats_snapshot()
             mm_stats = self._mm_stats_snapshot()
             host_tier_stats = self._host_tier_stats_snapshot()
+            qos_stats = self._qos_stats_snapshot()
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -508,6 +509,8 @@ class Scheduler(SchedulerIOMixin):
                     m.mm_stats = mm_stats
                 if host_tier_stats is not None:
                     m.host_tier_stats = host_tier_stats
+                if qos_stats is not None:
+                    m.qos_stats = qos_stats
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),

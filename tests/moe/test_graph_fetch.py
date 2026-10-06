@@ -84,6 +84,16 @@ class _FakeTier:
     def _fill_scalar_row(self, *a, **k):  # pragma: no cover - no scalar banks
         raise AssertionError("unexpected scalar bank")
 
+    # Doorbell ledger stubs (DiskTier.record_doorbell*): the bridge calls them
+    # off the ack path; counting them here also feeds the refusal test.
+    _db_timeouts = 0
+
+    def record_doorbell(self, rows, host_us):
+        pass
+
+    def record_doorbell_timeout(self):
+        self._db_timeouts += 1
+
 
 class _FakeCache:
     def __init__(self, tier):
@@ -187,8 +197,9 @@ def test_overflow_refuses_to_ack(tmp_path):
     try:
         b.enable()  # first, so the snapshot doesn't swallow the request
         _set_plan(cache, srcs=[1, 2, 3], slots=[10, 11, 12])
-        # Launch the request kernel + memcpy directly: stage_fetch would also
-        # launch the spin, which (correctly) never returns for this request.
+        # Launch the request kernel + memcpy directly: the spin would be
+        # released by the poisoned ack immediately, so test the host path
+        # without it.
         _gf_request_kernel[(1,)](
             cache.num_indices, cache.evict_slots, cache.src_indices,
             b.req_dev, b.req_slots_dev, b.req_count_dev,
@@ -197,8 +208,18 @@ def test_overflow_refuses_to_ack(tmp_path):
         b.req_host.copy_(b.req_dev, non_blocking=True)
         torch.cuda.synchronize()
         assert int(b.req_host[0]) == 3  # true count: over k_max=2, must refuse
-        time.sleep(0.3)
-        assert int(b.resp_host[0]) == 0, "over-capacity request must hang"
+        # Fail-loud semantics: the refusal sets the health flag, counts a
+        # doorbell_timeout, and poisons the ack so the replay's spin releases
+        # into the engine's raise_if_unhealthy (instead of hanging, the
+        # pre-2026-10-06 behaviour).
+        deadline = time.time() + 5
+        while not b._err and time.time() < deadline:
+            time.sleep(0.01)
+        assert b._err, "over-capacity request must trip the health flag"
+        assert int(b.resp_host[0]) == 1, "refusal must poison the ack with the seq"
+        assert tier._db_timeouts == 1
+        with pytest.raises(RuntimeError, match="k_max"):
+            b.raise_if_unhealthy()
     finally:
         b.disable()
         b.shutdown()
@@ -209,9 +230,12 @@ def test_spin_noop_when_doorbell_off(bridge):
     # req seq ahead of resp but the doorbell is off: spin must not block.
     bridge.req_dev[bridge.seq_off] = 5
     _gf_spin_kernel[(1,)](bridge.resp_host, bridge.req_dev,
-                          bridge.doorbell_dev, SEQ_OFF=bridge.seq_off,
+                          bridge.doorbell_dev, bridge.spin_stats_dev,
+                          SEQ_OFF=bridge.seq_off,
                           TRACE=False)
     torch.cuda.synchronize()  # returns at all == pass
+    # ...and it must not record a wait it never performed.
+    assert int(bridge.spin_stats_dev[1]) == 0
 
 
 def test_request_kernel_remaps_through_row_map(tmp_path):

@@ -6,8 +6,10 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 import types
 
+import pytest
 import torch
 
 from freetoken.moe.graph_fetch import GraphFetchBridge
@@ -141,3 +143,104 @@ def test_bounce_slab_exhaustion_is_loud(tmp_path):
         assert "bounce slab" in str(e)
     else:  # pragma: no cover
         raise AssertionError("expected loud slab-exhaustion error")
+
+
+# ---------------------------------------------------------------------------
+# M1 hardening: watchdog timeout / over-k_max refusal / spin-stats readout.
+# Host-side logic only -- no CUDA (same object.__new__ shell as above).
+
+
+class _WdTier:
+    """Just enough tier for the watchdog paths: a timeout counter."""
+
+    def __init__(self):
+        self.timeouts = 0
+
+    def record_doorbell_timeout(self):
+        self.timeouts += 1
+
+
+def _wd_bridge(k_max: int = 4, timeout_s: float = 0.2) -> GraphFetchBridge:
+    b = object.__new__(GraphFetchBridge)
+    b.k_max = k_max
+    b.seq_off = 2 + k_max
+    # Plain CPU tensors stand in for the pinned pair: the watchdog and refusal
+    # paths are plain CPU stores/reads, pinning is irrelevant to them.
+    b.req_host = torch.zeros(3 + k_max, dtype=torch.int64)
+    b.resp_host = torch.zeros(1, dtype=torch.int64)
+    b.tier = _WdTier()
+    b._served = 0
+    b._err = False
+    b._stop = threading.Event()
+    b._timeout_s = timeout_s
+    b._device = "cpu"  # only interpolated into log lines
+    return b
+
+
+def test_watchdog_timeout_poisons_and_fails_loud():
+    b = _wd_bridge()
+    b.req_host[b.seq_off] = 1  # request seq 1 arrives, is never acked
+    t = threading.Thread(target=b._watchdog, daemon=True)
+    t.start()
+    try:
+        deadline = time.time() + 5
+        while not b._err and time.time() < deadline:
+            time.sleep(0.01)
+        assert b._err, "watchdog never fired on a wedged request"
+        assert int(b.resp_host[0]) == 1, "watchdog must poison the ack to release the spin"
+        assert b.tier.timeouts == 1
+        with pytest.raises(RuntimeError, match="graph-doorbell"):
+            b.raise_if_unhealthy()
+        # The poisoned sequence must not refire...
+        time.sleep(0.5)
+        assert b.tier.timeouts == 1
+        # ...but a NEW wedged request fires again.
+        b._err = False
+        b.req_host[b.seq_off] = 2
+        deadline = time.time() + 5
+        while b.tier.timeouts < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert b.tier.timeouts == 2
+        assert int(b.resp_host[0]) == 2
+    finally:
+        b._stop.set()
+        t.join(timeout=2)
+
+
+def test_watchdog_ignores_acked_and_legacy_sequences():
+    b = _wd_bridge()
+    b.req_host[b.seq_off] = 1
+    b.resp_host[0] = 1  # already acked: nothing is pending
+    t = threading.Thread(target=b._watchdog, daemon=True)
+    t.start()
+    try:
+        time.sleep(0.5)
+        assert not b._err
+        assert b.tier.timeouts == 0
+    finally:
+        b._stop.set()
+        t.join(timeout=2)
+
+
+def test_refuse_overcount_fails_loud():
+    b = _wd_bridge(k_max=2)
+    b.req_host[b.seq_off] = 7
+    b._refuse_overcount(count=3, seq=7)
+    assert b._err, "over-k_max refusal must trip the health flag"
+    assert b.tier.timeouts == 1, "refusal counts as a doorbell timeout"
+    assert int(b.resp_host[0]) == 7, "refusal must poison the ack with the seq"
+    with pytest.raises(RuntimeError, match="k_max"):
+        b.raise_if_unhealthy()
+
+
+def test_spin_stats_readout():
+    b = object.__new__(GraphFetchBridge)
+    b.spin_stats_host = torch.tensor([150_000_000, 3, 100_000_000],
+                                     dtype=torch.int64)
+    s = b.spin_stats()
+    assert s["doorbell_spins"] == 3
+    assert s["doorbell_wait_ms"] == 50.0  # 150ms total / 3 waits
+    assert s["doorbell_wait_ms_peak"] == 100.0
+    # No waits yet -> 0.0, never a division error.
+    b.spin_stats_host = torch.zeros(3, dtype=torch.int64)
+    assert b.spin_stats()["doorbell_wait_ms"] == 0.0

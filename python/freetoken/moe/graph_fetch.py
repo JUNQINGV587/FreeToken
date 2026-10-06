@@ -46,6 +46,45 @@ Serialisation: single decode stream + the spin means requests are strictly
 ordered, so ONE request block and ONE staging set are enough: request N+1's
 kernel (and its D2H node) executes after request N's install in stream order,
 so staging rows are never overwritten while an install can still read them.
+
+Operational semantics (M1 hardening):
+
+- k_max = cuda_graph_max_bs x topk bounds one graphed layer's disk misses, so
+  a request count above it is a SIZING BUG (or a new multi-token decode step,
+  e.g. spec decode, raising the bound), never legitimate traffic. There is no
+  eager fallback inside a replayed graph: the service thread refuses (FATAL
+  log), sets the engine-visible health flag, counts a doorbell_timeout, and
+  poisons the ack so the replay releases into the engine's
+  raise_if_unhealthy instead of hanging (the pre-watchdog behaviour was a
+  22-minute silent freeze, 2026-10-03).
+- The same loud path covers a wedged service thread: a watchdog thread spots
+  a request unacked for more than FT_GRAPH_FETCH_TIMEOUT_S (default 10 s),
+  counts it, and poisons the ack. A fired watchdog means the step's staging
+  is incomplete; the engine raises before sampling and the server must be
+  restarted (logged). This is the cpu_executor err[] pattern, host-side
+  because the in-graph spin has no bounded wait of its own.
+- doorbell == 0 (before enable(), i.e. during capture and the eager compile
+  warm-up): the spin kernel no-ops and the install reads staging as-is. Safe
+  because capture executes nothing and _warm runs with num_indices == 0 (the
+  req-count == 0 short-circuit fires before the doorbell is even read).
+  Graphs captured with FT_GRAPH_FETCH_OFF set contain NO fetch nodes at all
+  (the capture branch in offload_cache.copy_missing is env-gated), so the env
+  is effectively read once per capture set, not per replay.
+- One bridge serves EVERY captured batch-size graph: requests are serialized
+  by the single decode stream, k_max is sized to the LARGEST graph, and the
+  spin's stream ordering serializes staging reuse, so switching between bs
+  graphs mid-stream needs no extra coordination.
+- Spin-wait telemetry: the spin kernel times itself (%globaltimer) into a
+  device stats word [total_ns, waits, peak_ns]; one captured D2H node after
+  the LAST layer's spin mirrors it to pinned host memory (kernel stores to
+  sysmem from a replay are lost, DMA copies are not -- see the transport
+  notes above), so /v1/stats reads it with zero CUDA calls.
+- Miss-routing priority once the CPU tier (port item 1) lands: slot hit ->
+  GPU-resident rows (today's fast path); RAM-pinned -> PCIe host-bank copy
+  (the compacted RAM remainder the request kernel leaves behind); disk ->
+  this doorbell. The row_map split in _gf_request_kernel is where the
+  RAM/disk boundary is decided; CPU-tier rows must be classified BEFORE the
+  doorbell request is built, or they would be fetched from disk needlessly.
 """
 
 from __future__ import annotations
@@ -119,15 +158,21 @@ def _gf_request_kernel(
 
 
 @triton.jit
-def _gf_spin_kernel(resp_ptr, req_ptr, doorbell_ptr, SEQ_OFF: tl.constexpr,
-                    TRACE: tl.constexpr):
+def _gf_spin_kernel(resp_ptr, req_ptr, doorbell_ptr, stats_ptr,
+                    SEQ_OFF: tl.constexpr, TRACE: tl.constexpr):
     """Wait until the host service thread acknowledges the request written by
     the (stream-ordered) preceding _gf_request_kernel. Skipped entirely during
     graph capture (doorbell off) and on warm layers (req count == 0). Polls
     HOST-PINNED resp over PCIe: device kernel sysmem reads are the one
     host->device direction that works while a graph replay is resident, and
     the sys-scope acquire read orders the install's staging reads after the
-    observed ack."""
+    observed ack.
+
+    The wait is timed with %globaltimer (the dsv41 ft_tier_cu_v.cu caliber)
+    and accumulated into stats_ptr = [total_ns, waits, peak_ns] so the host
+    can report mean/peak gpu-side doorbell wait without any CUDA call -- one
+    captured D2H node after the last layer's spin mirrors the device word to
+    pinned host memory (see GraphFetchBridge.stage_fetch)."""
     if tl.load(doorbell_ptr, volatile=True) == 0:
         return
     if tl.load(req_ptr, volatile=True) == 0:
@@ -135,8 +180,15 @@ def _gf_spin_kernel(resp_ptr, req_ptr, doorbell_ptr, SEQ_OFF: tl.constexpr,
     target = tl.load(req_ptr + SEQ_OFF, volatile=True)
     if TRACE:
         tl.device_print("[gf-spin] enter target=", target)
+    t0 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [],
+                                   dtype=tl.int64, is_pure=False, pack=1)
     while tl.atomic_add(resp_ptr, 0, sem="acquire", scope="sys") < target:
         pass
+    t1 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [],
+                                   dtype=tl.int64, is_pure=False, pack=1)
+    tl.atomic_add(stats_ptr, t1 - t0)
+    tl.atomic_add(stats_ptr + 1, 1)
+    tl.atomic_max(stats_ptr + 2, t1 - t0)
     if TRACE:
         tl.device_print("[gf-spin] exit resp=",
                         tl.atomic_add(resp_ptr, 0, sem="acquire", scope="sys"))
@@ -234,6 +286,18 @@ class GraphFetchBridge:
             self.doorbell_dev = torch.zeros(1, dtype=torch.int64,
                                             device=device)
 
+            # Spin-wait telemetry [total_ns, waits, peak_ns]: accumulated
+            # device-side by the spin kernel, mirrored to pinned host memory
+            # by one captured D2H node after the LAST layer's spin in
+            # stage_fetch (kernel stores to sysmem from a replay are lost,
+            # DMA copies are not -- same transport asymmetry as the request
+            # block above), so spin_stats() needs zero CUDA calls and stays
+            # readable even while a replay is wedged.
+            self.spin_stats_dev = torch.zeros(3, dtype=torch.int64,
+                                              device=device)
+            self.spin_stats_host = torch.zeros(3, dtype=torch.int64,
+                                               pin_memory=True)
+
             # Staging rows, one pinned host set per bank: the thread preadv's
             # into it and the captured install kernel reads it over PCIe (same
             # zero-copy contract the eager path has with host banks). Same
@@ -296,6 +360,14 @@ class GraphFetchBridge:
         self._issue_prefetch = os.environ.get("FT_GRAPH_FETCH_PREFETCH", "0") == "1"
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
+        # Engine-visible health flag (the cpu_executor err[] pattern, host
+        # side): set by the watchdog on an unacked request past the timeout
+        # and by the service thread on a count > k_max refusal; read once per
+        # forward via raise_if_unhealthy. A plain bool is enough (GIL-atomic).
+        self._err = False
+        self._timeout_s = float(
+            os.environ.get("FT_GRAPH_FETCH_TIMEOUT_S", "10"))
         # Row-level fetch pool: the W15 py-spy profile showed the doorbell
         # service thread is the decode bottleneck (one python thread doing
         # per-row preadv + member copies serially). Rows within one request
@@ -341,7 +413,11 @@ class GraphFetchBridge:
         self.req_host.copy_(self.req_dev, non_blocking=True)
         _gf_spin_kernel[(1,)](
             self.resp_host, self.req_dev, self.doorbell_dev,
-            SEQ_OFF=self.seq_off, TRACE=self._trace)
+            self.spin_stats_dev, SEQ_OFF=self.seq_off, TRACE=self._trace)
+        if layer_id == len(cache.banks[0][0]) - 1:
+            # One captured D2H node per replay mirrors the cumulative spin
+            # stats to the host, stream-ordered after every layer's spin.
+            self.spin_stats_host.copy_(self.spin_stats_dev, non_blocking=True)
         # Install reads PINNED HOST staging over PCIe — the probe-proven
         # host->device direction that needs zero CUDA calls from the thread.
         for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
@@ -366,6 +442,7 @@ class GraphFetchBridge:
             # Snapshot: ignore every sequence written during capture.
             self._served = int(self.req_host[self.seq_off])
             self._stop.clear()
+            self._err = False
             if not os.environ.get("FT_GRAPH_FETCH_NOTHREAD"):
                 # Pre-spawn the row workers and their pinned bounce slabs NOW:
                 # a cudaHostAlloc issued by a service thread DURING a replay
@@ -379,6 +456,10 @@ class GraphFetchBridge:
                 self._thread = threading.Thread(
                     target=self._serve, name="graph-fetch", daemon=True)
                 self._thread.start()
+                self._watchdog_thread = threading.Thread(
+                    target=self._watchdog, name="graph-fetch-watchdog",
+                    daemon=True)
+                self._watchdog_thread.start()
         self.doorbell_dev.fill_(1)
         print(f"[graph-fetch] enabled dev={self._device} pid={os.getpid()} "
               f"served={self._served} k_max={self.k_max} "
@@ -390,7 +471,104 @@ class GraphFetchBridge:
         if t is not None:
             t.join(timeout=5)
             self._thread = None
+        w = self._watchdog_thread
+        if w is not None:
+            w.join(timeout=5)
+            self._watchdog_thread = None
         self._row_pool.shutdown(wait=False)
+
+    # -- observability + health (host side, zero CUDA calls) -------------------
+
+    def spin_stats(self) -> dict:
+        """GPU-side spin-wait ledger, read off the pinned mirror (the dsv41
+        ``gpu_wait_ms`` caliber): ``doorbell_wait_ms`` is the mean device wait
+        per doorbell request, ``_peak`` the worst single wait, both over the
+        process lifetime. Zero CUDA calls, so /v1/stats stays readable even
+        while a replay is wedged in its spin."""
+        total_ns, waits, peak_ns = (int(x) for x in self.spin_stats_host[:3])
+        return {
+            "doorbell_spins": waits,
+            "doorbell_wait_ms": total_ns / 1e6 / waits if waits else 0.0,
+            "doorbell_wait_ms_peak": peak_ns / 1e6,
+        }
+
+    def raise_if_unhealthy(self) -> None:
+        """Engine per-forward health check (one python bool; the doorbell
+        analogue of cpu_executor's err[]). A fired watchdog or an over-k_max
+        refusal means a replay was let out of its spin WITHOUT valid staging;
+        the step must not ship its tokens, so the engine calls this between
+        replay and sampling."""
+        if self._err:
+            raise RuntimeError(
+                "graph-doorbell fetch failed: a request went unacked past "
+                f"FT_GRAPH_FETCH_TIMEOUT_S={self._timeout_s}s or exceeded "
+                f"k_max={self.k_max} (see the [graph-fetch] FATAL/WATCHDOG "
+                "log); the step was aborted before sampling but the server "
+                "must be restarted -- slot contents are no longer trustworthy")
+
+    def _watchdog(self) -> None:
+        """Loud-failure path for a wedged service thread (the cpu_executor
+        err[] pattern, host-side because the in-graph spin has no bounded
+        wait of its own).
+
+        The spin kernel polls resp_host forever; a dead service thread would
+        hang every replay with zero diagnostics (observed 2026-10-03: a
+        22-minute frozen prefill). This thread watches for a request that
+        stays unacked past FT_GRAPH_FETCH_TIMEOUT_S, then counts it
+        (doorbell_timeouts), sets the health flag, and poisons the ack so the
+        replay completes and the engine's raise_if_unhealthy turns the step
+        into a loud error before its tokens are sampled. The poisoned replay
+        installs incomplete staging, which is why a fired watchdog means
+        restart-required (logged)."""
+        base = self._served
+        pending_seq = None
+        pending_since = 0.0
+        while not self._stop.wait(0.05):
+            req_seq = int(self.req_host[self.seq_off])
+            if req_seq <= base or req_seq <= int(self.resp_host[0]):
+                pending_seq = None
+                continue
+            if pending_seq != req_seq:
+                pending_seq = req_seq
+                pending_since = time.monotonic()
+                continue
+            if time.monotonic() - pending_since < self._timeout_s:
+                continue
+            count = int(self.req_host[0])
+            layer = int(self.req_host[1])
+            print(f"[graph-fetch] WATCHDOG TIMEOUT dev={self._device}: "
+                  f"request seq={req_seq} layer={layer} count={count} unacked "
+                  f"for >{self._timeout_s}s (service thread wedged); failing "
+                  f"the step loudly -- the server must be restarted",
+                  flush=True)
+            self._err = True
+            rec = getattr(self.tier, "record_doorbell_timeout", None)
+            if rec is not None:
+                rec()
+            # Poison the ack AFTER setting err: the spin exits, the replay
+            # completes, and raise_if_unhealthy fails the step.
+            self.resp_host[0] = req_seq
+            base = req_seq  # never refire on the poisoned sequence
+
+    def _refuse_overcount(self, count: int, seq: int) -> None:
+        """count > k_max is impossible by construction (k_max = max graph bs x
+        topk bounds one graphed layer's disk misses); seeing it means the
+        bridge was sized under the captured graphs, or a future multi-token
+        decode step (e.g. spec decode) raised the bound. There is NO eager
+        fallback inside a replayed graph, so fail loud: flag the engine
+        health check, count a doorbell_timeout, and poison the ack so the
+        spin releases into the engine's raise -- the pre-watchdog behaviour
+        (never ack) was the 22-minute silent freeze of 2026-10-03, and
+        silently serving min(count, k_max) rows would be silent corruption."""
+        print(f"[graph-fetch] FATAL: request count {count} > "
+              f"k_max {self.k_max} dev={self._device}; refusing to serve -- "
+              f"the engine raises on this step and the server must be "
+              f"restarted", flush=True)
+        self._err = True
+        rec = getattr(self.tier, "record_doorbell_timeout", None)
+        if rec is not None:
+            rec()
+        self.resp_host[0] = seq
 
     # -- host service thread ---------------------------------------------------
     # The thread makes ZERO CUDA calls: anything enqueued from here (memcpy or
@@ -410,18 +588,20 @@ class GraphFetchBridge:
         self._bounce_buf()
         # A dead service thread hangs the whole engine: every replayed graph spins on an
         # ack that would never come. Observed 2026-10-03 -- an inference-mode RuntimeError
-        # inside _read_into_staging killed the thread and froze a prefill for 22 minutes.
-        # So: keep serving after a transient error, but give up loudly instead of
-        # spinning forever on a request that can never be served -- the same terminal
-        # contract as the count > k_max branch, which deliberately never acks.
+        # inside _read_into_staging killed the thread and froze a prefill for 22 minutes
+        # (the watchdog added after that incident now bounds the same failure to
+        # FT_GRAPH_FETCH_TIMEOUT_S + a loud engine error). So: keep serving after a
+        # transient error, but give up loudly instead of spinning forever on a request
+        # that can never be served -- the same terminal contract as the count > k_max
+        # branch.
         fails = 0
         while not self._stop.is_set():
             try:
                 self._serve_inner()
                 if not self._stop.is_set():
                     print(f"[graph-fetch] service thread stopping dev={self._device}: it "
-                          f"refused a request; the server will hang and must be "
-                          f"restarted", flush=True)
+                          f"refused a request; the engine raises per forward and the "
+                          f"server must be restarted", flush=True)
                 return
             except Exception:
                 import traceback
@@ -430,8 +610,9 @@ class GraphFetchBridge:
                       + traceback.format_exc(), flush=True)
                 if fails > 3:
                     print(f"[graph-fetch] service thread stopping dev={self._device} "
-                          f"after {fails} consecutive failures; the server will hang "
-                          f"and must be restarted", flush=True)
+                          f"after {fails} consecutive failures; the watchdog now fails "
+                          f"the next request loudly and the server must be restarted",
+                          flush=True)
                     return
                 time.sleep(0.05)
 
@@ -462,10 +643,8 @@ class GraphFetchBridge:
             t_serve0 = time.perf_counter_ns()
             count = int(blk[0])
             layer = int(blk[1])
-            if count > self.k_max:  # impossible by construction; never ack
-                print(f"[graph-fetch] FATAL: request count {count} > "
-                      f"k_max {self.k_max}; refusing to serve (server will "
-                      f"hang and must be restarted)", flush=True)
+            if count > self.k_max:
+                self._refuse_overcount(count, seq)
                 return
             # Staging reuse needs no fence: requests are strictly serialized
             # by the spin, so the previous request's install kernel (stream

@@ -478,6 +478,71 @@ def test_prefill_overlap_depth_three_requires_three_layer_slots(monkeypatch):
     )
 
 
+def test_prefill_pin_source_skips_ring_prefix_copy():
+    """②a (FREETOKEN_PREFILL_PIN_SOURCE=1): with a disk tier whose fetch plan
+    serves the routed pinned rows (DiskTier._serve_pin_rows), the ring's
+    blanket pinned-prefix copy is skipped -- the borrowed buffer keeps its
+    previous bytes (unrouted rows are never gathered by the grouped GEMM).
+    With the flag off the prefix copy runs exactly as before."""
+    from types import SimpleNamespace
+
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    num_layers, num_experts = 2, 4
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=2 * num_experts,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+    gate_up_source = list(torch.arange(
+        num_layers * num_experts * 32 * 8, dtype=torch.float32
+    ).reshape(num_layers * num_experts, 32, 8).split(num_experts))
+    down_source = list(torch.arange(
+        num_layers * num_experts * 8 * 16, dtype=torch.float32
+    ).reshape(num_layers * num_experts, 8, 16).split(num_experts))
+    cache.set_bank_sources({"gate_up": gate_up_source, "down": down_source})
+    for buf in cache.prefill_bank_buffers:
+        buf.view(torch.uint8).fill_(0xFF)
+
+    # Flag ON (stubbed tier): no prefix copy, but the buffer is still claimed
+    # for the layer (bookkeeping must be unchanged -- fetch_routed_into fills
+    # the routed rows at layer entry).
+    cache._disk_tier = SimpleNamespace(_prefill_pin_source=True)
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    assert cache._prefill_buffer_layer == [0, None]
+    assert cache._prefill_buffer_released == [False, True]
+    for buf in cache.prefill_bank_buffers:
+        assert bool((buf.view(torch.uint8) == 0xFF).all())
+
+    # Flag OFF (default): the pinned prefix [0, ram) IS copied, the tail is
+    # left for the fetch plan. Fresh cache: the first chunk above still holds
+    # buffer 0 (its layer-1 release never happened), so a second begin would
+    # not reset the buffer map.
+    cache = OffloadMoeCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=2 * num_experts,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+    cache.set_bank_sources({"gate_up": gate_up_source, "down": down_source})
+    for buf in cache.prefill_bank_buffers:
+        buf.view(torch.uint8).fill_(0xFF)
+    cache._disk_tier = SimpleNamespace(
+        _prefill_pin_source=False, _ram=1, _remapped=False)
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    assert torch.equal(cache.prefill_bank_buffers[0][0][0],
+                       gate_up_source[0][0])
+    assert torch.equal(cache.prefill_bank_buffers[1][0][0],
+                       down_source[0][0])
+    for buf in cache.prefill_bank_buffers:
+        assert bool((buf[0][1:].reshape(-1).view(torch.uint8) == 0xFF).all())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_begin_prefill_is_idempotent_within_a_chunk(monkeypatch):
     """With FREETOKEN_PREFILL_PREFETCH_EARLY=1 the decoder-layer-entry hook AND the

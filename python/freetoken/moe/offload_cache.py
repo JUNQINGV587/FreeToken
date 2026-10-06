@@ -1465,6 +1465,14 @@ class OffloadMoeCache:
                 out["disk_tier"] = self._disk_tier.stats()
             except Exception:  # noqa: BLE001 -- diagnostics must not break serving
                 pass
+        # 2c fat-GEMM ledger: busy/light expert+route counts per prefill layer call;
+        # all zeros while FREETOKEN_PREFILL_FAT_GEMM is off (the default).
+        try:
+            from freetoken.moe.prefill_fat_gemm import fat_gemm_stats
+
+            out["prefill_fat_gemm"] = fat_gemm_stats()
+        except Exception:  # noqa: BLE001 -- diagnostics must not break serving
+            pass
         return out
 
     def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,

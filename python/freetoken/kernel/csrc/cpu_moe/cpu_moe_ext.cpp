@@ -2147,7 +2147,7 @@ class CpuTierService {
   // Pinned protocol buffers shared with the device kernels (see class comment).
   // ctrl (int64): [0]=layer [1]=bsz [2]=npk [3..6]=spare [7]=seq.
   volatile int64_t* ctrl = nullptr;
-  const bf16_t* hx = nullptr;        // [max_tokens, H] hidden states
+  const uint16_t* hx = nullptr;      // [max_tokens, H] fp16 on the wire (halves PCIe)
   const int32_t* picks = nullptr;    // [max_picks * 3]: token, bank row, weight bits
   float* hout = nullptr;             // [max_tokens, H] fp32 partial sums (we write)
   volatile int64_t* done = nullptr;  // we release seq here; combine spins on it
@@ -2228,7 +2228,7 @@ class CpuTierService {
         swiglu_alpha(static_cast<float>(swiglu_alpha_)),
         swiglu_limit(static_cast<float>(swiglu_limit_)),
         ctrl(reinterpret_cast<volatile int64_t*>(ctrl_ptr)),
-        hx(reinterpret_cast<const bf16_t*>(hx_ptr)),
+        hx(reinterpret_cast<const uint16_t*>(hx_ptr)),
         picks(reinterpret_cast<const int32_t*>(picks_ptr)),
         hout(reinterpret_cast<float*>(hout_ptr)),
         done(reinterpret_cast<volatile int64_t*>(done_ptr)),
@@ -2248,7 +2248,9 @@ class CpuTierService {
     for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
     xe_scratch.assign(static_cast<size_t>(max_tokens) * (H / 2), 0.0f);
     xo_scratch.assign(static_cast<size_t>(max_tokens) * (H / 2), 0.0f);
-    if (fmt == WF_DSFP4) xq_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
+    // bf16 staging for the wire format conversion (both fmts; ds_fp4's FP8
+    // round-trip then runs in place on it).
+    xq_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
     g_scratch.assign(static_cast<size_t>(max_picks) * I, 0);
     ge_scratch.assign(static_cast<size_t>(max_picks) * (I / 2), 0.0f);
     go_scratch.assign(static_cast<size_t>(max_picks) * (I / 2), 0.0f);
@@ -2293,18 +2295,18 @@ class CpuTierService {
   uint64_t host_busy_ns_count() const { return busy_ns.load(); }
   int fatal() const { return fatal_code.load(); }
 
-  // Phase 0: zero this token's hout row; ds_fp4 FP8-round-trips the input (DSV4
-  // act_quant, same reference grid as the executor); deinterleave to fp32 even/odd.
+  // Phase 0: zero this token's hout row; convert the fp16 wire format to bf16
+  // (through f32 -- exact); ds_fp4 FP8-round-trips the input (DSV4 act_quant,
+  // same reference grid as the executor); deinterleave to fp32 even/odd.
   void do_prep(int64_t p) {
     const int tok = static_cast<int>(p);
     float* out = hout + static_cast<size_t>(tok) * H;
     for (int h = 0; h < H; ++h) out[h] = 0.0f;
-    const bf16_t* src = hx + static_cast<size_t>(tok) * H;
-    if (fmt == WF_DSFP4) {
-      bf16_t* xq = xq_scratch.data() + static_cast<size_t>(tok) * H;
-      fp8_roundtrip_bf16(src, xq, H);
-      src = xq;
-    }
+    const uint16_t* src16 = hx + static_cast<size_t>(tok) * H;
+    bf16_t* xb = xq_scratch.data() + static_cast<size_t>(tok) * H;
+    for (int h = 0; h < H; ++h) xb[h] = f32_to_bf16(fp16_to_f32(src16[h]));
+    const bf16_t* src = xb;
+    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(src, xb, H);
     deinterleave_bf16_f32(src, xe_scratch.data() + static_cast<size_t>(tok) * (H / 2),
                           xo_scratch.data() + static_cast<size_t>(tok) * (H / 2), H);
   }

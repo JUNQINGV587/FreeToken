@@ -342,6 +342,12 @@ class OffloadMoELayer(MoELayer):
             # adjacent-layer accuracy measurement that set that default.
             cache._disk_tier.prefetch_from_routing(self.layer_id, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
+        if cache._cpu_tier is not None:
+            # RAM-resident miss tier (dsv41 M2): classify misses BEFORE the
+            # doorbell/fetch -- pinned-bank rows are claimed for CPU compute,
+            # the staged plan shrinks to the fetch remainder.
+            cache._cpu_tier.split(self.layer_id, cache, hidden_states, topk_weights,
+                                  topk_ids)
         cache.copy_missing()
         if (cache.disk_tier_enabled and self.layer_id == 0
                 and os.environ.get("FT_DISK_TIER_VERIFY")
@@ -358,7 +364,7 @@ class OffloadMoELayer(MoELayer):
         if (cache.disk_tier_enabled and self.layer_id == cache.num_layers - 1
                 and os.environ.get("FT_DISK_TIER_TELEMETRY")):
             cache._disk_tier.end_turn()
-        return self._expert_gemm(
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -368,6 +374,9 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if cache._cpu_tier is not None:
+            out = cache._cpu_tier.combine(out)
+        return out
 
     def _decode_owner(
         self,
@@ -405,6 +414,11 @@ class OffloadMoELayer(MoELayer):
             update = owner.ensure_route_graph(self.layer_id, topk_weights, topk_ids)
         else:
             update = owner.ensure_route(self.layer_id, topk_weights, topk_ids)
+        if inner._cpu_tier is not None:
+            # Same three-way classification on the owner-local namespace:
+            # update.slot_ids are local slots, the staged plan lives on inner.
+            inner._cpu_tier.split(self.layer_id, inner, hidden_states, update.weights,
+                                  update.slot_ids)
         owner.copy_missing()
         if (inner.disk_tier_enabled
                 and os.environ.get("FT_DISK_TIER_VERIFY")
@@ -427,6 +441,8 @@ class OffloadMoELayer(MoELayer):
             alphas=owner.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if inner._cpu_tier is not None:
+            out = inner._cpu_tier.combine(out)
         if __debug__ and not owner.graph_safe and update.slot_ids.numel():
             # Guardrail: a slot id outside the local pool would be an unchecked OOB read.
             # Skipped when graph_safe: this read is a device->host sync, illegal in capture.

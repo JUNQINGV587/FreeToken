@@ -892,6 +892,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-cpu-tier",
+        action="store_true",
+        default=ServerArgs.moe_cpu_tier,
+        help=(
+            "RAM-resident miss tier (dsv41 M2): with --moe-disk-tier on, decode "
+            "misses that hit a RAM-pinned bank row are computed on the CPU from "
+            "that pinned row instead of being fetched over PCIe/NVMe -- only the "
+            "token's hidden state and the H-sized partial cross PCIe. Off keeps "
+            "the fetch path byte-identical."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,

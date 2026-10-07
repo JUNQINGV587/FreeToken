@@ -14,8 +14,9 @@ Covered:
   * admission self-sourcing: real per-expert counts drive a swap (G1: the
     policy no longer idles on miss_counts=None), free no-op between
     evaluations, zero-miss fallback without a tier, explicit counts bypass
-  * honesty bit: guard/admission summaries carry wired:false until the GPU
-    battery (review item #12) flips it
+  * honesty bit: guard/admission summaries carry wired:true since the GPU
+    battery (review item #12) landed the engine hooks; the flag still
+    tracks the module constant
 """
 
 from __future__ import annotations
@@ -178,7 +179,7 @@ def test_admission_self_sources_real_counts_and_swaps(monkeypatch):
     assert tier.calls == 1
     snap = cache.stats_snapshot()
     assert snap["admission"]["swaps"] == 1
-    assert snap["admission"]["wired"] is False
+    assert snap["admission"]["wired"] is True  # battery #12 wired the hooks
     # with miss_counts=None (the pre-G1 wiring) the misses decayed to zero and
     # this swap could never fire -- the policy idled. Real per-expert misses
     # from the split kernel end that.
@@ -227,9 +228,10 @@ def test_admission_env_off_update_no_counts_is_empty(monkeypatch):
 def test_summaries_carry_the_wired_honesty_bit(monkeypatch):
     g = ca.ElasticCacheGuard(L, E, SLOTS, BORROWED)
     a = ca.OnlineAdmission(L, E)
-    assert g.summary()["wired"] is False
-    assert a.summary()["wired"] is False
-    # the battery-#12 commit flips the module constant; summaries follow
-    monkeypatch.setattr(ca, "WIRED", True)
+    # WIRED flipped True in the battery-#12 commit (engine hooks landed)
     assert g.summary()["wired"] is True
     assert a.summary()["wired"] is True
+    # the summaries track the module constant either way
+    monkeypatch.setattr(ca, "WIRED", False)
+    assert g.summary()["wired"] is False
+    assert a.summary()["wired"] is False

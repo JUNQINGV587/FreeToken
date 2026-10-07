@@ -116,7 +116,7 @@ def _serve(bufs, layer: int, bsz: int, npk: int, seq: int) -> None:
     ctrl[0] = layer
     ctrl[1] = bsz
     ctrl[2] = npk
-    ctrl[_SEQ_OFF] = seq
+    ctrl[int(_SEQ_OFF)] = seq
 
 
 def _wait_done(bufs, seq: int, timeout_s: float = 10.0) -> bool:

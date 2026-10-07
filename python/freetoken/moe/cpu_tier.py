@@ -725,6 +725,10 @@ class CpuTier:
         if svc is not None:
             svc.shutdown()
 
+    # engine.shutdown() calls tier.stop(); keep the alias so teardown with
+    # --moe-cpu-tier on does not AttributeError after the workers are gone.
+    stop = shutdown
+
     # ------------------------------------------------------------------
     # observability (dsv41 ct_vllm.py:436-443 field contract)
     # ------------------------------------------------------------------

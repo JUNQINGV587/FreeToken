@@ -318,19 +318,25 @@ def iter_expert_pieces(
 # ``input_scale`` (F32) is ignored — ``activation_scheme: dynamic`` recomputes the
 # activation scale at runtime, and the V4.1 production checkpoint carries the same
 # tensor and ignores it too. With 43 MoE layers and no dense prefix the bank id is the
-# layer id itself.
-_NVFP4_EXPERT_KEY_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts\.")
-_NVFP4_KIND_MAP = {"weight": "weight", "weight_scale": "weight_scale", "weight_scale_2": "weight_scale_2"}
+# layer id itself; the MTP experts are out of scope here. The names are hardcoded rather
+# than read off the process quant config for the same reason as V4.1: the top-level
+# ``quantization_config`` declares ``quant_method=fp8`` (the dense dialect claims it)
+# while only the expert containers are NVFP4.
+_EXPERT_KEY_RE_NVFP4 = (
+    r"^layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>w1|w2|w3)\.(?P<kind>{kinds})$"
+)
 
 
-def nvfp4_expert_spec(config) -> Nvfp4ExpertSourceSpec | None:
-    """NVFP4 expert layout for ``nvidia/DeepSeek-V4-Flash-0731-NVFP4``."""
+def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
+    """The per-expert NVFP4 layout: ``layers.N.ffn.experts.E.{w1,w2,w3}.{kind}``."""
+    kind_map = {"weight": "weight", "weight_scale": "weight_scale", "weight_scale_2": "weight_scale_2"}
     return Nvfp4ExpertSourceSpec(
-        key_pattern=_NVFP4_EXPERT_KEY_RE,
-        proj_to_role={"w1": "gate", "w2": "down", "w3": "up"},
-        layer_to_bank=lambda layer, config: layer,
+        key_pattern=re.compile(_EXPERT_KEY_RE_NVFP4.format(kinds="|".join(map(re.escape, kind_map)))),
+        proj_to_role=dict(_PROJ_ROLE),
+        layer_to_bank=lambda layer, config: layer,  # every backbone layer is MoE
         desc="DeepSeek-V4-Flash-0731 NVFP4 experts (modelopt)",
-        kind_map=_NVFP4_KIND_MAP,
+        kind_map=kind_map,
         global_reciprocal=False,
     )
 

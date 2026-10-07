@@ -1084,6 +1084,12 @@ def _bare_tier() -> DiskTier:
     t._db_host_us = 1500
     t._db_timeouts = 0
     t._db_row_bytes = 8192
+    # ②a prefill data-source split fields, defaults == OFF mode.
+    t._prefill_pin_source = False
+    t._pf_pin_rows = 0
+    t._pf_pin_bytes = 0
+    t._pf_disk_rows = 0
+    t._pf_disk_bytes = 0
     return t
 
 

@@ -86,12 +86,15 @@ import triton.language as tl
 from freetoken.kernel.pinned import alloc_pinned_tensor
 
 _CTRL_LEN = 8
-_SEQ_OFF = 7  # LAST field of the block: the D2H memcpy lands it last
-_DFLAG_WAIT_NS = 1
-_DFLAG_TIMEOUTS = 2
-_SPIN_NS_PER_ITER = 5.0  # rough per-iteration cost of the combine spin loop
+# Kernel-body references must be tl.constexpr instances: Triton rejects plain
+# module globals inside @triton.jit (NameError at compile). Host-side uses keep
+# working -- tl.constexpr supports int() and tensor indexing.
+_SEQ_OFF = tl.constexpr(7)  # LAST field of the block: the D2H memcpy lands it last
+_DFLAG_WAIT_NS = tl.constexpr(1)
+_DFLAG_TIMEOUTS = tl.constexpr(2)
+_SPIN_NS_PER_ITER = tl.constexpr(5.0)  # rough per-iteration cost of the combine spin loop
 _DEFAULT_TIMEOUT_NS = 300_000_000
-_BIG = 2**30
+_BIG = tl.constexpr(2**30)
 
 # dsv41 cost-model semantics, verbatim (ct_vllm.py):
 #   gpu(k) = THIT*(nh+nm-k) + TZC*(nm-k)         ms, k miss experts moved to CPU
@@ -116,7 +119,10 @@ def _env_cost() -> dict[str, float]:
     return out
 
 
-@triton.jit
+# do_not_specialize: Triton folds int args == 1 into constexpr at compile
+# time, and the kernel body calls .to() on layer_id/bsz -- layer 1 and
+# single-request decode (bsz=1) are the common production cases.
+@triton.jit(do_not_specialize=["layer_id", "bsz"])
 def _ct_split_kernel(
     slots_ptr,  # [bsz*K] int, in/out: claimed entries point at slot 0
     weights_ptr,  # [bsz*K] fp32, in/out: claimed entries become 0
@@ -616,7 +622,7 @@ class CpuTier:
         bsz = int(out.shape[0])
         if bsz > self._max_tokens:
             return out
-        timeout_iters = int(self._timeout_ns // _SPIN_NS_PER_ITER) if self._timeout_ns > 0 else 0
+        timeout_iters = int(self._timeout_ns // float(_SPIN_NS_PER_ITER.value)) if self._timeout_ns > 0 else 0
         _ct_combine_kernel[(1,)](
             out,
             self._hout,
@@ -743,8 +749,8 @@ class CpuTier:
         misses = int(dev[:, 1].sum().item())
         picks = int(dev[:, 2].sum().item())
         calls = int(dev[:, 3].sum().item())
-        wait_ns = int(self._dflag[_DFLAG_WAIT_NS].item())
-        timeouts = int(self._dflag[_DFLAG_TIMEOUTS].item())
+        wait_ns = int(self._dflag[_DFLAG_WAIT_NS.value].item())
+        timeouts = int(self._dflag[_DFLAG_TIMEOUTS.value].item())
         routed = int(self._route_counts_dev.sum().item())
         missed_entries = int(self._miss_counts_dev.sum().item())
         total = hits + misses

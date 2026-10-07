@@ -105,7 +105,7 @@ _CTRL_LEN = 8
 _SEQ_OFF = tl.constexpr(7)  # LAST field of the block: the D2H memcpy lands it last
 # ctrl[3]: claimed-EXPERT count of the pre-ensure path (ctrl[2] counts PICKS;
 # the combine needs the expert count to restore the slot-0 sentinels). The
-# legacy kernel never writes it, so it stays 0 there (zeroed at attach).
+# legacy kernel publishes 0 here defensively on every job.
 _CTRL_NCLAIMED = tl.constexpr(3)
 _DFLAG_WAIT_NS = tl.constexpr(1)
 _DFLAG_TIMEOUTS = tl.constexpr(2)
@@ -363,6 +363,10 @@ def _ct_split_kernel(
     tl.store(ctrl_dev_ptr + 0, layer_id.to(tl.int64))
     tl.store(ctrl_dev_ptr + 1, bsz.to(tl.int64))
     tl.store(ctrl_dev_ptr + 2, w_out.to(tl.int64))
+    # Defensive: the combine's sentinel restore keys on ctrl[3]; publish 0
+    # explicitly instead of relying on the attach-time zeroing surviving
+    # every job (the implicit never-mix-split_pre invariant, now load-free).
+    tl.store(ctrl_dev_ptr + _CTRL_NCLAIMED, layer_id.to(tl.int64) * 0)
     seq = tl.load(seqc_ptr, volatile=True)
     if w_out > 0:
         seq = seq + 1
@@ -599,8 +603,8 @@ def _ct_combine_kernel(
     # (slot_for_id[e] = 0 made claimed experts pseudo-hits so lru_ensure
     # staged no eviction/fetch for them). Stream-ordered after this layer's
     # ensure and GEMM; the next reader is next step's ensure for this layer.
-    # nclaimed == 0 on the legacy path (ctrl[3] zero-initialised, never
-    # written by the legacy split kernel), so this loop is a no-op there.
+    # nclaimed == 0 on the legacy path (the legacy split kernel publishes
+    # ctrl[3]=0 on every job), so this loop is a no-op there.
     ncl = tl.load(ctrl_dev_ptr + _CTRL_NCLAIMED)
     for j in range(0, ncl):
         e = tl.load(claimed_ptr + j)

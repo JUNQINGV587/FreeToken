@@ -1358,6 +1358,12 @@ class DiskTier:
                     rm = self._row_map_cpu[layer]
                     rm[out_e] = r_in
                     rm[in_e] = r_out
+                    # Keep the tolist mirror feeding build_prefetch_plan in
+                    # step with the hot swap, or ②b keeps prefetching rows
+                    # that just moved to disk and skips the new residents.
+                    lst = self._row_map_list[layer]
+                    lst[out_e] = r_in
+                    lst[in_e] = r_out
                     applied.append(((layer, out_e), (layer, in_e)))
                 if applied:
                     self._rebuild_pin_maps()
@@ -1765,8 +1771,22 @@ class DiskTier:
                                for e in hits}
             if hits:
                 self._bk_hits += len(hits)
-                for e, entry in hit_entries.items():
-                    self._stash_to_buffer(entry, layer_id, e, buffers, buffer_id)
+                try:
+                    for e, entry in hit_entries.items():
+                        self._stash_to_buffer(entry, layer_id, e, buffers,
+                                              buffer_id)
+                except Exception:
+                    # A failed block read raises out of _stash_to_buffer
+                    # before its slab enqueues any H2D, but earlier hits'
+                    # copies may still be in flight: drain, then drop every
+                    # popped reference so no slab leaks out of the pool.
+                    self._sync_fetches()
+                    for entry in hit_entries.values():
+                        try:
+                            self._bulk_recycle_rec(entry["rec"])
+                        except Exception:
+                            pass  # the original failure is re-raised below
+                    raise
                 disk = torch.tensor(
                     [e for e in disk.tolist() if e not in hit_entries],
                     dtype=disk.dtype, device=disk.device)
@@ -2134,9 +2154,15 @@ class DiskTier:
             rec["refs"] -= 1
             if rec["refs"] > 0:
                 return
-        rec["future"].result()
-        with self._bulk_lock:
-            self._bulk_slab_free.append(rec["slab"])
+        try:
+            rec["future"].result()
+        finally:
+            # A failed block read (e.g. the slab-overflow raise) must not
+            # strand the slab: the pool would silently drain to zero and the
+            # prefetch degrades to never issuing again. The read error still
+            # propagates -- only the leak is fixed.
+            with self._bulk_lock:
+                self._bulk_slab_free.append(rec["slab"])
 
     def _bulk_advance(self, layer_id: int) -> None:
         """Rolling ②b trigger, called at the END of fetch_routed_into for layer

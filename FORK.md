@@ -454,3 +454,54 @@ suites green on their branches; GPU validation is the deferred battery
   policy as a working one. CPU tests cover release scope/gates, admission
   boundaries (strict threshold, hysteresis, batch cap, period, decay) and the
   self-sourced counter feed.
+
+## Port2-branch entries (2026-10-07, merged into sm89-moe-offload)
+
+Entries for the three `port2/*` branches, kept in their own tail section for
+the same union-append reason as the batch above. Validation status for all
+three: CPU suites green (`research/notes/engines/20261007-port2-branches-review.md`;
+349 passed / 9 pre-existing environment failures on the merge tip); every GPU
+item is deferred to the combined battery (§G of that review) -- do not enable
+any flag before it.
+
+- `feat(moe)`: **CPU tier rescue -- pre-ensure claim + reuse filter** (`559d95330e`,
+  `3b35fe8aa6`, `1403201bb0`, `port2/cpu-tier-rescue`) — regression rescue for
+  the decode collapse (2.23 t/s vs the >=8 target): a `split_pre` kernel claims
+  CPU-ok experts BEFORE `ensure_experts` (slot-0 sentinel protocol kills the
+  eviction churn), a reuse-score filter keeps one-shot misses on the PCIe
+  path, and `gpu_wait_ms` is measured with `%globaltimer` instead of the ~300x
+  off cross-step clock. Switches (all default off = byte-identical legacy
+  split): `FREETOKEN_CT_PRE_ENSURE` (0), `FREETOKEN_CT_REUSE_MIN` (-1 = no
+  filter), `FREETOKEN_CT_XSTEP_W` (1.0 = neutral weight). Note for the A/B
+  battery: the B9 ghost-pick fix changes the pick PUBLICATION order to pure
+  routed order, so the C++ fp32 accumulation order over multi-pick tokens
+  changes -- output is exact-arithmetic equivalent but NOT bitwise identical;
+  compare with rel-RMS / `torch.allclose`, never `torch.equal`. 28 CPU tests
+  on branch (incl. TRITON_INTERPRET kernel twins); sanitizer + decode wins
+  defer to the battery.
+- `feat(moe)`: **learned block bulk prefetch for cold prefill** (`5efd1173d7`,
+  `e0c9fd93e3`, `port2/bulk-prefetch`) — cold prefill leaves the disk idle in
+  the GEMM/attention windows (~6.4% honest ceiling); a learned per-layer
+  expert score distribution (never an identity predictor) is rolled into
+  top-k candidates per layer, chunked into cross-expert read blocks, and read
+  into refcounted pinned slabs behind the running GEMM. Switches (master
+  default 0 = off = byte-identical; no prediction file or DS-FP4 convert mode
+  force it off with a log line): `FREETOKEN_PREFILL_BULK_PREFETCH` (0),
+  `FREETOKEN_PREFILL_BULK_PREDICT` (unset = disabled),
+  `FREETOKEN_PREFILL_BULK_DEPTH` (8), `FREETOKEN_PREFILL_BULK_TOPK` (32),
+  `FREETOKEN_PREFILL_BULK_MIN_FRAC` (0), `FREETOKEN_PREFILL_BULK_BLOCK` (4),
+  `FREETOKEN_PREFILL_BULK_SLABS` (4), `FREETOKEN_PREFILL_BULK_WORKERS` (2).
+  22 new CPU cases on branch; cold24k TIMELINE-gap win defers to the battery.
+- `feat(moe)`: **admission apply -- hot-swap RAM rows in place** (`75a4d00c1e`,
+  `becc0b8962`, `port2/admission-apply`) — wires the online-admission skeleton
+  to a real apply: each evaluation's swap plan reads the challenger row from
+  disk (prepare, per-pair failure keeps the old layout), drains the device
+  once, then memcpys into the incumbent's bank row and trades the two rows'
+  slots in the pin maps in place (captured graphs baked the pointers, so
+  rebinding is never used; GPU slot contents stay valid because weights are
+  immutable). Switches (both default off = evaluation-only skeleton,
+  byte-identical cache behavior): `FREETOKEN_ADMISSION_APPLY` (0),
+  `FREETOKEN_ADMISSION_WARMUP_STEPS` (64; warmup steps evaluate but never
+  commit, counted as skips). 8 new CPU tests on branch (row content,
+  failure rollback, warmup gate); APPLY-on cache1100 A/B and the graph-replay
+  race check defer to the battery.

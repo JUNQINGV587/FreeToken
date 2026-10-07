@@ -1071,6 +1071,33 @@ def test_apply_pin_swaps_disk_read_failure_keeps_old_row(checkpoint, monkeypatch
     assert s["apply_io_bytes"] == 0
 
 
+def test_apply_pin_swaps_updates_bulk_plan_snapshot(checkpoint):
+    """F1 regression (2b x 3): _row_map_list is the construction-time tolist
+    mirror feeding build_prefetch_plan. A hot swap must flip its two rows in
+    the mirror too, or the plan keeps excluding the demoted expert (lost
+    prefetch) and prefetching the newly-pinned one (wasted disk read)."""
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2, pin_rows=[[1, 3], [0, 2]])
+    _fill_pin_rows(cache, [[1, 3], [0, 2]])
+    assert tier._row_map_list[0] == [2, 0, 3, 1]
+
+    report = tier.apply_pin_swaps([((0, 1), (0, 2))])
+
+    assert report["applied"] == [((0, 1), (0, 2))]
+    # The mirror follows the flip: expert 2 pinned (row 0), expert 1 demoted.
+    assert tier._row_map_list[0] == [2, 3, 0, 1]
+    assert tier._row_map_list[1] == [0, 2, 1, 3]
+    # The plan's pin exclusion now follows the NEW layout: layer 0's plan
+    # covers the disk-resident {0,1} and not the newly-pinned expert 2.
+    from freetoken.moe.prefetch_plan import build_prefetch_plan
+    plan = build_prefetch_plan(
+        [{0: 5.0, 1: 1.0, 2: 4.0, 3: 2.0},
+         {0: 5.0, 1: 1.0, 2: 4.0, 3: 2.0}],
+        tier._row_map_list, tier._ram, start_layer=-1, depth=2, top_k=8)
+    assert plan[0] == [0, 1]  # pre-fix stale mirror gave [0, 2]
+    assert plan[1] == [3, 1]  # layer 1 untouched: pins {0,2} excluded
+
+
 class _SegIndex:
     """Handcrafted segment layouts for _row_groups merge-math tests."""
     scalar_banks = (2, 5)
@@ -1543,6 +1570,75 @@ def test_bulk_prefetch_wasted_recycles_the_block_slab(
     assert tier.fetch_routed_into(cache, 1, torch.tensor([0, 1]), 1) == 0
     assert tier._bk_hits == 0
     assert tier._bk_wasted == 2
+    assert len(tier._bulk_stash) == 0
+    assert len(tier._bulk_slab_free) == 1
+
+
+def test_bulk_prefetch_failed_block_read_still_returns_the_slab(
+        checkpoint, monkeypatch, tmp_path):
+    """F5 regression (2b): a block read that raises in the pool thread (here
+    an injected EIO) must not strand its slab -- the refcounted recycle frees
+    it back to the pool even though the read error itself stays loud."""
+    pred = _bulk_prediction(tmp_path, [[0.0] * 4, [0.0, 0.0, 1.0, 0.9]])
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREFETCH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREDICT", pred)
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_DEPTH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_BLOCK", "2")
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)
+    _fill_pinned_host_rows(cache, [[0, 1], [0, 1]])
+    _prefill_buffers(cache)
+
+    def _boom(fd, bufs, off):
+        raise OSError(5, "injected EIO")
+
+    monkeypatch.setattr("os.preadv", _boom)
+    # Layer 0 routes only the pinned experts: no demand read (which would
+    # also hit preadv), and _bulk_advance still issues the layer-1 block.
+    assert tier.fetch_routed_into(cache, 0, torch.tensor([0, 1]), 0) == 0
+    assert tier._bk_issued == 2
+    for rec in {id(e["rec"]): e["rec"] for e in tier._bulk_stash.values()}.values():
+        with pytest.raises(OSError):
+            rec["future"].result()  # wait for the failed block read
+    # Layer 1 again routes only pins: the stale recycle of the failed block
+    # raises (loud) but the slab still returns to the free pool.
+    with pytest.raises(OSError):
+        tier.fetch_routed_into(cache, 1, torch.tensor([0, 1]), 1)
+    assert tier._bk_wasted == 2
+    assert len(tier._bulk_stash) == 0
+    assert len(tier._bulk_slab_free) == 1
+
+
+def test_bulk_prefetch_failed_block_hit_path_recycles_popped_entries(
+        checkpoint, monkeypatch, tmp_path):
+    """F5 regression, hit path: _stash_to_buffer re-raises the block read
+    error; the entries already popped from the stash must still be drained
+    and recycled so their slab is not lost before the error propagates."""
+    pred = _bulk_prediction(tmp_path, [[0.0] * 4, [0.0, 0.0, 1.0, 0.9]])
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREFETCH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREDICT", pred)
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_DEPTH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_BLOCK", "2")
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)
+    _fill_pinned_host_rows(cache, [[0, 1], [0, 1]])
+    _prefill_buffers(cache)
+
+    def _boom(fd, bufs, off):
+        raise OSError(5, "injected EIO")
+
+    monkeypatch.setattr("os.preadv", _boom)
+    # Layer 0 routes only the pinned experts (no demand read); the layer-1
+    # block is issued behind it and fails in the pool thread.
+    assert tier.fetch_routed_into(cache, 0, torch.tensor([0, 1]), 0) == 0
+    assert tier._bk_issued == 2
+    for rec in {id(e["rec"]): e["rec"] for e in tier._bulk_stash.values()}.values():
+        with pytest.raises(OSError):
+            rec["future"].result()  # wait for the failed block read
+    # Layer 1 routes the prefetched experts: the hit path pops them, the
+    # failed read raises out of _stash_to_buffer, and the recycle still runs.
+    with pytest.raises(OSError):
+        tier.fetch_routed_into(cache, 1, torch.tensor([0, 1, 2, 3]), 1)
     assert len(tier._bulk_stash) == 0
     assert len(tier._bulk_slab_free) == 1
 

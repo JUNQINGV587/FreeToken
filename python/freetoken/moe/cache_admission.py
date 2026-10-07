@@ -212,15 +212,22 @@ class OnlineAdmission:
     def note_step(self) -> None:
         self._since_eval += 1
 
+    @property
+    def evaluation_due(self) -> bool:
+        """True once ``period`` decode steps elapsed since the last evaluation."""
+        return self._since_eval >= self.config.period
+
     def update(self, route_counts, miss_counts=None) -> list[tuple[tuple[int, int], tuple[int, int]]]:
         """Fold one cycle's per-row counts in; evaluate when the period elapses.
 
         ``route_counts``/``miss_counts``: [L, E] per-row routed entries / misses
-        since the last update. ``miss_counts=None`` means "no per-row miss
-        signal yet" (item 1's stats_dev[L,16] per-layer counters are the wiring
-        source once they grow per-expert columns); the conservative reading is
-        zero misses, so no pin row crosses the threshold and the layout stays
-        put. Returns the applied swaps as [((layer, out_e), (layer, in_e)), ...].
+        since the last update. The wiring source is the cpu tier split kernel's
+        [L,E] per-expert counters (moe/cpu_tier.py, port/m4-perexpert-counts);
+        offload_cache.admission_update() pulls their deltas when called without
+        explicit counts. ``miss_counts=None`` remains the conservative fallback
+        (no miss signal: zero misses, so no pin row crosses the threshold and
+        the layout stays put). Returns the applied swaps as
+        [((layer, out_e), (layer, in_e)), ...].
         """
         counts = torch.as_tensor(route_counts, dtype=torch.float64)
         assert counts.shape == (self.num_layers, self.num_experts), counts.shape

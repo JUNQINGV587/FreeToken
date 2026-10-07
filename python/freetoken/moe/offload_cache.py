@@ -389,6 +389,11 @@ class OffloadMoeCache:
             self._admission = _cache_admission.OnlineAdmission(
                 num_layers=self.num_layers, num_experts=self.num_experts
             )
+            if _cache_admission.ADMISSION_APPLY:
+                # APPLY mode: evaluation returns the plan only; membership
+                # moves when the disk tier has physically hot-swapped the row
+                # (apply_admission_swaps -> commit_swaps).
+                self._admission.defer_commit = True
 
     # ------------------------------------------------------------------
     # item 5 (dsv41 port): elastic release/rewarm + online admission hooks.
@@ -449,6 +454,39 @@ class OffloadMoeCache:
             else:
                 route_counts = torch.zeros(self.num_layers, self.num_experts)
         return self._admission.update(route_counts, miss_counts)
+
+    def apply_admission_swaps(self, swaps) -> dict | None:
+        """RAM-row hot-swap apply for one admission evaluation's swap plan
+        (FREETOKEN_ADMISSION_APPLY; design:
+        /data/research/notes/engines/20261007-admission-apply-design.md).
+
+        Policy/apply split mirroring apply_elastic_release/rewarm: the
+        admission policy proposes pairs, this method runs the physical apply
+        on the disk tier between decode steps (the engine's step hook call
+        site is the fence; the tier drains the device before host-side bank
+        writes) and commits the applied pairs back into the policy. Env off,
+        no admission, no disk tier (all-RAM cache: nothing to swap) or the
+        warmup gate closed -> no-op. Returns the tier's apply report, or None
+        when nothing ran.
+        """
+        admission = self._admission
+        tier = self._disk_tier
+        if (admission is None or tier is None or not swaps
+                or not _cache_admission.ADMISSION_APPLY):
+            return None
+        if not admission.apply_warmup_done:
+            # Counts not yet stable: skip the physical apply entirely; the
+            # pairs are re-proposed by a later evaluation.
+            admission.apply_warmup_skips += len(swaps)
+            return None
+        report = tier.apply_pin_swaps(swaps)
+        applied = report["applied"]
+        if applied:
+            admission.commit_swaps(applied)
+            if self._elastic_guard is not None:
+                # The release freeze set follows the new pin layout.
+                self._elastic_guard.set_pin_rows(admission.pin_rows)
+        return report
 
     def apply_elastic_release(self, slots: list[int]) -> None:
         """Item 5 CUDA apply: invalidate the released slots + return allocator slack.

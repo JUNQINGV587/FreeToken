@@ -31,6 +31,7 @@ import json
 import os
 import struct
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -656,6 +657,11 @@ class DiskTier:
         self._fetches = 0
         self._fetch_bytes = 0
         self._preadv_calls = 0
+        # Admission hot-swap apply side profile (20261007, FREETOKEN_ADMISSION_APPLY).
+        self._apply_swaps = 0
+        self._apply_failures = 0
+        self._apply_io_bytes = 0
+        self._apply_host_ns = 0
         # Doorbell (graph_fetch) telemetry: the doorbell path never touches
         # _fetches/_fetch_bytes (those are eager-only), so decode fetch volume
         # was a blind spot (W22). The bridge reports each served request here.
@@ -997,7 +1003,12 @@ class DiskTier:
 
     def _fetch_expert_inner(self, layer: int, expert: int, slot: int,
                             dst_buffers: list | None = None,
-                            buffer_id: int = 0) -> None:
+                            buffer_id: int = 0,
+                            dst_rows: list | None = None) -> None:
+        # ``dst_rows`` (admission hot-swap apply): explicit per-bank destination
+        # rows (host temporaries) instead of the GPU slot / prefill buffer. The
+        # fetch/miss accounting then belongs to the caller (apply_pin_swaps),
+        # so the ``_fetches``/``_fetch_bytes`` bumps are skipped.
         ring = self._staging_ring()
         ri = getattr(self._staging, "ri", 0)
         scalar_banks = getattr(self._index, "scalar_banks", ())
@@ -1008,7 +1019,9 @@ class DiskTier:
             # the v41 layout; identical bytes, see _row_groups).
             rows = {}
             for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
-                if dst_buffers is None:
+                if dst_rows is not None:
+                    row = dst_rows[bank_idx]
+                elif dst_buffers is None:
                     row = gpu_cache[slot]
                 else:
                     row = dst_buffers[bank_idx][buffer_id][expert]
@@ -1040,11 +1053,14 @@ class DiskTier:
                 if ev is not None:
                     ev.record()
             self._staging.ri = ri
-            self._fetches += 1
-            self._fetch_bytes += sum(self._row_bytes)
+            if dst_rows is None:
+                self._fetches += 1
+                self._fetch_bytes += sum(self._row_bytes)
             return
         for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
-            if dst_buffers is None:
+            if dst_rows is not None:
+                row = dst_rows[bank_idx]
+            elif dst_buffers is None:
                 row = gpu_cache[slot]
             else:
                 # Overlap prefill: write directly into the borrowed buffer row
@@ -1090,6 +1106,8 @@ class DiskTier:
                     # Arm: the next reuse of this buffer waits for this copy.
                     ev.record()
         self._staging.ri = ri
+        if dst_rows is not None:
+            return
         self._fetches += 1
         # Conversion mode reports the NVMe-side bytes actually read (the NVFP4
         # extents incl. the dropped odd scale columns); the native path keeps the
@@ -1148,6 +1166,116 @@ class DiskTier:
             dst.copy_(torch.from_numpy(conv).view(dst.dtype).view(dst.shape))
             disk_bytes += nbytes
         return ri, disk_bytes
+
+    def _rebuild_pin_maps(self) -> None:
+        """Re-derive the pin-layout inverse maps after ``_row_map_cpu`` flips and
+        push every consumer-visible tensor IN PLACE.
+
+        graph_fetch baked the ``_row_map_dev`` layer pointers at CUDA-graph
+        capture and the cpu tier ALIASES ``_row_map_dev`` (cpu_tier.py), so a
+        rebind would strand those consumers on the old layout -- only in-place
+        ``copy_`` keeps the hot-swap visible to captured graphs, the split
+        kernel, the prefill remapped scatter and the eager fetch paths.
+        """
+        num_layers = self._row_map_cpu.shape[0]
+        inv = torch.empty_like(self._row_map_cpu)
+        inv.scatter_(1, self._row_map_cpu.long(),
+                     torch.arange(self._local_num, dtype=torch.int32).expand(num_layers, -1))
+        self._ids_by_row_cpu.copy_(inv)
+        self._pin_ids_cpu.copy_(inv[:, :self._ram])
+        self._remapped = bool(
+            (self._row_map_cpu != torch.arange(self._local_num, dtype=torch.int32))
+            .any().item())
+        self._row_map_dev.copy_(self._row_map_cpu)
+        self._pin_ids_dev.copy_(self._pin_ids_cpu)
+        self._pin_ids_dev_i64.copy_(self._pin_ids_dev)
+        self._nonpin_dev.copy_(self._ids_by_row_cpu[:, self._ram:].long())
+
+    def _drain_for_apply(self) -> None:
+        """Step-boundary fence for the admission row hot-swap: drain every CUDA
+        stream before host-side bank-row writes. Queued prefill ring copies
+        (pin-row H2D + remapped scatter) and the async cpu-tier service read
+        host bank rows / device maps without stream-ordering against the engine
+        thread's host writes, and the host can run ~1 batch ahead of the GPU;
+        one device sync per apply cycle closes both races (design doc §3).
+        Keyed on the bank device like _sync_fetches: CPU-bank unit tests have
+        nothing to drain."""
+        device = self._banks[0][1].device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def apply_pin_swaps(self, swaps) -> dict:
+        """RAM-row hot-swap apply for one admission evaluation's swap plan.
+
+        ``swaps``: [((layer, out_e), (layer, in_e)), ...] from
+        OnlineAdmission._evaluate. Per pair: PREPARE reads the challenger
+        (in_e) checkpoint row into temporary host rows with the normal fetch
+        machinery -- a preadv failure aborts JUST that pair with the layout
+        untouched (counted, old row kept); COMMIT (after ONE device drain for
+        the whole call) memcpys the temporaries into host bank row r_out and
+        trades the two rows' slots in the pin maps. Every other row's bank
+        slot stays put: the whole apply costs one row of disk IO per pair and
+        no other data movement. Weights are immutable, so GPU slot contents,
+        the cpu-tier base-pointer tables and captured graphs stay valid.
+
+        Returns {"applied": [pairs physically swapped], "failed": int,
+        "io_bytes": int, "host_us": int} -- the cache commits ``applied`` back
+        into the admission membership; failed/skipped pairs are re-proposed by
+        a later evaluation if their signals persist.
+        """
+        t0 = time.perf_counter_ns()
+        applied: list = []
+        failed = 0
+        with torch.inference_mode():
+            prepared: list[tuple[int, int, int, int, list]] = []
+            for (layer, out_e), (layer2, in_e) in swaps:
+                assert layer == layer2
+                r_out = int(self._row_map_cpu[layer][out_e])
+                r_in = int(self._row_map_cpu[layer][in_e])
+                if not (r_out < self._ram <= r_in):
+                    continue  # stale plan (layout moved on); never corrupt maps
+                temps = [torch.empty_like(host_layer[layer][r_out])
+                         for host_layer, _gpu in self._banks]
+                try:
+                    self._fetch_expert_inner(layer, in_e, 0, dst_rows=temps)
+                except Exception:
+                    # Disk read failed: nothing committed, old layout intact.
+                    failed += 1
+                    continue
+                prepared.append((layer, out_e, in_e, r_out, r_in, temps))
+            if prepared:
+                self._drain_for_apply()
+                for layer, out_e, in_e, r_out, r_in, temps in prepared:
+                    try:
+                        for bank_idx, (host_layer, _gpu) in enumerate(self._banks):
+                            host_layer[layer][r_out].copy_(temps[bank_idx])
+                    except Exception:
+                        # Maps not yet flipped for this pair, but r_out may be
+                        # torn: restore the incumbent's row from disk. If even
+                        # the restore fails, die loudly rather than serve a
+                        # corrupt RAM row (the engine health check will trip).
+                        self._fetch_expert_inner(
+                            layer, out_e, 0,
+                            dst_rows=[host_layer[layer][r_out]
+                                      for host_layer, _gpu in self._banks])
+                        failed += 1
+                        continue
+                    rm = self._row_map_cpu[layer]
+                    rm[out_e] = r_in
+                    rm[in_e] = r_out
+                    applied.append(((layer, out_e), (layer, in_e)))
+                if applied:
+                    self._rebuild_pin_maps()
+        self._apply_swaps += len(applied)
+        self._apply_failures += failed
+        self._apply_io_bytes += len(applied) * self._db_row_bytes
+        self._apply_host_ns += time.perf_counter_ns() - t0
+        return {
+            "applied": applied,
+            "failed": failed,
+            "io_bytes": len(applied) * self._db_row_bytes,
+            "host_us": (time.perf_counter_ns() - t0) // 1000,
+        }
 
     def _sync_fetches(self) -> None:
         """Wait for the pool threads' async H2D copies to land.
@@ -2003,6 +2131,11 @@ class DiskTier:
             "doorbell_bytes": self._db_bytes,
             "doorbell_host_ms": self._db_host_us / 1000.0,
             "doorbell_timeouts": self._db_timeouts,
+            # Admission RAM-row hot-swap apply (FREETOKEN_ADMISSION_APPLY).
+            "apply_swaps": self._apply_swaps,
+            "apply_failures": self._apply_failures,
+            "apply_io_bytes": self._apply_io_bytes,
+            "apply_host_ms": self._apply_host_ns / 1e6,
         }
         bridge = getattr(self, "_graph_bridge", None)
         if bridge is not None:

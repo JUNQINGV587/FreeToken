@@ -97,6 +97,30 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   still arrives exactly once (hit -> gather, miss -> copy run), which is what the GPU test checks; the flag is
   read at cache construction so a test can flip it.
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
+- `feat(moe)`: **graph-doorbell fetch hardening — observability + loud failure, default-on**
+  (`f9947feb60`/`915beb65ff`) — the disk-fetch bridge inside CUDA graphs gets the
+  dsv41-caliber telemetry and the cpu_executor-style health contract. (1) The spin
+  kernel times itself with `%globaltimer` into a device stats word, mirrored to
+  pinned host memory by one captured D2H node per replay, so `/v1/stats`'s
+  `disk_tier` block carries `doorbell_spins` / `doorbell_wait_ms` /
+  `doorbell_wait_ms_peak` (GPU-side wait, the dsv41 `gpu_wait_ms` caliber) next to
+  the W22 host-side `doorbell_requests/rows/bytes/host_ms`, plus
+  `doorbell_timeouts`. (2) A host watchdog (`FT_GRAPH_FETCH_TIMEOUT_S`, default
+  10 s) turns a wedged service thread into a counted timeout + an engine-visible
+  `raise_if_unhealthy` error between replay and sampling (poison the ack, fail the
+  step) instead of the 22-minute silent freeze of 2026-10-03; count > k_max
+  (= cuda_graph_max_bs x topk) takes the same loud path — refuse, count, poison,
+  raise — because no eager fallback exists inside a replayed graph. **Default-on
+  decision: ON.** Production (`/data/build/start_ftprod_full0913tp2.sh`:
+  `--moe-disk-tier auto --cuda-graph-max-bs 8`) has never set
+  `FT_GRAPH_FETCH_OFF`, and the 20261002 battery's graphs4 arm ran with the
+  doorbell hot, so the doorbell IS the graph-mode disk path; the env stays as a
+  debug escape hatch (eager `fetch_pending` fallback), read once per capture set.
+  Baseline anchor (runs/20261002-tune/results/_table.md; decode300 median t/s,
+  engine-cumulative t/s, wall): graphs4 2.73 / 1.989 / 147.1 s vs graphs0
+  2.16 / 1.678 / 180.3 s → +26.4% decode300; cold-24K wall 156.2 s vs 148.5 s
+  (spin overhead visible on cold prefill); disk read volume identical at 141.9
+  GiB, as expected — the doorbell changes WHERE reads are served, not how many.
 
 ## Working on this fork (git)
 

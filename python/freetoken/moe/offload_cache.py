@@ -1448,16 +1448,28 @@ class OffloadMoeCache:
             except Exception:  # noqa: BLE001 -- stats must never break the reply path
                 pass
         # DIAGNOSTIC (captain, 2026-10-02): surface the disk tier's own ledger. The tier
-        # has always kept these counters (disk_tier.py:1392 stats()) but nothing read them,
+        # has always kept these counters (disk_tier.py stats()) but nothing read them,
         # so the router-guided cross-layer prefetch was unobservable. route_hist_total is
         # the tell for "did the hook run at all" -- prefetch_from_routing returns early
         # while a CUDA graph is capturing, so with graphs on it only grows on eager steps.
+        # The doorbell_* keys carry the graph-fetch ledger: requests/rows/bytes/host_ms
+        # (host side), spins/wait_ms/wait_ms_peak (GPU-side spin, pinned mirror), and
+        # timeouts (watchdog fires; must stay 0).
         if self._disk_tier is not None:
             try:
                 out["disk_tier"] = self._disk_tier.stats()
             except Exception:  # noqa: BLE001 -- diagnostics must not break serving
                 pass
         return out
+
+    def raise_if_unhealthy(self) -> None:
+        """Per-forward engine health check: surfaces a fired graph-doorbell
+        watchdog (or an over-k_max refusal) as a loud error between replay and
+        sampling, so a step whose fetch was poisoned never ships its tokens.
+        No-op without a disk tier / bridge. Cheap (one python bool), called
+        once per forward like cpu_executor.raise_if_unhealthy."""
+        if self._disk_tier is not None:
+            self._disk_tier.raise_if_unhealthy()
 
     def attach_disk_tier(self, index, ram_experts: int, workers: int = 8,
                          ownership=None, graph_k_max: int | None = None,
@@ -1513,6 +1525,13 @@ class OffloadMoeCache:
                 # Graph-doorbell fetch: record request/spin/install kernels;
                 # the disk reads themselves are served by the host service
                 # thread at replay time (preadv is not capturable).
+                # DEFAULT-ON decision (M1, 2026-10-07): production
+                # (/data/build/start_ftprod_full0913tp2.sh: --moe-disk-tier auto
+                # --cuda-graph-max-bs 8) has never set FT_GRAPH_FETCH_OFF, and
+                # the 20261002 graphs4 battery arm ran with the doorbell hot,
+                # so the doorbell IS the graph-mode disk path; the env is a
+                # debug escape hatch (eager fetch_pending fallback), read once
+                # per capture set, not a supported production toggle.
                 if not os.environ.get("FT_GRAPH_FETCH_OFF"):
                     self._disk_tier.graph_stage_fetch(self, layer_id)
             else:

@@ -1048,3 +1048,66 @@ def test_row_groups_excludes_scalar_banks():
     t = _row_groups_tier(segs)
     members = [m for g in t._row_groups(0, 0) for m in g[3]]
     assert all(m[0] not in (2, 5) for m in members)
+
+
+# ---------------------------------------------------------------------------
+# M1: stats() surfaces the doorbell ledger (host counters + bridge spin mirror).
+
+
+class _StatsBridge:
+    def spin_stats(self):
+        return {
+            "doorbell_spins": 3,
+            "doorbell_wait_ms": 50.0,
+            "doorbell_wait_ms_peak": 100.0,
+        }
+
+    def raise_if_unhealthy(self):
+        return None
+
+
+def _bare_tier() -> DiskTier:
+    t = object.__new__(DiskTier)
+    t._fetches = 0
+    t._fetch_bytes = 0
+    t._preadv_calls = 0
+    t._scalar_preload_reads = 0
+    t._pf_issued = 0
+    t._pf_hits = 0
+    t._pf_wasted = 0
+    t._pf_skipped_resident = 0
+    t._route_hist = torch.zeros(8)
+    t._remapped = 0
+    t._db_requests = 2
+    t._db_rows = 5
+    t._db_bytes = 40960
+    t._db_host_us = 1500
+    t._db_timeouts = 0
+    t._db_row_bytes = 8192
+    return t
+
+
+def test_stats_carries_doorbell_ledger_without_bridge():
+    t = _bare_tier()
+    s = t.stats()
+    assert s["doorbell_requests"] == 2
+    assert s["doorbell_rows"] == 5
+    assert s["doorbell_bytes"] == 40960
+    assert s["doorbell_host_ms"] == 1.5
+    assert s["doorbell_timeouts"] == 0
+    # No bridge yet (capture not done): no spin fields at all.
+    assert "doorbell_wait_ms" not in s
+    assert "doorbell_spins" not in s
+
+
+def test_stats_merges_bridge_spin_mirror_and_timeouts():
+    t = _bare_tier()
+    t._graph_bridge = _StatsBridge()
+    t.record_doorbell_timeout()
+    s = t.stats()
+    assert s["doorbell_timeouts"] == 1
+    assert s["doorbell_spins"] == 3
+    assert s["doorbell_wait_ms"] == 50.0
+    assert s["doorbell_wait_ms_peak"] == 100.0
+    # raise_if_unhealthy delegates to the bridge when present.
+    t.raise_if_unhealthy()  # stub bridge has no _err: returns cleanly

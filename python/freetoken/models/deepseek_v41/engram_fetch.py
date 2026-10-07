@@ -114,6 +114,10 @@ class EngramGraphFetch:
             # kernel over PCIe. No device copy of it exists.
             self.resp_host = torch.zeros(1, dtype=torch.int64, pin_memory=True)
             self.doorbell_dev = torch.zeros(1, dtype=torch.int64, device=device)
+            # Sink for the shared spin kernel's wait-time ledger (its stats_ptr
+            # argument). No host mirror here: the engram path has no /v1/stats
+            # consumer for it yet; add one the day someone needs the number.
+            self._spin_stats = torch.zeros(3, dtype=torch.int64, device=device)
             # Staging rows for the graph path, separate from the eager path's own pinned buffers:
             # an eager gather on the engine thread runs host-side staging without stream ordering,
             # so sharing them with a replay's H2D nodes would be a data race, not a slowdown.
@@ -150,7 +154,8 @@ class EngramGraphFetch:
                 BLOCK_K=self.block_k, LAYER=layer_index, TRACE=False,
             )
         _gf_spin_kernel[(1,)](
-            self.resp_host, self.req_dev, self.doorbell_dev, SEQ_OFF=self.seq_off, TRACE=False
+            self.resp_host, self.req_dev, self.doorbell_dev, self._spin_stats,
+            SEQ_OFF=self.seq_off, TRACE=False
         )
         torch.cuda.synchronize(self._device)
 
@@ -171,8 +176,8 @@ class EngramGraphFetch:
         # sysmem are lost from a replay; DMA writes are visible by construction).
         self.req_host.copy_(self.req_dev, non_blocking=True)
         _gf_spin_kernel[(1,)](
-            self.resp_host, self.req_dev, self.doorbell_dev, SEQ_OFF=self.seq_off,
-            TRACE=self._trace,
+            self.resp_host, self.req_dev, self.doorbell_dev, self._spin_stats,
+            SEQ_OFF=self.seq_off, TRACE=self._trace,
         )
         # Captured H2D nodes: re-read the pinned staging every replay, after the spin.
         self.out_w[: n * self.dim].copy_(self.staging_w[: n * self.dim], non_blocking=True)

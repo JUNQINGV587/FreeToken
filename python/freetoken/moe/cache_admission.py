@@ -26,6 +26,14 @@ def _env_bool(name: str) -> bool:
 VRAM_ELASTIC = _env_bool("FREETOKEN_VRAM_ELASTIC")
 ONLINE_ADMISSION = _env_bool("FREETOKEN_ONLINE_ADMISSION")
 
+# Honesty bit for /v1/stats (review 202610, m4 finding): until the GPU battery
+# (review item #12) lands the engine/scheduler call sites AND the CUDA apply,
+# these policies run with no production traffic -- "enabled" must not be read
+# as "working". Flip to True in the battery-#12 commit that wires the
+# scheduler's note_prefill_step/note_decode_step/admission_update calls and
+# the release/rewarm CUDA apply (unmap + empty_cache + re-add).
+WIRED = False
+
 
 class ElasticConfig:
     """Knobs for the elastic guard (dsv41 DSV41_EC_* equivalents)."""
@@ -163,6 +171,7 @@ class ElasticCacheGuard:
     def summary(self) -> dict:
         return {
             "enabled": True,
+            "wired": WIRED,
             "released": self._released,
             "keep_rows": len(self._keep),
             "releases": self.releases,
@@ -292,6 +301,7 @@ class OnlineAdmission:
     def summary(self) -> dict:
         return {
             "enabled": True,
+            "wired": WIRED,
             "evaluations": self.evaluations,
             "swaps": self.swaps,
             "miss_rate_max": round(self._last_miss_rate_max, 4),

@@ -1111,3 +1111,170 @@ def test_stats_merges_bridge_spin_mirror_and_timeouts():
     assert s["doorbell_wait_ms_peak"] == 100.0
     # raise_if_unhealthy delegates to the bridge when present.
     t.raise_if_unhealthy()  # stub bridge has no _err: returns cleanly
+# --------------------------------------------- ②a prefill data-source split
+def _fill_pinned_host_rows(cache, pin_rows):
+    """Back the host banks' pinned rows [0, ram) with the pinned experts'
+    content (what the loader does in production): bank row r of layer L holds
+    expert pin_rows[L][r]."""
+    for layer, rows in enumerate(pin_rows):
+        for row, expert in enumerate(rows):
+            expected = _expected_rows(layer, expert)
+            for bank_idx, (per_layer, _gpu) in enumerate(cache.banks):
+                dst = per_layer[layer][row].contiguous().view(torch.uint8).reshape(-1)
+                dst.copy_(expected[bank_idx])
+
+
+def _prefill_buffers(cache, depth=2, fill=0xFF):
+    """Borrowed-ring stand-in: [depth, E, *shape] per bank, sentinel-filled
+    BYTE-wise (an fp16 tensor filled with the VALUE 0xFF would be 255.0)."""
+    bufs = [
+        torch.empty((depth, cache.num_experts, *shape), dtype=dtype)
+        for shape, dtype in zip(BANK_SHAPES, BANK_DTYPES)
+    ]
+    for buf in bufs:
+        buf.view(torch.uint8).fill_(fill)
+    cache.prefill_bank_buffers = bufs
+    return bufs
+
+
+def _buffer_rows(buffers, buffer_id, expert):
+    return [buf[buffer_id][expert].contiguous().view(torch.uint8).reshape(-1)
+            for buf in buffers]
+
+
+def test_routed_source_split_identity_layout(checkpoint):
+    """Default prefix pin (no pin file): experts < ram are RAM-pinned."""
+    tier = _tier(checkpoint, _fake_cache(), ram_experts=2)
+    pin, disk = tier._routed_split(1, torch.tensor([0, 1, 2, 3, 1]))
+    assert pin.tolist() == [0, 1]  # unique, sorted
+    assert disk.tolist() == [2, 3]
+    # Unrouted experts are excluded from both sides.
+    pin, disk = tier._routed_split(1, torch.tensor([1, 3]))
+    assert pin.tolist() == [1]
+    assert disk.tolist() == [3]
+    # Empty routing is legal (a layer with no routed tokens).
+    pin, disk = tier._routed_split(1, torch.tensor([], dtype=torch.int64))
+    assert pin.numel() == 0 and disk.numel() == 0
+
+
+def test_routed_source_split_uses_row_map(checkpoint):
+    """Learned pin set: the split follows row_map, not the expert id."""
+    tier = _tier(checkpoint, _fake_cache(), ram_experts=2,
+                 pin_rows=[[1, 3], [0, 2]])
+    # Layer 0 pins {1,3}; layer 1 pins {0,2}.
+    pin, disk = tier._routed_split(0, torch.tensor([0, 1, 2, 3]))
+    assert pin.tolist() == [1, 3]
+    assert disk.tolist() == [0, 2]
+    pin, disk = tier._routed_split(1, torch.tensor([0, 1, 2, 3]))
+    assert pin.tolist() == [0, 2]
+    assert disk.tolist() == [1, 3]
+
+
+def test_routed_source_split_owner_ep(checkpoint):
+    """Owner-local EP: GLOBAL routing is renumbered to local rows and remote
+    experts dropped before the row_map lookup."""
+    ownership = _ownership(rank=1)  # global {2,3} as local {0,1}, ram=1
+    tier = _tier(checkpoint, _fake_cache(num_experts=2), ram_experts=1,
+                 ownership=ownership)
+    # Global routing {0,1 (remote), 2 (-> local 0, pinned), 3 (-> local 1, disk)}.
+    pin, disk = tier._routed_split(0, torch.tensor([0, 1, 2, 3]))
+    assert pin.tolist() == [0]
+    assert disk.tolist() == [1]
+    # A remote-only routing splits to nothing.
+    pin, disk = tier._routed_split(0, torch.tensor([0, 1]))
+    assert pin.numel() == 0 and disk.numel() == 0
+
+
+def test_fetch_routed_into_off_fetches_disk_only_and_counts_split(
+        checkpoint, monkeypatch):
+    """Flag OFF (default == current behavior): the fetch plan touches only the
+    routed DISK rows; the routed pin rows are the ring copy's job, so their
+    buffer rows stay untouched. The ②a counters still record the split."""
+    monkeypatch.delenv("FREETOKEN_PREFILL_PIN_SOURCE", raising=False)
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2, pin_rows=[[1, 3], [0, 2]])
+    assert tier._prefill_pin_source is False
+    assert tier.stats()["prefill_pin_source"] is False
+    _fill_pinned_host_rows(cache, [[1, 3], [0, 2]])
+    buffers = _prefill_buffers(cache)
+
+    fetched = tier.fetch_routed_into(cache, 0, torch.tensor([0, 1, 2, 3]), 0)
+
+    assert fetched == 2  # disk-resident {0, 2}
+    for expert in (0, 2):
+        expected = _expected_rows(0, expert)
+        got = _buffer_rows(buffers, 0, expert)
+        for bank_idx in range(len(buffers)):
+            assert torch.equal(got[bank_idx], expected[bank_idx]), bank_idx
+    # Pin rows {1, 3}: OFF -> not the fetch plan's job, sentinel preserved.
+    for expert in (1, 3):
+        got = _buffer_rows(buffers, 0, expert)
+        for bank_idx in range(len(buffers)):
+            assert int(got[bank_idx][0]) == 0xFF and int(got[bank_idx][-1]) == 0xFF
+    stats = tier.stats()
+    assert stats["prefill_pin_rows"] == 2
+    assert stats["prefill_disk_rows"] == 2
+    assert stats["prefill_pin_bytes"] == 2 * sum(tier._row_bytes)
+    assert stats["prefill_disk_bytes"] == 2 * tier._db_row_bytes
+
+
+def test_fetch_routed_into_pin_source_on_serves_pin_rows(
+        checkpoint, monkeypatch):
+    """Flag ON: the routed PINNED rows are served from the HostBank pinned
+    rows (row_map translation), the routed disk rows from preadv -- the buffer
+    ends up complete without any ring prefix copy."""
+    monkeypatch.setenv("FREETOKEN_PREFILL_PIN_SOURCE", "1")
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2, pin_rows=[[1, 3], [0, 2]])
+    assert tier._prefill_pin_source is True
+    _fill_pinned_host_rows(cache, [[1, 3], [0, 2]])
+    buffers = _prefill_buffers(cache)
+
+    fetched = tier.fetch_routed_into(cache, 0, torch.tensor([0, 1, 2, 3]), 0)
+
+    assert fetched == 2  # return value stays the disk-read count
+    for expert in (0, 1, 2, 3):
+        expected = _expected_rows(0, expert)
+        got = _buffer_rows(buffers, 0, expert)
+        for bank_idx in range(len(buffers)):
+            assert torch.equal(got[bank_idx], expected[bank_idx]), (bank_idx, expert)
+    stats = tier.stats()
+    assert stats["prefill_pin_source"] is True
+    assert stats["prefill_pin_rows"] == 2
+    assert stats["prefill_disk_rows"] == 2
+
+    # Partial routing: only routed rows are served, the rest stay stale
+    # (never gathered by the grouped GEMM -- same argument as the unrouted
+    # disk tail in OFF mode).
+    tier.fetch_routed_into(cache, 1, torch.tensor([1]), 1)
+    expected = _expected_rows(1, 1)  # expert 1 is disk-resident on layer 1
+    got = _buffer_rows(buffers, 1, 1)
+    for bank_idx in range(len(buffers)):
+        assert torch.equal(got[bank_idx], expected[bank_idx]), bank_idx
+    for expert in (0, 2, 3):
+        got = _buffer_rows(buffers, 1, expert)
+        for bank_idx in range(len(buffers)):
+            assert int(got[bank_idx][0]) == 0xFF and int(got[bank_idx][-1]) == 0xFF
+    stats = tier.stats()
+    assert stats["prefill_pin_rows"] == 2  # expert 1 is disk on layer 1
+    assert stats["prefill_disk_rows"] == 3
+
+
+def test_fetch_routed_into_pin_source_identity_layout(
+        checkpoint, monkeypatch):
+    """Flag ON with the default prefix pin (identity row_map): pinned experts
+    0/1 come from host bank rows 0/1, disk experts 2/3 from preadv."""
+    monkeypatch.setenv("FREETOKEN_PREFILL_PIN_SOURCE", "1")
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)  # prefix pin {0,1}
+    assert not tier._remapped
+    _fill_pinned_host_rows(cache, [[0, 1], [0, 1]])
+    buffers = _prefill_buffers(cache)
+
+    tier.fetch_routed_into(cache, 1, torch.tensor([0, 1, 2, 3]), 1)
+
+    for expert in (0, 1, 2, 3):
+        expected = _expected_rows(1, expert)
+        got = _buffer_rows(buffers, 1, expert)
+        for bank_idx in range(len(buffers)):
+            assert torch.equal(got[bank_idx], expected[bank_idx]), (bank_idx, expert)

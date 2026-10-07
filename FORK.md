@@ -96,6 +96,19 @@ The default branch **`sm89-moe-offload`** is the production mainline. Upstream i
   GB per chunk and TTFT 1.49 -> 1.30 s (-13%, 4.3K prompt 1.83 -> 1.64 s), with bit-identical outputs. Every row
   still arrives exactly once (hit -> gather, miss -> copy run), which is what the GPU test checks; the flag is
   read at cache construction so a test can flip it.
+- `feat(moe)`: **prefill data-source split by pin layout** (dsv41 port plan ②a). The overlap prefill
+  fetch plan now names its two sources explicitly: RAM-pinned rows (HostBank pinned-row H2D) vs disk
+  rows (preadv), split by the pinned-row layout (`row_map`) rather than by expert id, so a learned pin
+  set and the default prefix pin go through the same test. `FREETOKEN_PREFILL_PIN_SOURCE=1` (default
+  off; off is byte-identical to the previous plan) moves the pin share's H2D from the ring's blanket
+  prefix copy into `fetch_routed_into` itself -- routed pinned rows only, gathered from the host banks
+  and scattered into the borrowed buffer, while the ring skips its prefix copy. Unrouted rows stay
+  stale either way: the grouped GEMM never gathers them, same argument as the unrouted disk tail.
+  `/v1/stats` gains the split of the routed demand: `prefill_pin_rows`/`prefill_pin_bytes` (H2D
+  payload) vs `prefill_disk_rows`/`prefill_disk_bytes` (preadv payload), plus `prefill_pin_source`
+  echoing the flag. Validation (GPU battery, deferred): with the pin file mounted (~31% pin share at
+  budgets 64+56/384) the cold24k "盘读 GiB" column must drop by that share vs the 141.5 GiB baseline;
+  targets cold24k <= 80 s (>= 300 tok/s).
 - TP2/owner-EP serving stack from PR #447 lineage + vision TP sharding.
 - `feat(moe)`: **graph-doorbell fetch hardening — observability + loud failure, default-on**
   (`f9947feb60`/`915beb65ff`) — the disk-fetch bridge inside CUDA graphs gets the

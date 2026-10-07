@@ -823,6 +823,14 @@ class OffloadMoeCache:
             # (DiskTier.fetch_routed_into), and unrouted tail rows are never
             # gathered by the grouped GEMM.
             tier = self._disk_tier
+            if tier is not None and tier._prefill_pin_source:
+                # ②a (FREETOKEN_PREFILL_PIN_SOURCE=1): the fetch plan serves the
+                # ROUTED pinned rows from the HostBank at layer entry
+                # (DiskTier._serve_pin_rows), so skip the blanket prefix copy --
+                # unrouted pinned rows stay stale in the buffer, exactly like
+                # today's unrouted disk tail: the grouped GEMM never gathers
+                # them. Buffer invalidation/events above and below still run.
+                return
             n = tier._ram if tier is not None else None
             remapped = tier is not None and tier._remapped
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):

@@ -167,6 +167,31 @@ def pin_rows_to_row_map(pin_rows: list[list[int]], local_num: int) -> list[list[
     return row_map
 
 
+def routed_source_split(layer_id: int, expert_ids: torch.Tensor,
+                        row_map: torch.Tensor, ram: int, *,
+                        owner_ep: bool, g0: int = 0,
+                        local_num: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split one layer's routing into (RAM-pinned, disk-resident) LOCAL expert ids.
+
+    ``expert_ids`` is the layer's routing (GLOBAL ids under owner-EP; renumbered
+    to local rows here, unowned experts dropped). "RAM-pinned" goes through the
+    pinned-row layout ``row_map`` ([num_layers, local_num] local id -> bank
+    row): with the default identity map ``row_map[layer][e] == e`` this is the
+    prefix test ``e < ram``; with a learned pin set it is whatever the pin file
+    packed into rows ``[0, ram)``. Pure torch ops on whatever device the inputs
+    live on, so the split is unit-testable on CPU. Returns unique ascending id
+    tensors ``(pin_ids, disk_ids)``.
+    """
+    routed = expert_ids.reshape(-1)
+    if owner_ep:
+        # Owner-local EP: routing arrives GLOBAL; renumber to local rows and
+        # drop the experts this rank does not own.
+        routed = routed - g0
+        routed = routed[(routed >= 0) & (routed < local_num)]
+    rows = row_map[layer_id][routed.long()]
+    return torch.unique(routed[rows < ram]), torch.unique(routed[rows >= ram])
+
+
 def release_bank_tails(banks_by_name: dict[str, list[HostBank]], num_experts: int,
                        ram_experts: int) -> None:
     """MADV_DONTNEED the unpinned tail rows of every bank layer (post-load).
@@ -718,6 +743,39 @@ class DiskTier:
             (index.num_layers, self._local_num), -1, dtype=torch.int8)
         self._turn = 0
         self._telemetry_path = os.environ.get("FT_DISK_TIER_TELEMETRY") or None
+        # ---- ②a prefill data-source split (dsv41 port plan ②a). The overlap
+        # prefill fetch plan serves ROUTED rows from two sources: RAM-pinned
+        # rows via HostBank pinned-row H2D, disk rows via preadv. That split
+        # already existed implicitly -- prefetch_prefill_layer copies the whole
+        # pinned prefix depth-ahead on the copy stream and fetch_routed_into
+        # only ever fetched the disk-resident routing. FREETOKEN_PREFILL_PIN_SOURCE=1
+        # makes it explicit in the fetch plan: fetch_routed_into additionally
+        # serves the routed PINNED rows from the host banks (same gather+H2D+
+        # index_copy mechanism as the ring's remapped scatter, routed rows
+        # only) and prefetch_prefill_layer then skips its blanket prefix copy.
+        # Unrouted pinned rows stay stale in the borrowed buffer, exactly like
+        # today's unrouted disk tail -- the grouped GEMM never gathers them.
+        # Default OFF == byte-identical current behavior (rollback switch).
+        self._prefill_pin_source = bool(
+            int(os.environ.get("FREETOKEN_PREFILL_PIN_SOURCE", "0")))
+        # Per-source prefill counters (routed DEMAND split, counted at the
+        # fetch plan in fetch_routed_into/fetch_routed regardless of mode --
+        # in OFF mode the ring copy is what actually serves the pin rows).
+        # Byte basis: pin rows count cache-row bytes sum(_row_bytes) (the H2D
+        # payload), disk rows count disk-read bytes _db_row_bytes (the preadv
+        # payload) -- the same conventions as _fetch_bytes/_db_bytes.
+        #
+        # Validation (GPU battery, deferred): with the pin file mounted
+        # (budgets 64+56/384 -> ~31% pin share) the cold24k battery's "盘读
+        # GiB" column (runs/20261002-tune/results/_table.md) must drop by that
+        # share vs the 141.5 GiB baseline, and prefill_pin_bytes /
+        # prefill_disk_bytes in stats() must show the same ~31/69 split of the
+        # routed demand. Targets: cold24k wall <= 80 s (>= 300 tok/s).
+        self._pf_pin_rows = 0
+        self._pf_pin_bytes = 0
+        self._pf_disk_rows = 0
+        self._pf_disk_bytes = 0
+        self._row_bytes_total = sum(self._row_bytes)
 
     # ------------------------------------------------------------------ fds
     def _fd(self, shard_idx: int) -> tuple[int, bool]:
@@ -1375,8 +1433,12 @@ class DiskTier:
         cache.id_of_slot[idx] = torch.where(valid, -1, seg)
         cache.usage[idx] = torch.where(valid, 0, cache.usage[idx])
 
-        routed = self._routed_disk(layer_id, expert_ids)
-        disk = routed
+        pin, disk = self._routed_split(layer_id, expert_ids)
+        # ②a per-source prefill counters (routed demand split; see __init__).
+        self._pf_pin_rows += pin.numel()
+        self._pf_pin_bytes += pin.numel() * self._row_bytes_total
+        self._pf_disk_rows += disk.numel()
+        self._pf_disk_bytes += disk.numel() * self._db_row_bytes
         if os.environ.get("FT_DISK_TIER_DEBUG") and layer_id < 3:
             print(f"[disk-tier dbg] layer={layer_id} routed={expert_ids.numel()} "
                   f"unique_disk={disk.numel()} disk={disk.tolist()[:12]}", flush=True)
@@ -1405,6 +1467,14 @@ class DiskTier:
         cache.usage[disk] = cache.step
         return disk.to(dtype=torch.int32)
 
+    def _routed_split(self, layer_id: int,
+                      expert_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(pin, disk) split of this layer's routing -- see routed_source_split."""
+        return routed_source_split(
+            layer_id, expert_ids, self._row_map_dev, self._ram,
+            owner_ep=bool(self._g0 or self._local_num != self._index.num_experts),
+            g0=self._g0, local_num=self._local_num)
+
     def _routed_disk(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
         """Unique disk-resident rows in this layer's routing (GLOBAL ids under
         owner-EP; renumbered to local rows, unowned experts dropped).
@@ -1413,14 +1483,7 @@ class DiskTier:
         identity map ``_row_map[layer][e] == e`` this is the prefix test
         ``e >= _ram``; with a learned pin set it is whatever the pin file left
         out."""
-        routed = expert_ids.reshape(-1)
-        if self._g0 or self._local_num != self._index.num_experts:
-            # Owner-local EP: routing arrives GLOBAL; renumber to local rows and
-            # drop the experts this rank does not own.
-            routed = routed - self._g0
-            routed = routed[(routed >= 0) & (routed < self._local_num)]
-        rows = self._row_map_dev[layer_id][routed.long()]
-        return torch.unique(routed[rows >= self._ram])
+        return self._routed_split(layer_id, expert_ids)[1]
 
     def fetch_routed_into(self, cache, layer_id: int,
                           expert_ids: torch.Tensor, buffer_id: int) -> int:
@@ -1434,22 +1497,36 @@ class DiskTier:
 
         Slot bookkeeping is untouched: the buffer rows' map entries are owned
         by the overlap ring (``_invalidate_prefill_buffer``), and decode never
-        sees a phantom hit. Returns the fetched-expert count.
+        sees a phantom hit. Returns the fetched (disk-read) expert count.
+
+        ②a: with FREETOKEN_PREFILL_PIN_SOURCE=1 the ROUTED RAM-pinned rows are
+        served here too, from the HostBank pinned rows (``_serve_pin_rows``);
+        prefetch_prefill_layer then skips its blanket prefix copy. With the
+        flag off (default) this function is byte-identical to the pre-②a
+        behavior -- the ring serves the pin rows, this fetches only disk rows.
         """
-        disk = self._routed_disk(layer_id, expert_ids)
-        if disk.numel() == 0:
+        pin, disk = self._routed_split(layer_id, expert_ids)
+        # ②a per-source prefill counters (routed demand split; see __init__).
+        self._pf_pin_rows += pin.numel()
+        self._pf_pin_bytes += pin.numel() * self._row_bytes_total
+        self._pf_disk_rows += disk.numel()
+        self._pf_disk_bytes += disk.numel() * self._db_row_bytes
+        serve_pin = self._prefill_pin_source and pin.numel() > 0
+        if disk.numel() == 0 and not serve_pin:
             return 0
         device = self._banks[0][1].device
         if device.type == "cuda":
-            # Order the pool threads' H2D writes (default stream) behind ALL
-            # compute enqueued so far -- this layer's ring-copy wait
-            # (wait_prefill_layer) and the previous occupants' GEMMs. The NVMe
-            # preadv below still overlaps the in-flight compute; only the PCIe
-            # writes wait.
+            # Order the H2D writes below (pool threads' disk rows and the pin
+            # rows, both on the default stream) behind ALL compute enqueued so
+            # far -- this layer's ring-copy wait (wait_prefill_layer) and the
+            # previous occupants' GEMMs. The NVMe preadv below still overlaps
+            # the in-flight compute; only the PCIe writes wait.
             gate = torch.cuda.Event()
             gate.record()
             torch.cuda.default_stream(device).wait_event(gate)
         buffers = cache.prefill_bank_buffers
+        if serve_pin:
+            self._serve_pin_rows(layer_id, pin, buffers, buffer_id)
         futures = [
             self._pool.submit(self._fetch_expert, layer_id, int(e), -1,
                               buffers, buffer_id)
@@ -1460,6 +1537,52 @@ class DiskTier:
         self._sync_fetches()
         self._dbg_fetched[layer_id] = {int(e) for e in disk.tolist()}
         return disk.numel()
+
+    def _serve_pin_rows(self, layer_id: int, pin_ids: torch.Tensor,
+                        buffers, buffer_id: int) -> None:
+        """②a (FREETOKEN_PREFILL_PIN_SOURCE=1): patch the ROUTED RAM-pinned rows
+        of one layer into the borrowed buffer straight from the HostBank pinned
+        rows -- one host gather (row_map translation) + one H2D + one D2D
+        index_copy per bank, the same mechanism as the overlap ring's remapped
+        scatter (offload_cache.prefetch_prefill_layer), but routed rows only.
+
+        Called from fetch_routed_into on the engine thread AFTER the gate
+        event orders the default stream behind in-flight compute, and covered
+        by the same _sync_fetches() as the pool threads' disk-row writes, so
+        the GEMM sees a complete buffer either way. Covers every bank
+        (including the scalar banks), which the host banks already hold for
+        pinned rows -- unlike the disk path's _fill_scalar_row special case.
+        """
+        device = self._banks[0][1].device
+        # Small (<= _ram ints) D2H; fetch_routed_into is host-blocking on the
+        # pool futures + _sync_fetches anyway, so this orders for free.
+        pin_cpu = pin_ids.cpu()
+        host_rows = self._row_map_cpu[layer_id][pin_cpu].long()
+        dst = pin_ids.long()
+
+        def _copy() -> None:
+            for bank_idx, (per_layer, _gpu) in enumerate(self._banks):
+                src = per_layer[layer_id].index_select(0, host_rows)
+                tmp = (src.to(device, non_blocking=True)
+                       if device.type == "cuda" else src)
+                row_dst = buffers[bank_idx][buffer_id]
+                if row_dst.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
+                                     torch.float8_e4m3fnuz, torch.float8_e5m2fnuz,
+                                     torch.float8_e8m0fnu):
+                    # No index_copy kernel for fp8 (ds_fp4 e8m0 scale banks) --
+                    # go through the uint8 view, like the ring's scatter does.
+                    row_dst.view(torch.uint8).index_copy_(
+                        0, dst, tmp.view(torch.uint8))
+                else:
+                    row_dst.index_copy_(0, dst, tmp)
+
+        if device.type == "cuda":
+            # Same default stream the pool threads write the disk rows on, so
+            # _sync_fetches() in the caller covers the pin H2D too.
+            with torch.cuda.stream(torch.cuda.default_stream(device)):
+                _copy()
+        else:
+            _copy()
 
     # ------------------------------------------------------------- PILOT prefetch
     def _slab_bytes(self) -> int:
@@ -1867,6 +1990,14 @@ class DiskTier:
             "prefetch_skipped_resident": self._pf_skipped_resident,
             "route_hist_total": float(self._route_hist.sum()),
             "pin_remapped": self._remapped,
+            # ②a prefill data-source split: routed demand by source (rows /
+            # bytes). pin bytes = HostBank H2D payload, disk bytes = preadv
+            # payload (see __init__ for the accounting basis).
+            "prefill_pin_source": self._prefill_pin_source,
+            "prefill_pin_rows": self._pf_pin_rows,
+            "prefill_pin_bytes": self._pf_pin_bytes,
+            "prefill_disk_rows": self._pf_disk_rows,
+            "prefill_disk_bytes": self._pf_disk_bytes,
             "doorbell_requests": self._db_requests,
             "doorbell_rows": self._db_rows,
             "doorbell_bytes": self._db_bytes,

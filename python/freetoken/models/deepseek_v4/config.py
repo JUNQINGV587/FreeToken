@@ -20,6 +20,23 @@ from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, Rotar
 from .args import load_args
 
 
+def _expert_quant(hf_config: Any) -> str:
+    """Routed-expert weight dialect: the author's ``DeepSeek-V4-Flash`` checkpoint ships
+    MXFP4 experts (``ds_fp4``); ``nvidia/DeepSeek-V4-Flash-0731-NVFP4`` is ModelOpt
+    ``dsv4-nvfp4-experts`` output and declares ``moe_quant_algo == "NVFP4"`` in its
+    ``quantization_config`` (the top-level ``quant_algo`` stays ``MIXED_PRECISION`` and
+    ``quant_method`` ``fp8``, which describe the dense fp8 path, so neither is a usable
+    signal here)."""
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return "ds_fp4"
+    get = quant.get if isinstance(quant, dict) else lambda key, default=None: getattr(quant, key, default)
+    moe_algo = get("moe_quant_algo", None)
+    if isinstance(moe_algo, str) and moe_algo.upper() == "NVFP4":
+        return "nvfp4"
+    return "ds_fp4"
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     model_path = getattr(hf_config, "_name_or_path", None) or getattr(
         hf_config, "name_or_path", None
@@ -71,7 +88,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
         model_type="deepseek_v4",
         architectures=["DeepseekV4ForCausalLM"],
         moe_enabled=True,
-        expert_quant="ds_fp4",
+        expert_quant=_expert_quant(hf_config),
+        # NVFP4 expert banks cannot shard an expert across ranks, so under moe_ep_size>1
+        # the MoE seam asks ``owner_ep_expert_tp_size`` for the unsharded expert GEMM and
+        # the owner-side cache reduce stays inside DSV4OffloadMoELayer -- owner-local EP
+        # is supported. Engine gates owner EP on this declaration plus expert_quant
+        # "nvfp4" (see engine._check_owner_ep_model); with the default "ds_fp4" dialect
+        # TP>1 remains rejected as before.
+        owner_ep=True,
         # NB: DSV4 has MoE on every layer (no dense-replace) and reads its routing /
         # shared-expert / scaling config from dsv4_args, so the generic DeepSeek-family
         # MoE ModelConfig fields (first_k_dense_replace / n_shared_experts /

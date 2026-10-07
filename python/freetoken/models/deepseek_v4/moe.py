@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
+from freetoken.layers.moe import owner_ep_expert_tp_size
 
 from .args import DeepseekV4Args
 
@@ -65,10 +66,12 @@ class Expert(BaseOP):
 
 
 class DSV4OffloadMoELayer(OffloadMoELayer):
-    """Routed MXFP4 experts on the shared offload cache: the base whole-layer
-    streaming prefill (grouped inline-dequant GEMM for dense chunks, GEMV
-    below the route crossover) and slot-cache / cpu / hybrid decode paths
-    (per-route dequant GEMV)."""
+    """Routed experts (MXFP4 author dialect or NVFP4 0731 banks) on the shared offload
+    cache: the base whole-layer streaming prefill (grouped inline-dequant GEMM for
+    dense chunks, GEMV below the route crossover) and slot-cache / cpu / hybrid decode
+    paths (per-route dequant GEMV). Under owner-local EP (``moe_ep_size > 1``) each rank
+    owns a slice of experts whole (NVFP4 banks reject TP > 1), so the expert GEMM runs
+    unsharded via ``expert_tp_size``."""
 
     def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
         super().__init__(
@@ -84,6 +87,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             decode_target=decode_target,
             quant_config=quant_config,
             prefix=prefix,
+            expert_tp_size=owner_ep_expert_tp_size(args),
         )
 
     def _prefill_routed(

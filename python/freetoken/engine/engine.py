@@ -1828,6 +1828,9 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     model_config = config.model_config
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    # Owner-local EP degree for the NVFP4 expert banks (0731 checkpoint): the MoE seam
+    # reads it via owner_ep_expert_tp_size (see models/deepseek_v4/moe.py).
+    model_config.dsv4_args.moe_ep_size = getattr(config, "moe_ep_size", 1)
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);
     # a runtime rebuild pins an absolute window via swa_num_pages_override instead.
     # DSV4's KV page IS the P-token window page (window == radix reuse granularity == lcm of

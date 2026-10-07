@@ -19,6 +19,12 @@ class DeepseekV4Args:
     # ----- runtime -----
     max_batch_size: int = 1
     max_seq_len: int = 4096
+    # Owner-local EP degree, synced onto these args by the engine (``_adjust_dsv4_config``) from
+    # ``--moe-ep-size``. It decides whether the routed-expert GEMM is sharded -- see
+    # ``freetoken.layers.moe.owner_ep_expert_tp_size``: the 0731 checkpoint's experts are NVFP4,
+    # and every NVFP4 kernel rejects TP > 1, so they are only usable when owner-local EP makes
+    # them whole per rank. MXFP4 (author checkpoint) expert banks reject TP > 1 outright.
+    moe_ep_size: int = 1
     dtype: Literal["bf16", "fp8"] = "fp8"
     scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
     expert_dtype: Literal[None, "fp4"] = "fp4"

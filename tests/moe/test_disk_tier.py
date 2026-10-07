@@ -1090,6 +1090,12 @@ def _bare_tier() -> DiskTier:
     t._pf_pin_bytes = 0
     t._pf_disk_rows = 0
     t._pf_disk_bytes = 0
+    # 2b bulk prefetch bookkeeping fields, defaults == OFF mode.
+    t._prefill_bulk = False
+    t._bk_issued = 0
+    t._bk_hits = 0
+    t._bk_wasted = 0
+    t._bk_bytes = 0
     return t
 
 
@@ -1284,3 +1290,205 @@ def test_fetch_routed_into_pin_source_identity_layout(
         got = _buffer_rows(buffers, 1, expert)
         for bank_idx in range(len(buffers)):
             assert torch.equal(got[bank_idx], expected[bank_idx]), (bank_idx, expert)
+
+
+# ---------------------------------------------------------------------------
+# 2b: block-level bulk prefetch (FREETOKEN_PREFILL_BULK_*; default OFF).
+
+def _bulk_prediction(tmp_path, hist):
+    p = tmp_path / "bulk_pred.json"
+    p.write_text(json.dumps({"layers": len(hist), "experts": len(hist[0]),
+                             "hist": hist}))
+    return str(p)
+
+
+def _flush_bulk(tier):
+    """Wait for every in-flight bulk block read (one future per block slab)."""
+    recs = {id(entry["rec"]): entry["rec"]
+            for entry in tier._bulk_stash.values()}
+    for rec in recs.values():
+        rec["future"].result()
+
+
+def test_bulk_prefetch_off_by_default(checkpoint, monkeypatch):
+    """No env: the 2b machinery is inert (off == byte-identical current
+    behavior) and stats() still surfaces the bookkeeping keys."""
+    for var in ("FREETOKEN_PREFILL_BULK_PREFETCH", "FREETOKEN_PREFILL_BULK_PREDICT"):
+        monkeypatch.delenv(var, raising=False)
+    tier = _tier(checkpoint, _fake_cache(), ram_experts=2)
+    assert tier._prefill_bulk is False
+    assert tier._bulk_pool is None
+    stats = tier.stats()
+    assert stats["prefill_bulk"] is False
+    assert stats["prefill_bulk_issued"] == 0
+    assert stats["prefill_bulk_hits"] == 0
+    assert stats["prefill_bulk_wasted"] == 0
+    assert stats["prefill_bulk_bytes"] == 0
+
+
+def test_bulk_prefetch_requires_prediction_doc(checkpoint, monkeypatch, capsys):
+    """Flag on but no learned distribution: disable with a log line, never
+    speculate from nothing (the PILOT identity predictor measured 1.01%)."""
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREFETCH", "1")
+    monkeypatch.delenv("FREETOKEN_PREFILL_BULK_PREDICT", raising=False)
+    tier = _tier(checkpoint, _fake_cache(), ram_experts=2)
+    assert tier._prefill_bulk is False
+    assert "FREETOKEN_PREFILL_BULK_PREDICT" in capsys.readouterr().out
+
+
+def test_bulk_prefetch_rejects_mismatched_doc(checkpoint, monkeypatch, tmp_path):
+    """A prediction doc whose L x E does not match the checkpoint fails the
+    boot -- speculating from the wrong distribution is worse than none."""
+    pred = _bulk_prediction(tmp_path, [[1.0] * 4] * 3)  # 3 layers vs checkpoint 2
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREFETCH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREDICT", pred)
+    with pytest.raises(ValueError, match="does not match"):
+        _tier(checkpoint, _fake_cache(), ram_experts=2)
+
+
+def test_bulk_prefetch_hit_serves_rows_and_skips_demand_read(
+        checkpoint, monkeypatch, tmp_path):
+    """Rolling plan: layer 0's demand fetch issues the learned plan for
+    layer 1; the block read lands in a shared slab; layer 1's routed disk rows
+    are then served from the slab (zero preadv in the demand window) with
+    bytes identical to the demand path. The pinned expert with the highest
+    score (0: 5.0) must NOT be prefetched -- it is a host-bank row."""
+    pred = _bulk_prediction(tmp_path, [[0.0] * 4, [5.0, 0.0, 1.0, 0.9]])
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREFETCH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREDICT", pred)
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_DEPTH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_TOPK", "8")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_BLOCK", "2")
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)  # prefix pin {0,1}
+    assert tier._prefill_bulk is True
+    _fill_pinned_host_rows(cache, [[0, 1], [0, 1]])
+    buffers = _prefill_buffers(cache)
+
+    # Layer 0: demand-served {2,3}; _bulk_advance(0) then plans layer 1.
+    assert tier.fetch_routed_into(cache, 0, torch.tensor([0, 1, 2, 3]), 0) == 2
+    assert tier._bk_issued == 2  # disk-resident {2,3}, pinned 0 excluded
+    _flush_bulk(tier)
+    preadv_after_bulk = tier._preadv_calls
+
+    # Layer 1: both routed disk rows are stash hits.
+    fetched = tier.fetch_routed_into(cache, 1, torch.tensor([0, 1, 2, 3]), 1)
+
+    assert fetched == 2
+    assert tier._preadv_calls == preadv_after_bulk  # no demand-window NVMe
+    for expert in (2, 3):
+        expected = _expected_rows(1, expert)
+        got = _buffer_rows(buffers, 1, expert)
+        for bank_idx in range(len(buffers)):
+            assert torch.equal(got[bank_idx], expected[bank_idx]), bank_idx
+    for expert in (0, 1):  # pin rows: the ring's job (2a OFF), sentinel kept
+        got = _buffer_rows(buffers, 1, expert)
+        for bank_idx in range(len(buffers)):
+            assert int(got[bank_idx][0]) == 0xFF and int(got[bank_idx][-1]) == 0xFF
+    assert tier._bk_hits == 2
+    assert tier._bk_wasted == 0
+    assert len(tier._bulk_slab_free) == 1  # block slab recycled after the hits
+    stats = tier.stats()
+    assert stats["prefill_bulk"] is True
+    assert stats["prefill_bulk_issued"] == 2
+    assert stats["prefill_bulk_hits"] == 2
+    assert stats["prefill_bulk_wasted"] == 0
+    assert stats["prefill_bulk_bytes"] > 0
+
+
+def test_bulk_prefetch_miss_falls_back_to_demand(
+        checkpoint, monkeypatch, tmp_path):
+    """Empty learned distribution (zero scores): nothing is issued, and the
+    next layer's fetch is the unchanged demand path -- correct rows, preadv
+    reads, no hits and nothing wasted."""
+    pred = _bulk_prediction(tmp_path, [[0.0] * 4, [0.0] * 4])
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREFETCH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREDICT", pred)
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_DEPTH", "1")
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)
+    _fill_pinned_host_rows(cache, [[0, 1], [0, 1]])
+    buffers = _prefill_buffers(cache)
+
+    assert tier.fetch_routed_into(cache, 0, torch.tensor([0, 1, 2, 3]), 0) == 2
+    assert tier._bk_issued == 0
+    preadv_before = tier._preadv_calls
+    assert tier.fetch_routed_into(cache, 1, torch.tensor([0, 1, 2, 3]), 1) == 2
+    assert tier._preadv_calls > preadv_before  # demand reads happened
+    for expert in (2, 3):
+        expected = _expected_rows(1, expert)
+        got = _buffer_rows(buffers, 1, expert)
+        for bank_idx in range(len(buffers)):
+            assert torch.equal(got[bank_idx], expected[bank_idx]), bank_idx
+    assert tier._bk_hits == 0
+    assert tier._bk_wasted == 0
+
+
+def test_bulk_prefetch_wasted_recycles_the_block_slab(
+        checkpoint, monkeypatch, tmp_path):
+    """Prefetched but never routed: the entries go stale at the next advance,
+    count as wasted, and the shared block slab returns to the free pool."""
+    pred = _bulk_prediction(tmp_path, [[0.0] * 4, [0.0, 0.0, 1.0, 0.9]])
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREFETCH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_PREDICT", pred)
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_DEPTH", "1")
+    monkeypatch.setenv("FREETOKEN_PREFILL_BULK_BLOCK", "2")
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2)
+    _fill_pinned_host_rows(cache, [[0, 1], [0, 1]])
+    _prefill_buffers(cache)
+
+    tier.fetch_routed_into(cache, 0, torch.tensor([0, 1, 2, 3]), 0)
+    assert tier._bk_issued == 2
+    _flush_bulk(tier)
+    # Layer 1 routes only the pinned experts: the prefetched {2,3} go stale.
+    assert tier.fetch_routed_into(cache, 1, torch.tensor([0, 1]), 1) == 0
+    assert tier._bk_hits == 0
+    assert tier._bk_wasted == 2
+    assert len(tier._bulk_stash) == 0
+    assert len(tier._bulk_slab_free) == 1
+
+
+def test_row_groups_multi_merges_across_experts():
+    """The block read plan: two experts whose extents chain adjacently on one
+    shard merge into a single group; members stay expert-tagged and the member
+    multiset is byte-identical to the union of the per-expert plans."""
+    segs = {
+        # Expert 0: banks 0/1/3/4 contiguous 1000..4500 (the R1x rule).
+        (0, 0, 0): [(0, 1000, 1000)], (1, 0, 0): [(0, 2000, 1000)],
+        (3, 0, 0): [(0, 3000, 1000)], (4, 0, 0): [(0, 4000, 500)],
+        # Expert 1: the chain continues 4500..8000 -- cross-EXPERT merge.
+        (0, 0, 1): [(0, 4500, 1000)], (1, 0, 1): [(0, 5500, 1000)],
+        (3, 0, 1): [(0, 6500, 1000)], (4, 0, 1): [(0, 7500, 500)],
+    }
+    t = _row_groups_tier(segs)
+    groups = t._row_groups_multi(0, [0, 1])
+    assert len(groups) == 1
+    assert len(groups) < len(t._row_groups(0, 0)) + len(t._row_groups(0, 1))
+    shard, a0, a1, members, end = groups[0]
+    assert (shard, a0, a1, end) == (0, 1000, 8000, 8000)
+    got = sorted(tuple(m) for m in members)
+    want = sorted(
+        (e, b, d0, d1, off, nb)
+        for e in (0, 1)
+        for (b, d0, d1, off, nb) in _per_bank_members(t, 0, e))
+    assert got == want
+
+
+def test_row_groups_multi_no_merge_across_gap_or_shard():
+    # Expert 0 -> 1 has a 1-byte gap (2000 -> 2001); expert 2 lives on shard 1.
+    # Nothing merges: the multi plan is exactly the per-expert plans' union.
+    segs = {}
+    for e, (shard, base) in enumerate(((0, 1000), (0, 2001), (1, 1000))):
+        for b in (0, 1, 3, 4):
+            segs[(b, 0, e)] = [(shard, base + b * 100000, 1000)]
+    t = _row_groups_tier(segs)
+    groups = t._row_groups_multi(0, [0, 1, 2])
+    assert len(groups) == sum(len(t._row_groups(0, e)) for e in (0, 1, 2))
+    got = sorted((m[0], m[1], m[2], m[3], m[4], m[5])
+                 for g in groups for m in g[3])
+    want = sorted(
+        (e, b, d0, d1, off, nb)
+        for e in (0, 1, 2)
+        for (b, d0, d1, off, nb) in _per_bank_members(t, 0, e))
+    assert got == want

@@ -37,6 +37,8 @@ from dataclasses import dataclass
 import torch
 
 from freetoken.moe.host_banks import HostBank
+from freetoken.moe.prefetch_plan import (
+    build_prefetch_plan, form_blocks, load_prediction_doc)
 
 _ALIGN = 4096
 
@@ -776,6 +778,69 @@ class DiskTier:
         self._pf_disk_rows = 0
         self._pf_disk_bytes = 0
         self._row_bytes_total = sum(self._row_bytes)
+        # ---- ②b block-level bulk prefetch (cold-prefill speculative staging;
+        # design + honest ceiling: notes/engines/20261007-bulk-prefetch-design.md).
+        # fetch_routed_into serves a layer's disk rows, then _bulk_advance issues
+        # a LEARNED plan for L+1..L+depth: high-score disk-resident experts are
+        # read into shared pinned BLOCK slabs (cross-bank AND cross-expert
+        # adjacent merging, the R1x _row_groups rule) from a small dedicated
+        # pool, landing the reads in the GEMM/attention disk-idle window. A
+        # later layer's demand checks the stash first: hit -> slab H2D into the
+        # borrowed buffer (that row's NVMe wait is gone), miss -> the unchanged
+        # demand path. Default OFF == byte-identical current behavior; also
+        # forced OFF without a prediction file (no distribution, no speculation
+        # -- the PILOT identity predictor measured 1.01% precision and was a
+        # net loss on this disk) and in DS-FP4 conversion mode (the block
+        # machinery is native-layout only, like _row_groups).
+        self._prefill_bulk = bool(
+            int(os.environ.get("FREETOKEN_PREFILL_BULK_PREFETCH", "0")))
+        self._bulk_depth = int(os.environ.get("FREETOKEN_PREFILL_BULK_DEPTH", "8"))
+        self._bulk_topk = int(os.environ.get("FREETOKEN_PREFILL_BULK_TOPK", "32"))
+        self._bulk_min_frac = float(
+            os.environ.get("FREETOKEN_PREFILL_BULK_MIN_FRAC", "0"))
+        self._bulk_block = max(
+            1, int(os.environ.get("FREETOKEN_PREFILL_BULK_BLOCK", "4")))
+        self._bulk_slab_count = int(
+            os.environ.get("FREETOKEN_PREFILL_BULK_SLABS", "4"))
+        self._bulk_scores: list[dict[int, float]] | None = None
+        if self._prefill_bulk and self._convert:
+            print("[disk-tier] DS-FP4 conversion mode: bulk prefetch unsupported, "
+                  "forcing FREETOKEN_PREFILL_BULK_PREFETCH=0", flush=True)
+            self._prefill_bulk = False
+        if self._prefill_bulk:
+            pred = os.environ.get("FREETOKEN_PREFILL_BULK_PREDICT") or None
+            if pred is None:
+                print("[disk-tier] bulk prefetch needs FREETOKEN_PREFILL_BULK_PREDICT "
+                      "(a learned distribution); disabling", flush=True)
+                self._prefill_bulk = False
+            else:
+                nl, ne, scores = load_prediction_doc(pred)
+                if nl != index.num_layers or ne != index.num_experts:
+                    raise ValueError(
+                        f"bulk prediction doc {pred}: {nl}x{ne} does not match "
+                        f"the checkpoint {index.num_layers}x{index.num_experts}")
+                # The doc is in the GLOBAL expert namespace; plan in local ids.
+                hi = self._g0 + self._local_num
+                self._bulk_scores = [
+                    {e - self._g0: s for e, s in per.items() if self._g0 <= e < hi}
+                    for per in scores
+                ]
+        self._bulk_pool = (
+            ThreadPoolExecutor(
+                max_workers=int(
+                    os.environ.get("FREETOKEN_PREFILL_BULK_WORKERS", "2")),
+                thread_name_prefix="disk-tier-bulk")
+            if self._prefill_bulk else None
+        )
+        self._bulk_stash: dict = {}       # (layer, local expert) -> entry
+        self._bulk_lock = threading.Lock()
+        self._bulk_slab_free: list = []   # block slabs available for reuse
+        self._bulk_slabs_allocated = 0
+        self._row_map_list = self._row_map_cpu.tolist()
+        self._bk_issued = 0
+        self._bk_hits = 0
+        self._bk_wasted = 0
+        self._bk_bytes = 0
 
     # ------------------------------------------------------------------ fds
     def _fd(self, shard_idx: int) -> tuple[int, bool]:
@@ -985,6 +1050,36 @@ class DiskTier:
             else:
                 groups.append([shard_idx, a0, a1,
                                [(bank_idx, d0, d1, off, nbytes)],
+                               off + nbytes])
+        return groups
+
+    def _row_groups_multi(self, layer: int, experts) -> list:
+        """Cross-expert merged read plan for one prefetch block -- NATIVE mode
+        only (②b). Union of ``_row_groups`` over the block's experts with each
+        member tagged by its expert: [shard, a0, a1, [(expert, bank_idx, d0,
+        d1, off, nbytes)], exact_end]. Adjacent expert ids sit adjacent in the
+        checkpoint (``form_blocks`` sorts the block by id), so the R1x rule --
+        same shard, prev exact_end == next off -- now also merges ACROSS
+        experts; the whole block reads into one shared slab with a fraction of
+        the syscalls. Byte conservation vs the per-expert plans is exact."""
+        runs = []
+        for expert in experts:
+            for shard_idx, a0, a1, members, _end in self._row_groups(layer, expert):
+                for (bank_idx, d0, d1, off, nbytes) in members:
+                    runs.append((shard_idx, a0, a1, off, nbytes,
+                                 expert, bank_idx, d0, d1))
+        runs.sort(key=lambda t: (t[0], t[3]))
+        groups = []  # [shard, a0, a1, [(expert, bank_idx, d0, d1, off, nbytes)], exact_end]
+        for shard_idx, a0, a1, off, nbytes, expert, bank_idx, d0, d1 in runs:
+            if (groups and groups[-1][0] == shard_idx
+                    and groups[-1][4] == off):
+                g = groups[-1]
+                g[2] = max(g[2], a1)
+                g[4] = off + nbytes
+                g[3].append((expert, bank_idx, d0, d1, off, nbytes))
+            else:
+                groups.append([shard_idx, a0, a1,
+                               [(expert, bank_idx, d0, d1, off, nbytes)],
                                off + nbytes])
         return groups
 
@@ -1513,6 +1608,9 @@ class DiskTier:
         self._pf_disk_bytes += disk.numel() * self._db_row_bytes
         serve_pin = self._prefill_pin_source and pin.numel() > 0
         if disk.numel() == 0 and not serve_pin:
+            # All-resident layer: nothing to serve, but the GEMM still runs --
+            # keep the ②b window rolling so its reads land in the idle window.
+            self._bulk_advance(layer_id)
             return 0
         device = self._banks[0][1].device
         if device.type == "cuda":
@@ -1527,6 +1625,23 @@ class DiskTier:
         buffers = cache.prefill_bank_buffers
         if serve_pin:
             self._serve_pin_rows(layer_id, pin, buffers, buffer_id)
+        n_disk = disk.numel()
+        hit_entries: dict = {}
+        if self._prefill_bulk and n_disk > 0:
+            # ②b three-source consumption: stash hit -> slab H2D (that row's
+            # NVMe wait is gone); miss -> the unchanged demand path below.
+            with self._bulk_lock:
+                hits = [e for e in (int(x) for x in disk.tolist())
+                        if (layer_id, e) in self._bulk_stash]
+                hit_entries = {e: self._bulk_stash.pop((layer_id, e))
+                               for e in hits}
+            if hits:
+                self._bk_hits += len(hits)
+                for e, entry in hit_entries.items():
+                    self._stash_to_buffer(entry, layer_id, e, buffers, buffer_id)
+                disk = torch.tensor(
+                    [e for e in disk.tolist() if e not in hit_entries],
+                    dtype=disk.dtype, device=disk.device)
         futures = [
             self._pool.submit(self._fetch_expert, layer_id, int(e), -1,
                               buffers, buffer_id)
@@ -1535,8 +1650,13 @@ class DiskTier:
         for f in futures:
             f.result()
         self._sync_fetches()
-        self._dbg_fetched[layer_id] = {int(e) for e in disk.tolist()}
-        return disk.numel()
+        # The slab H2D copies are drained now: drop the hits' slab references.
+        for entry in hit_entries.values():
+            self._bulk_recycle_rec(entry["rec"])
+        self._dbg_fetched[layer_id] = ({int(e) for e in disk.tolist()}
+                                       | set(hit_entries))
+        self._bulk_advance(layer_id)
+        return n_disk
 
     def _serve_pin_rows(self, layer_id: int, pin_ids: torch.Tensor,
                         buffers, buffer_id: int) -> None:
@@ -1818,6 +1938,130 @@ class DiskTier:
         self.prefetch_from_routing(layer_id, torch.tensor(sorted(ids),
                                                           dtype=torch.int32))
 
+    # ------------------------------------------------- ②b bulk block prefetch
+    def _new_bulk_slab(self) -> torch.Tensor:
+        """One block slab: holds a whole block's merged reads (block_size x the
+        per-expert slab bound -- cross-expert merging only shrinks the total)."""
+        n = self._bulk_block * self._slab_bytes()
+        try:
+            return torch.zeros(n, dtype=torch.uint8, pin_memory=True)
+        except (RuntimeError, TypeError):
+            return torch.zeros(n, dtype=torch.uint8)
+
+    def _prefetch_block(self, layer: int, experts: list, entries: dict,
+                        slab: torch.Tensor) -> None:
+        """Pool task: read a block's merged groups into its shared slab. Pure
+        host work (preadv only, no CUDA, no slot cache), safe to run behind the
+        GEMM. Each expert's entry records (slab_off, a0, bank_idx, member) so
+        the hit path can slice its rows back out of the shared slab."""
+        slab_off = 0
+        for shard_idx, a0, a1, members, _end in self._row_groups_multi(
+                layer, experts):
+            slen = a1 - a0
+            if slab_off + slen > slab.numel():
+                # Block x per-expert slab bound must hold (same argument as the
+                # PILOT single-expert slab) -- fail loudly, never overrun the
+                # pinned allocation.
+                raise RuntimeError(
+                    f"bulk block slab overflow at layer {layer}: "
+                    f"{slab_off + slen} > {slab.numel()}")
+            mv = (ctypes.c_char * slen).from_address(slab.data_ptr() + slab_off)
+            fd, _direct = self._fd(shard_idx)
+            os.preadv(fd, [mv], a0)
+            self._preadv_calls += 1
+            self._bk_bytes += slen  # aligned preadv payload: the real disk traffic
+            for expert, bank_idx, d0, d1, off, nbytes in members:
+                entries[expert]["groups"].append(
+                    (slab_off, a0, bank_idx, (d0, d1, off, nbytes)))
+            slab_off += slen
+
+    def _stash_to_buffer(self, entry: dict, layer: int, expert: int,
+                         buffers, buffer_id: int) -> None:
+        """Bulk hit: copy the block slab's bytes into the borrowed buffer rows
+        (position == expert id) -- pinned H2D instead of an NVMe round trip.
+        Slab recycling is refcounted per block in _bulk_recycle_rec, not here:
+        the slab is shared with the block's other experts."""
+        entry["rec"]["future"].result()  # the block read may still be in flight
+        with torch.inference_mode():
+            slab = entry["slab"]
+            scalar_banks = getattr(self._index, "scalar_banks", ())
+            for bank_idx in range(len(self._banks)):
+                if bank_idx in scalar_banks:
+                    self._fill_scalar_row(
+                        bank_idx, layer, expert,
+                        buffers[bank_idx][buffer_id][expert])
+            for slab_off, a0, bank_idx, (d0, d1, off, nbytes) in entry["groups"]:
+                row = buffers[bank_idx][buffer_id][expert]
+                src = slab[slab_off + (off - a0):
+                           slab_off + (off - a0) + nbytes]
+                dst = row[d0:d1]
+                dst.copy_(src.view(dst.dtype).view(dst.shape), non_blocking=True)
+
+    def _bulk_recycle_rec(self, rec: dict) -> None:
+        """Drop one expert's reference on a block slab; the last drop waits for
+        the block read and returns the slab to the pool. Call only where the
+        slab's H2D copies are already drained (after _sync_fetches) or where
+        none were ever enqueued (wasted entries)."""
+        with self._bulk_lock:
+            rec["refs"] -= 1
+            if rec["refs"] > 0:
+                return
+        rec["future"].result()
+        with self._bulk_lock:
+            self._bulk_slab_free.append(rec["slab"])
+
+    def _bulk_advance(self, layer_id: int) -> None:
+        """Rolling ②b trigger, called at the END of fetch_routed_into for layer
+        L (demand served, the GEMM is about to start): recycle the entries no
+        layer will ever consume, then issue the learned plan for L+1..L+depth.
+        Issuing here -- not at layer entry -- is what keeps the prefetch reads
+        off the layer's own demand window; they land in the GEMM/attention
+        disk-idle window instead of stealing saturated bandwidth."""
+        if not self._prefill_bulk:
+            return
+        pending = []
+        with self._bulk_lock:
+            stale = [k for k in self._bulk_stash if k[0] <= layer_id]
+            for k in stale:
+                entry = self._bulk_stash.pop(k)
+                self._bk_wasted += 1
+                # Wasted entries never enqueued an H2D from the slab (any
+                # sibling hit's copies were drained by _sync_fetches already),
+                # so the slab is safe to recycle once the refcount hits zero.
+                # _bulk_recycle_rec re-enters the lock: defer past this block.
+                pending.append(entry["rec"])
+        for rec in pending:
+            self._bulk_recycle_rec(rec)
+        plan = build_prefetch_plan(
+            self._bulk_scores, self._row_map_list, self._ram,
+            start_layer=layer_id, depth=self._bulk_depth,
+            top_k=self._bulk_topk, min_frac=self._bulk_min_frac,
+            resident=self._resident_disk)
+        for target in sorted(plan):
+            for block in form_blocks(plan[target], self._bulk_block):
+                with self._bulk_lock:
+                    # A deeper earlier window may already cover some members.
+                    block = [e for e in block
+                             if (target, e) not in self._bulk_stash]
+                    if not block:
+                        continue
+                    slab = (self._bulk_slab_free.pop()
+                            if self._bulk_slab_free else None)
+                    if slab is None:
+                        if self._bulk_slabs_allocated >= self._bulk_slab_count:
+                            return  # slab budget exhausted; degrade gracefully
+                        slab = self._new_bulk_slab()
+                        self._bulk_slabs_allocated += 1
+                    rec = {"slab": slab, "future": None, "refs": len(block)}
+                    entries = {}
+                    for e in block:
+                        entry = {"slab": slab, "rec": rec, "groups": []}
+                        entries[e] = entry
+                        self._bulk_stash[(target, e)] = entry
+                        self._bk_issued += 1
+                rec["future"] = self._bulk_pool.submit(
+                    self._prefetch_block, target, block, entries, slab)
+
     def route_histogram(self) -> torch.Tensor:
         """Decayed (L, E) routing-mass snapshot for placement decisions."""
         return self._route_hist.clone()
@@ -1955,6 +2199,12 @@ class DiskTier:
                             self._slab_free.append((slab, None))
                     self._prefetch_pool.submit(_recycle)
                 self._stash.clear()
+        if self._prefill_bulk:
+            with self._bulk_lock:
+                pending = [entry["rec"] for entry in self._bulk_stash.values()]
+                self._bulk_stash.clear()
+            for rec in pending:
+                self._bulk_recycle_rec(rec)
 
     def record_doorbell(self, rows: int, host_us: int) -> None:
         """One served doorbell request (graph_fetch hot path; GIL-serialized
@@ -1998,6 +2248,15 @@ class DiskTier:
             "prefill_pin_bytes": self._pf_pin_bytes,
             "prefill_disk_rows": self._pf_disk_rows,
             "prefill_disk_bytes": self._pf_disk_bytes,
+            # ②b block bulk prefetch bookkeeping: issued = experts ever planned
+            # into block slabs; hits = routed rows served from a slab instead
+            # of NVMe; wasted = prefetched but never routed before going stale;
+            # bytes = aligned preadv payload of the bulk reads themselves.
+            "prefill_bulk": self._prefill_bulk,
+            "prefill_bulk_issued": self._bk_issued,
+            "prefill_bulk_hits": self._bk_hits,
+            "prefill_bulk_wasted": self._bk_wasted,
+            "prefill_bulk_bytes": self._bk_bytes,
             "doorbell_requests": self._db_requests,
             "doorbell_rows": self._db_rows,
             "doorbell_bytes": self._db_bytes,

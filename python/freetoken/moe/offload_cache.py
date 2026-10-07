@@ -424,10 +424,28 @@ class OffloadMoeCache:
             return None
         return guard.note_decode()
 
-    def admission_update(self, route_counts, miss_counts=None):
-        """One admission cycle's per-row counts; swaps once the period elapses."""
+    def admission_update(self, route_counts=None, miss_counts=None):
+        """One admission cycle's per-row counts; swaps once the period elapses.
+
+        With explicit counts this behaves exactly as OnlineAdmission.update.
+        Called WITHOUT counts (the engine/scheduler call site's form), it
+        self-sources: the cpu tier split kernel's cumulative [L,E] per-expert
+        counters are pulled as deltas since the last pull. Between evaluations
+        the call is a cheap no-op -- no device read, no sync; the counters keep
+        accumulating on the device and the next due pull folds the whole window
+        (so the decay cycle is one evaluation period under this wiring).
+        Without a cpu tier the conservative zero-miss reading applies.
+        """
         if self._admission is None:
             return []
+        if route_counts is None:
+            if not self._admission.evaluation_due:
+                return []
+            tier = self._cpu_tier
+            if tier is not None and tier.enabled:
+                route_counts, miss_counts = tier.take_route_count_deltas()
+            else:
+                route_counts = torch.zeros(self.num_layers, self.num_experts)
         return self._admission.update(route_counts, miss_counts)
 
     @property

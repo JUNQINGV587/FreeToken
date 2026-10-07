@@ -135,7 +135,10 @@ def _ct_split_kernel(
     hx_dev_ptr,  # [max_tokens, H] fp16 device staging
     picks_dev_ptr,  # [max_picks*3] int32 device staging (tok, row, w-bits)
     stats_ptr,  # [L*16] int64: [0] hits [1] misses [2] picks [3] calls
+    route_counts_ptr,  # [L*E] int64: per-expert routed entries (item ⑤ admission signal)
+    miss_counts_ptr,  # [L*E] int64: per-expert miss entries (item ⑤ admission signal)
     ram_rows,
+    E,  # local experts per layer (route/miss counter row width)
     layer_id,
     bsz,
     K: tl.constexpr,
@@ -180,16 +183,29 @@ def _ct_split_kernel(
         tl.store(mark_ptr + s, tl.where(ok, r + 1, -(r + 1)).to(tl.int32))
     nh = 0
     n_miss_entries = 0
+    # Per-expert counters: scalar RMW inside this single-block kernel, same
+    # determinism contract as cnt_ptr above -- one writer, replay-stable, no
+    # atomics on the output. Every routed entry increments route[e]; misses
+    # additionally increment miss[e]. Invariants: sum(route) == nh +
+    # n_miss_entries == bsz*K, sum(miss) == n_miss_entries.
+    rc_base = route_counts_ptr + layer_id.to(tl.int64) * E
+    mc_base = miss_counts_ptr + layer_id.to(tl.int64) * E
     for i in range(0, bsz * K):
         slot = tl.load(slots_ptr + i)
         mk = tl.load(mark_ptr + slot)
         if mk == 0:
             nh += 1
+            e_hit = tl.load(id_of_slot_ptr + slot) - layer_id * E
+            if (e_hit >= 0) & (e_hit < E):  # defensive: never scribble OOB
+                tl.store(rc_base + e_hit, tl.load(rc_base + e_hit) + 1)
         else:
             n_miss_entries += 1
             r = tl.where(mk > 0, mk - 1, -mk - 1)
             c = tl.load(cnt_ptr + r)
             tl.store(cnt_ptr + r, c + 1)
+            e_miss = tl.load(src_indices_ptr + r)
+            tl.store(rc_base + e_miss, tl.load(rc_base + e_miss) + 1)
+            tl.store(mc_base + e_miss, tl.load(mc_base + e_miss) + 1)
 
     # ---- scalar pass 2: order CPU-ok experts by (count asc, ordinal asc) ----
     # selection via "smallest key strictly greater than the previous" (keys are
@@ -286,7 +302,8 @@ def _ct_split_kernel(
         tl.store(seqc_ptr, seq)
     tl.store(ctrl_dev_ptr + _SEQ_OFF, seq)
 
-    # ---- per-layer routing counters (item ⑤'s future recorder) --------------
+    # ---- per-layer routing aggregates (observability only; item ⑤'s -------
+    # admission signal is the per-expert counters recorded in pass 1) --------
     sb = stats_ptr + layer_id.to(tl.int64) * 16
     tl.store(sb + 0, tl.load(sb + 0) + nh.to(tl.int64))
     tl.store(sb + 1, tl.load(sb + 1) + n_miss_entries.to(tl.int64))
@@ -368,6 +385,45 @@ def cost_select(entries: list[tuple[int, int]], nh: int, nm: int,
     return npk if tt > 0 else 0
 
 
+def route_count_mirror(slots: list[int], evict_slots: list[int], src_indices: list[int],
+                       row_map: list[int], ram_rows: int, id_of_slot: list[int],
+                       cache_size: int, layer_id: int, num_experts: int
+                       ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Python mirror of the split kernel's per-expert counting (scalar pass 1).
+
+    Reproduces the mark loop and the entry walk exactly: ``mark[s]`` holds
+    ``staged ordinal + 1`` for a CPU-ok staged miss and ``-(ordinal + 1)`` for
+    a GPU-bound one; an entry whose slot is unmarked is a hit whose expert is
+    ``id_of_slot[slot]`` (flat ``layer*E + expert``). Returns
+    ``(route_counts[E], miss_counts[E], nh, n_miss)``. The kernel keeps the
+    invariants ``route.sum() == nh + n_miss == len(slots)`` and
+    ``miss.sum() == n_miss`` by construction. Production counting runs in the
+    Triton kernel (the GPU battery cross-checks it against this mirror); the
+    mirror exists so the accounting is testable on pure CPU.
+    """
+    mark = [0] * cache_size
+    for r in range(len(src_indices)):
+        s = evict_slots[r]
+        row = row_map[src_indices[r]]
+        mark[s] = (r + 1) if 0 <= row < ram_rows else -(r + 1)
+    route = torch.zeros(num_experts, dtype=torch.int64)
+    miss = torch.zeros(num_experts, dtype=torch.int64)
+    nh = 0
+    n_miss = 0
+    for slot in slots:
+        mk = mark[slot]
+        if mk == 0:
+            nh += 1
+            route[id_of_slot[slot] - layer_id * num_experts] += 1
+        else:
+            n_miss += 1
+            r = mk - 1 if mk > 0 else -mk - 1
+            e = src_indices[r]
+            route[e] += 1
+            miss[e] += 1
+    return route, miss, nh, n_miss
+
+
 class CpuTier:
     """Protocol owner for the RAM-resident miss tier (one per MoE cache).
 
@@ -405,6 +461,8 @@ class CpuTier:
         cache = self._cache
         disk = self._disk
         assert cache is not None and disk is not None
+        self._num_layers = int(cache.num_layers)
+        self._num_experts = int(cache.num_experts)
         self._ram_rows = int(disk._ram)
         self._row_map = disk._row_map_dev  # [L, local_num] int32 device
         max_bs = int(getattr(cache, "cuda_graph_max_bs", 0) or 0)
@@ -432,9 +490,21 @@ class CpuTier:
             self._seqc = torch.zeros(1, dtype=torch.int64, device=dev)
             self._dflag = torch.zeros(8, dtype=torch.int64, device=dev)
             self._stats_dev = torch.zeros(cache.num_layers * 16, dtype=torch.int64, device=dev)
+            # Item ⑤'s admission signal (port/m4-perexpert-counts): cumulative
+            # [L,E] per-expert route/miss counters. The split kernel writes them
+            # during graph replay (device memory, so replay writes are real);
+            # host reads are on-demand, so no per-replay D2H mirror is added.
+            self._route_counts_dev = torch.zeros(cache.num_layers * cache.num_experts,
+                                                 dtype=torch.int64, device=dev)
+            self._miss_counts_dev = torch.zeros(cache.num_layers * cache.num_experts,
+                                                dtype=torch.int64, device=dev)
             self._mark = torch.zeros(plan, dtype=torch.int32, device=dev)
             self._cnt = torch.zeros(plan, dtype=torch.int32, device=dev)
             self._order = torch.zeros(plan, dtype=torch.int32, device=dev)
+        self._counter_snapshot = (
+            torch.zeros(self._num_layers, self._num_experts, dtype=torch.int64),
+            torch.zeros(self._num_layers, self._num_experts, dtype=torch.int64),
+        )
         self._built = True
 
     # ------------------------------------------------------------------
@@ -447,6 +517,33 @@ class CpuTier:
     @property
     def ram_rows(self) -> int:
         return self._ram_rows
+
+    # ------------------------------------------------------------------
+    # item ⑤ admission signal: per-expert counters (port/m4-perexpert-counts)
+    # ------------------------------------------------------------------
+    def route_counters(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cumulative per-expert (route, miss) counters on the host, [L, E] int64.
+
+        The split kernel accumulates them during graph replay (device memory,
+        so replay writes are real); this on-demand read is the only D2H they
+        ever pay -- no per-replay mirror node. Call at the admission evaluation
+        cadence, not per step.
+        """
+        if not self._built:
+            raise RuntimeError("attach() first")
+        shape = (self._num_layers, self._num_experts)
+        # copy=True even on CPU-device tensors: .cpu() alone aliases the buffer,
+        # and the delta snapshot must not track later kernel increments.
+        return (
+            self._route_counts_dev.view(shape).to("cpu", copy=True),
+            self._miss_counts_dev.view(shape).to("cpu", copy=True),
+        )
+
+    def take_route_count_deltas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-expert (route, miss) counts since the last take -- admission's feed."""
+        cur = self.route_counters()
+        prev, self._counter_snapshot = self._counter_snapshot, cur
+        return cur[0] - prev[0], cur[1] - prev[1]
 
     # ------------------------------------------------------------------
     # decode hooks
@@ -483,7 +580,10 @@ class CpuTier:
             self._hx_dev,
             self._picks_dev.view(-1),
             self._stats_dev,
+            self._route_counts_dev,
+            self._miss_counts_dev,
             self._ram_rows,
+            int(cache.num_experts),
             layer_id,
             bsz,
             K=K,
@@ -625,6 +725,10 @@ class CpuTier:
         if svc is not None:
             svc.shutdown()
 
+    # engine.shutdown() calls tier.stop(); keep the alias so teardown with
+    # --moe-cpu-tier on does not AttributeError after the workers are gone.
+    stop = shutdown
+
     # ------------------------------------------------------------------
     # observability (dsv41 ct_vllm.py:436-443 field contract)
     # ------------------------------------------------------------------
@@ -641,6 +745,8 @@ class CpuTier:
         calls = int(dev[:, 3].sum().item())
         wait_ns = int(self._dflag[_DFLAG_WAIT_NS].item())
         timeouts = int(self._dflag[_DFLAG_TIMEOUTS].item())
+        routed = int(self._route_counts_dev.sum().item())
+        missed_entries = int(self._miss_counts_dev.sum().item())
         total = hits + misses
         return {
             "enabled": True,
@@ -655,8 +761,17 @@ class CpuTier:
             "cost": dict(self._cost),
             "fatal": int(svc.fatal()) if svc is not None else 0,
             # Per-layer route classification [layer][hits, misses, picks, calls]
-            # -- the online-admission signal item 5 (route recorder) consumes.
+            # -- observability only. Item 5's online admission consumes the
+            # per-expert counters below (pulled as deltas via
+            # take_route_count_deltas), not this [L,16] aggregate.
             "per_layer": dev[:, :4].cpu().tolist(),
+            # Item 5's admission signal is live: cumulative [L,E] route/miss
+            # counters. Full matrices via route_counters(); JSON stats carries
+            # totals only -- L*E*2 int64 would bloat /v1/stats. Invariants:
+            # routed == hits + misses, miss_entries == misses.
+            "per_expert_counts": True,
+            "routed_entries": routed,
+            "miss_entries": missed_entries,
         }
 
     summary = stats

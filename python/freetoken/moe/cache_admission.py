@@ -26,6 +26,14 @@ def _env_bool(name: str) -> bool:
 VRAM_ELASTIC = _env_bool("FREETOKEN_VRAM_ELASTIC")
 ONLINE_ADMISSION = _env_bool("FREETOKEN_ONLINE_ADMISSION")
 
+# Honesty bit for /v1/stats (review 202610, m4 finding): until the GPU battery
+# (review item #12) lands the engine/scheduler call sites AND the CUDA apply,
+# these policies run with no production traffic -- "enabled" must not be read
+# as "working". Flip to True in the battery-#12 commit that wires the
+# scheduler's note_prefill_step/note_decode_step/admission_update calls and
+# the release/rewarm CUDA apply (unmap + empty_cache + re-add).
+WIRED = False
+
 
 class ElasticConfig:
     """Knobs for the elastic guard (dsv41 DSV41_EC_* equivalents)."""
@@ -163,6 +171,7 @@ class ElasticCacheGuard:
     def summary(self) -> dict:
         return {
             "enabled": True,
+            "wired": WIRED,
             "released": self._released,
             "keep_rows": len(self._keep),
             "releases": self.releases,
@@ -212,15 +221,22 @@ class OnlineAdmission:
     def note_step(self) -> None:
         self._since_eval += 1
 
+    @property
+    def evaluation_due(self) -> bool:
+        """True once ``period`` decode steps elapsed since the last evaluation."""
+        return self._since_eval >= self.config.period
+
     def update(self, route_counts, miss_counts=None) -> list[tuple[tuple[int, int], tuple[int, int]]]:
         """Fold one cycle's per-row counts in; evaluate when the period elapses.
 
         ``route_counts``/``miss_counts``: [L, E] per-row routed entries / misses
-        since the last update. ``miss_counts=None`` means "no per-row miss
-        signal yet" (item 1's stats_dev[L,16] per-layer counters are the wiring
-        source once they grow per-expert columns); the conservative reading is
-        zero misses, so no pin row crosses the threshold and the layout stays
-        put. Returns the applied swaps as [((layer, out_e), (layer, in_e)), ...].
+        since the last update. The wiring source is the cpu tier split kernel's
+        [L,E] per-expert counters (moe/cpu_tier.py, port/m4-perexpert-counts);
+        offload_cache.admission_update() pulls their deltas when called without
+        explicit counts. ``miss_counts=None`` remains the conservative fallback
+        (no miss signal: zero misses, so no pin row crosses the threshold and
+        the layout stays put). Returns the applied swaps as
+        [((layer, out_e), (layer, in_e)), ...].
         """
         counts = torch.as_tensor(route_counts, dtype=torch.float64)
         assert counts.shape == (self.num_layers, self.num_experts), counts.shape
@@ -285,6 +301,7 @@ class OnlineAdmission:
     def summary(self) -> dict:
         return {
             "enabled": True,
+            "wired": WIRED,
             "evaluations": self.evaluations,
             "swaps": self.swaps,
             "miss_rate_max": round(self._last_miss_rate_max, 4),

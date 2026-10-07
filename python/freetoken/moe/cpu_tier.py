@@ -69,6 +69,19 @@ Env knobs (all optional, all read at construction):
   FREETOKEN_CT_TIMEOUT_NS  combine spin budget per reporting interval
       (default 300ms; on expiry the kernel KEEPS SPINNING and bumps the
       timeouts counter -- a hang is loud, a wrong output is silent)
+
+20261007 rescue pieces (design: notes/engines/20261007-cpu-tier-rescue-design.md;
+all default off, off == pre-rescue behaviour):
+  FREETOKEN_CT_PRE_ENSURE  1 = claim BEFORE ensure_experts (pieces A+B):
+      claimed experts get a slot-0 sentinel so lru_ensure treats them as hits
+      (no staged eviction/fetch -> no churn) and the CPU job overlaps
+      ensure+fetch+GEMM instead of fetch+GEMM alone. The combine kernel
+      restores slot_for_id[e] = -1 from the claimed list.
+  FREETOKEN_CT_REUSE_MIN  piece C: claim only misses whose reuse score
+      (this-step duplicates + XSTEP_W * cross-step routing frequency) is >=
+      this threshold; -1 = off (claim every CPU-ok miss, the old policy).
+      FORCE_N bypasses the filter (calibration comparability).
+  FREETOKEN_CT_XSTEP_W  weight of the cross-step frequency term (default 1.0)
 """
 
 from __future__ import annotations
@@ -90,6 +103,10 @@ _CTRL_LEN = 8
 # module globals inside @triton.jit (NameError at compile). Host-side uses keep
 # working -- tl.constexpr supports int() and tensor indexing.
 _SEQ_OFF = tl.constexpr(7)  # LAST field of the block: the D2H memcpy lands it last
+# ctrl[3]: claimed-EXPERT count of the pre-ensure path (ctrl[2] counts PICKS;
+# the combine needs the expert count to restore the slot-0 sentinels). The
+# legacy kernel never writes it, so it stays 0 there (zeroed at attach).
+_CTRL_NCLAIMED = tl.constexpr(3)
 _DFLAG_WAIT_NS = tl.constexpr(1)
 _DFLAG_TIMEOUTS = tl.constexpr(2)
 _SPIN_NS_PER_ITER = tl.constexpr(5.0)  # rough per-iteration cost of the combine spin loop
@@ -157,6 +174,8 @@ def _ct_split_kernel(
     TOK,
     MAXN,
     FORCE_N,
+    REUSE_MIN,
+    XSTEP_W,
     BLOCK_H: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
@@ -212,6 +231,28 @@ def _ct_split_kernel(
             e_miss = tl.load(src_indices_ptr + r)
             tl.store(rc_base + e_miss, tl.load(rc_base + e_miss) + 1)
             tl.store(mc_base + e_miss, tl.load(mc_base + e_miss) + 1)
+
+    # ---- reuse filter (20261007 rescue piece C): demote low-reuse CPU-ok ----
+    # misses to the fetch path. Flipping the mark sign keeps the entry staged
+    # (pass 5 compacts mk != 0) but invisible to the sort below (mk > 0), so
+    # the doorbell fetches it like any other GPU-bound miss. FORCE_N bypasses
+    # the filter: it is the calibration knob and must stay comparable across
+    # reuse settings. REUSE_MIN < 0 compiles to a no-op (off == old policy).
+    # freq uses the counters BEFORE this step's increments (pass 1 already
+    # added this step's cnt; stats calls is only bumped at the end below).
+    if (REUSE_MIN >= 0.0) & (FORCE_N < 0):
+        calls_pre = tl.load(stats_ptr + layer_id.to(tl.int64) * 16 + 3)
+        denom = tl.maximum(calls_pre, 1).to(tl.float32)
+        for r in range(0, nm):
+            s = tl.load(evict_slots_ptr + r)
+            mk = tl.load(mark_ptr + s)
+            if mk > 0:
+                c = tl.load(cnt_ptr + r)
+                e = tl.load(src_indices_ptr + r)
+                rc_pre = tl.load(rc_base + e) - c.to(tl.int64)
+                score = c.to(tl.float32) + XSTEP_W * (rc_pre.to(tl.float32) / denom)
+                if score < REUSE_MIN:
+                    tl.store(mark_ptr + s, -mk)
 
     # ---- scalar pass 2: order CPU-ok experts by (count asc, ordinal asc) ----
     # selection via "smallest key strictly greater than the previous" (keys are
@@ -337,13 +378,215 @@ def _ct_split_kernel(
     tl.store(sb + 3, tl.load(sb + 3) + 1)
 
 
+@triton.jit(do_not_specialize=["layer_id", "bsz"])
+def _ct_split_pre_kernel(
+    ids_ptr,  # [bsz*K] int32 raw expert ids (READ ONLY; ensure rewrites later)
+    weights_ptr,  # [bsz*K] fp32, in/out: claimed entries become 0
+    hidden_ptr,  # [bsz, H] input activations (bf16/fp16)
+    slot_for_id_ptr,  # [E] int32 (this layer's row), in/out: claimed -> sentinel 0
+    row_map_ptr,  # [E] int32 (this layer's pin row map; -1 = not pinned)
+    mark_ptr,  # [PLAN] int32 scratch: expert -> 1 = CPU-ok candidate
+    cnt_ptr,  # [PLAN] int32 scratch: routed entries per candidate
+    order_ptr,  # [PLAN] int32 scratch: selection-sorted candidate expert ids
+    gpum_ptr,  # [PLAN] int32 scratch: expert -> 1 = distinct GPU-bound miss
+    claimed_ptr,  # [PLAN] int32 out: claimed expert ids (combine restores)
+    ctrl_dev_ptr,  # [8] int64 device staging: [0]=layer [1]=bsz [2]=npk [3]=nclaimed [7]=seq
+    seqc_ptr,  # [1] int64 device counter (graph replay bumps it -> new seq)
+    hx_dev_ptr,  # [max_tokens, H] fp16 device staging
+    picks_dev_ptr,  # [max_picks*3] int32 device staging (tok, row, w-bits)
+    stats_ptr,  # [L*16] int64: [0] hits [1] misses [2] picks [3] calls
+    route_counts_ptr,  # [L*E] int64: per-expert routed entries
+    miss_counts_ptr,  # [L*E] int64: per-expert miss entries
+    ram_rows,
+    E,  # local experts per layer (route/miss counter row width)
+    layer_id,
+    bsz,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    PLAN,
+    REUSE_MIN,
+    XSTEP_W,
+    TZC,
+    THIT,
+    CA,
+    CB,
+    TOK,
+    MAXN,
+    FORCE_N,
+    BLOCK_H: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    """Claim-BEFORE-ensure split (20261007 rescue pieces A+B+C).
+
+    Runs on RAW routing, before ``lru_ensure``: a claimed expert's
+    ``slot_for_id[e]`` is set to the slot-0 sentinel, so ensure classifies it
+    as a hit -- no victim eviction and no fetch is ever staged for it (piece
+    B, the churn fix) -- and the CPU job is published before
+    ensure+fetch+GEMM instead of fetch+GEMM alone, widening the overlap
+    window (piece A). Claimed entries' weights are zeroed here (ensure never
+    touches weights), so after ensure rewrites their ids to slot 0 the GPU
+    GEMM contributes exactly 0 for them. The combine kernel restores
+    ``slot_for_id[e] = -1`` from ``claimed_ptr``.
+
+    Sentinels bump ``usage[0]`` once per claimed expert per step, so slot 0's
+    resident is effectively pinned -- a deliberate 1/cache_size capacity tax,
+    documented in the design doc. Determinism contract identical to the
+    legacy kernel: one block, scalar ordered loops, no atomics.
+    """
+    # ---- lanes: stage hidden states to fp16 device staging + zero scratch ----
+    h_off = tl.arange(0, BLOCK_H)
+    for tok in range(0, bsz):
+        src = hidden_ptr + tok.to(tl.int64) * H
+        dst = hx_dev_ptr + tok.to(tl.int64) * H
+        for h0 in range(0, H, BLOCK_H):
+            h = h0 + h_off
+            hm = h < H
+            v = tl.load(src + h, mask=hm, other=0.0)
+            tl.store(dst + h, v.to(tl.float16), mask=hm)
+    p_off = tl.arange(0, BLOCK_P)
+    for p0 in range(0, PLAN, BLOCK_P):
+        p = p0 + p_off
+        pm = p < PLAN
+        tl.store(mark_ptr + p, tl.zeros([BLOCK_P], dtype=tl.int32), mask=pm)
+        tl.store(cnt_ptr + p, tl.zeros([BLOCK_P], dtype=tl.int32), mask=pm)
+        tl.store(gpum_ptr + p, tl.zeros([BLOCK_P], dtype=tl.int32), mask=pm)
+    tl.debug_barrier()  # scratch visible to the scalar loops below (same block)
+
+    # ---- scalar pass A: classify raw routing, count per-expert entries ------
+    # Candidates are keyed by EXPERT ID (not staged ordinal): the legacy
+    # kernel's staged order is ascending expert id (lru_ensure ranks misses by
+    # id), so (count asc, expert asc) reproduces its total order exactly.
+    rc_base = route_counts_ptr + layer_id.to(tl.int64) * E
+    mc_base = miss_counts_ptr + layer_id.to(tl.int64) * E
+    nh = 0
+    n_miss_entries = 0
+    for i in range(0, bsz * K):
+        e = tl.load(ids_ptr + i)
+        s = tl.load(slot_for_id_ptr + e)
+        tl.store(rc_base + e, tl.load(rc_base + e) + 1)
+        if s >= 0:
+            nh += 1
+        else:
+            n_miss_entries += 1
+            tl.store(mc_base + e, tl.load(mc_base + e) + 1)
+            row = tl.load(row_map_ptr + e)
+            ok = (row >= 0) & (row < ram_rows)
+            if ok:
+                tl.store(mark_ptr + e, 1)
+                tl.store(cnt_ptr + e, tl.load(cnt_ptr + e) + 1)
+            else:
+                tl.store(gpum_ptr + e, 1)
+
+    # ---- reuse filter (piece C): demote low-reuse candidates to GPU-bound ---
+    # Same semantics as the legacy kernel's filter: FORCE_N bypasses it;
+    # freq uses pre-step counters. Demoted experts are simply not candidates
+    # -- ensure stages them as ordinary misses (the pre-rescue behaviour for
+    # every miss).
+    if (REUSE_MIN >= 0.0) & (FORCE_N < 0):
+        calls_pre = tl.load(stats_ptr + layer_id.to(tl.int64) * 16 + 3)
+        denom = tl.maximum(calls_pre, 1).to(tl.float32)
+        for e in range(0, E):
+            mk = tl.load(mark_ptr + e)
+            if mk == 1:
+                c = tl.load(cnt_ptr + e)
+                rc_pre = tl.load(rc_base + e) - c.to(tl.int64)
+                score = c.to(tl.float32) + XSTEP_W * (rc_pre.to(tl.float32) / denom)
+                if score < REUSE_MIN:
+                    tl.store(mark_ptr + e, 0)
+                    tl.store(gpum_ptr + e, 1)
+
+    # ---- scalar pass B: order candidates by (count asc, expert asc) ---------
+    ncpu = 0
+    for e in range(0, E):
+        if tl.load(mark_ptr + e) == 1:
+            ncpu += 1
+    prev_c = -1
+    prev_e = -1
+    for i in range(0, ncpu):
+        best_c = _BIG
+        best_e = _BIG
+        for e in range(0, E):
+            mk = tl.load(mark_ptr + e)
+            if mk == 1:
+                c = tl.load(cnt_ptr + e)
+                after_prev = (c > prev_c) | ((c == prev_c) & (e > prev_e))
+                before_best = (c < best_c) | ((c == best_c) & (e < best_e))
+                if after_prev & before_best:
+                    best_c = c
+                    best_e = e
+        tl.store(order_ptr + i, best_e)
+        prev_c = best_c
+        prev_e = best_e
+
+    # ---- scalar pass C: cost-model scan over the sorted prefix (dsv41 tt) ---
+    npk = 0
+    if FORCE_N >= 0:
+        npk = tl.minimum(FORCE_N, ncpu)
+    else:
+        tt = 0.0
+        for k in range(0, MAXN + 1):
+            if k <= ncpu:
+                gpu_ms = THIT * (nh + n_miss_entries - k) + TZC * (n_miss_entries - k)
+                cpu_ms = CA
+                for i in range(0, k):
+                    e = tl.load(order_ptr + i)
+                    c = tl.load(cnt_ptr + e)
+                    cpu_ms += CB * (1.0 + TOK * (c - 1))
+                m = tl.maximum(gpu_ms, cpu_ms)
+                if (k == 0) | (m < tt):
+                    tt = m
+                    npk = k
+        if tt <= 0.0:
+            npk = 0
+
+    # ---- scalar pass D: claim the chosen experts, emit per-pair picks -------
+    # sentinel FIRST (per claimed expert, once), then its routed entries in
+    # routed order: weight -> 0 (GEMM contributes exactly 0) and one pick per
+    # (token, expert) pair. ids_ptr is never written.
+    w_out = 0
+    for j in range(0, npk):
+        e = tl.load(order_ptr + j)
+        row = tl.load(row_map_ptr + e)
+        tl.store(slot_for_id_ptr + e, e * 0)  # slot-0 sentinel, dtype-preserving
+        tl.store(claimed_ptr + j, e)
+        for i in range(0, bsz * K):
+            ei = tl.load(ids_ptr + i)
+            if ei == e:
+                wgt = tl.load(weights_ptr + i).to(tl.float32)
+                tl.store(picks_dev_ptr + w_out * 3 + 0, i // K)
+                tl.store(picks_dev_ptr + w_out * 3 + 1, row)
+                tl.store(picks_dev_ptr + w_out * 3 + 2, wgt.to(tl.int32, bitcast=True))
+                w_out += 1
+                tl.store(weights_ptr + i, 0.0)
+
+    # ---- publish: header fields; seq handled by the D2H memcpy ordering -----
+    tl.store(ctrl_dev_ptr + 0, layer_id.to(tl.int64))
+    tl.store(ctrl_dev_ptr + 1, bsz.to(tl.int64))
+    tl.store(ctrl_dev_ptr + 2, w_out.to(tl.int64))
+    tl.store(ctrl_dev_ptr + _CTRL_NCLAIMED, npk.to(tl.int64))
+    seq = tl.load(seqc_ptr, volatile=True)
+    if w_out > 0:
+        seq = seq + 1
+        tl.store(seqc_ptr, seq)
+    tl.store(ctrl_dev_ptr + _SEQ_OFF, seq)
+
+    # ---- per-layer routing aggregates (same [L,16] contract as legacy) ------
+    sb = stats_ptr + layer_id.to(tl.int64) * 16
+    tl.store(sb + 0, tl.load(sb + 0) + nh.to(tl.int64))
+    tl.store(sb + 1, tl.load(sb + 1) + n_miss_entries.to(tl.int64))
+    tl.store(sb + 2, tl.load(sb + 2) + w_out.to(tl.int64))
+    tl.store(sb + 3, tl.load(sb + 3) + 1)
+
+
 @triton.jit
 def _ct_combine_kernel(
     out_ptr,  # [bsz, H] GPU GEMM output, in/out
     hout_ptr,  # [max_tokens, H] fp32 pinned host partial sums (PCIe reads)
     done_ptr,  # [1] int64 pinned host flag, CPU-written
     dflag_ptr,  # [8] int64 device: [0]=target [1]=wait_ns [2]=timeouts
-    ctrl_dev_ptr,  # [8] int64 device staging: [2]=npk this call, [7]=target seq
+    ctrl_dev_ptr,  # [8] int64 device staging: [2]=npk [3]=nclaimed [7]=target seq
+    claimed_ptr,  # [PLAN] int32: claimed expert ids to restore (pre-ensure path)
+    slot_for_id_ptr,  # [E] int32: this layer's row (sentinel restore target)
     bsz,
     H: tl.constexpr,
     TIMEOUT_ITERS,
@@ -352,11 +595,30 @@ def _ct_combine_kernel(
     npk = tl.load(ctrl_dev_ptr + 2)
     if npk <= 0:
         return
+    # Rescue pieces A+B: restore the pre-ensure slot-0 sentinels
+    # (slot_for_id[e] = 0 made claimed experts pseudo-hits so lru_ensure
+    # staged no eviction/fetch for them). Stream-ordered after this layer's
+    # ensure and GEMM; the next reader is next step's ensure for this layer.
+    # nclaimed == 0 on the legacy path (ctrl[3] zero-initialised, never
+    # written by the legacy split kernel), so this loop is a no-op there.
+    ncl = tl.load(ctrl_dev_ptr + _CTRL_NCLAIMED)
+    for j in range(0, ncl):
+        e = tl.load(claimed_ptr + j)
+        tl.store(slot_for_id_ptr + e, -1)
     target = tl.load(ctrl_dev_ptr + _SEQ_OFF)
     # Publish the target FIRST (graph_fetch's ordering: a torn sequence can only
     # show up as a timeout, never as a silently accepted stale frame).
     tl.store(dflag_ptr, target)
     tl.debug_barrier()
+    # Piece D: real wall-clock spin time via %globaltimer (sm_70+). The old
+    # accounting assumed ~5ns/iter while a sys-scope host atomic costs ~1.5us,
+    # a ~300x underestimate of the GPU wait.
+    t0 = tl.sum(
+        tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l,l",
+            [tl.full([1], 0, tl.int64)], dtype=tl.int64, is_pure=False, pack=1
+        )
+    )
     iters = 0
     done = tl.atomic_add(done_ptr, 0, sem="acquire", scope="sys")
     while done < target:
@@ -367,8 +629,14 @@ def _ct_combine_kernel(
         if (TIMEOUT_ITERS > 0) & (iters % TIMEOUT_ITERS == 0):
             tl.store(dflag_ptr + _DFLAG_TIMEOUTS, tl.load(dflag_ptr + _DFLAG_TIMEOUTS) + 1)
         done = tl.atomic_add(done_ptr, 0, sem="acquire", scope="sys")
+    t1 = tl.sum(
+        tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l,l",
+            [tl.full([1], 0, tl.int64)], dtype=tl.int64, is_pure=False, pack=1
+        )
+    )
     tl.store(dflag_ptr + _DFLAG_WAIT_NS,
-             tl.load(dflag_ptr + _DFLAG_WAIT_NS) + (iters * _SPIN_NS_PER_ITER).to(tl.int64))
+             tl.load(dflag_ptr + _DFLAG_WAIT_NS) + (t1 - t0))
     h_off = tl.arange(0, BLOCK_H)
     for tok in range(0, bsz):
         dst = out_ptr + tok.to(tl.int64) * H
@@ -382,7 +650,9 @@ def _ct_combine_kernel(
 
 
 def cost_select(entries: list[tuple[int, int]], nh: int, nm: int,
-                cost: dict[str, float], force_n: int = -1) -> int:
+                cost: dict[str, float], force_n: int = -1,
+                reuse_scores: list[float] | None = None,
+                reuse_min: float = -1.0) -> int:
     """Python reference of the split kernel's passes 2-3 (dsv41 cost selection).
 
     ``entries`` holds one ``(duplicate_count, staged_ordinal)`` per CPU-ok miss
@@ -391,7 +661,15 @@ def cost_select(entries: list[tuple[int, int]], nh: int, nm: int,
     Returns the number of experts to serve on the CPU (0 = keep the fetch path).
     Production runs the Triton kernel; this mirror exists for the pure-CPU
     accounting tests and for calibration tooling.
+
+    Piece C (20261007 rescue): ``reuse_scores`` carries one score per entry
+    (see :func:`reuse_score`); with ``reuse_min >= 0`` entries scoring below
+    the threshold are demoted to the fetch path BEFORE ordering. ``force_n``
+    bypasses the filter (calibration knob comparability), mirroring the
+    kernel's ``(REUSE_MIN >= 0) & (FORCE_N < 0)`` guard.
     """
+    if force_n < 0 and reuse_scores is not None and reuse_min >= 0.0:
+        entries = [e for i, e in enumerate(entries) if reuse_scores[i] >= reuse_min]
     order = sorted(range(len(entries)), key=lambda i: (entries[i][0], entries[i][1]))
     ncpu = len(order)
     if force_n >= 0:
@@ -409,6 +687,78 @@ def cost_select(entries: list[tuple[int, int]], nh: int, nm: int,
             tt = m
             npk = k
     return npk if tt > 0 else 0
+
+
+def reuse_score(cnt: int, route_count_pre: int, calls_pre: int,
+                xstep_w: float = 1.0) -> float:
+    """Piece C reuse estimate: this-step duplicates + w * cross-step frequency.
+
+    ``route_count_pre`` is the expert's cumulative routed-entry count BEFORE
+    this step and ``calls_pre`` the layer's split-call count before this step,
+    so ``route_count_pre / max(calls_pre, 1)`` is the per-step routing rate the
+    [L,E] counters encode. The split kernels derive both from their own
+    counters (subtracting this step's contribution, which pass 1/A has
+    already added); the value is identical on both the legacy and the
+    pre-ensure path.
+    """
+    return cnt + xstep_w * (route_count_pre / max(calls_pre, 1))
+
+
+def pre_ensure_claim_plan(ids: list[int], K: int, slot_for_id_row: dict[int, int],
+                          row_map_row: dict[int, int], route_counts_pre: dict[int, int],
+                          calls_pre: int, cost: dict[str, float], ram_rows: int,
+                          reuse_min: float = -1.0, xstep_w: float = 1.0,
+                          force_n: int = -1) -> dict:
+    """Pure-python mirror of ``_ct_split_pre_kernel``'s decision + bookkeeping.
+
+    Reproduces the kernel's passes on raw routing: classify (hit / CPU-ok
+    candidate / GPU-bound), piece-C reuse demotion (skipped under force_n),
+    (count asc, expert asc) ordering, dsv41 cost selection, then the claim
+    side effects. Returns a dict with ``claimed`` (expert ids in selection
+    order), ``sentinels`` (same set -- the kernel writes slot_for_id[e] = 0),
+    ``weight_zeroed`` (entry indices whose weight becomes 0), ``picks``
+    ((token, row) per (token, expert) pair in publish order), ``demoted``
+    (reuse-filtered candidates, ascending), ``nh``/``n_miss``/``ncpu``/
+    ``npk``. Exists so the A+B+C bookkeeping is testable on pure CPU.
+    """
+    nh = 0
+    cnt: dict[int, int] = {}
+    for e in ids:
+        if slot_for_id_row[e] >= 0:
+            nh += 1
+        else:
+            row = row_map_row[e]
+            if 0 <= row < ram_rows:
+                cnt[e] = cnt.get(e, 0) + 1
+    n_miss = len(ids) - nh
+    demoted: set[int] = set()
+    if force_n < 0 and reuse_min >= 0.0:
+        for e in list(cnt):
+            if reuse_score(cnt[e], route_counts_pre.get(e, 0), calls_pre, xstep_w) < reuse_min:
+                demoted.add(e)
+                del cnt[e]
+    order = sorted(cnt, key=lambda e: (cnt[e], e))
+    npk = cost_select([(cnt[e], e) for e in order], nh, n_miss, cost, force_n=force_n)
+    claimed = order[:npk]
+    picks: list[tuple[int, int]] = []
+    weight_zeroed: list[int] = []
+    for e in claimed:
+        row = row_map_row[e]
+        for i, ei in enumerate(ids):
+            if ei == e:
+                picks.append((i // K, row))
+                weight_zeroed.append(i)
+    return {
+        "claimed": claimed,
+        "sentinels": list(claimed),
+        "weight_zeroed": weight_zeroed,
+        "picks": picks,
+        "demoted": sorted(demoted),
+        "nh": nh,
+        "n_miss": n_miss,
+        "ncpu": len(order),
+        "npk": npk,
+    }
 
 
 def route_count_mirror(slots: list[int], evict_slots: list[int], src_indices: list[int],
@@ -470,6 +820,10 @@ class CpuTier:
         )
         self._cost = _env_cost()
         self._force_n = int(os.environ.get("FREETOKEN_CT_FORCE_N", "-1"))
+        # 20261007 rescue pieces (design doc: notes/engines/20261007-cpu-tier-rescue-design.md)
+        self._pre_ensure = os.environ.get("FREETOKEN_CT_PRE_ENSURE", "0").strip() == "1"
+        self._reuse_min = float(os.environ.get("FREETOKEN_CT_REUSE_MIN", "-1"))
+        self._xstep_w = float(os.environ.get("FREETOKEN_CT_XSTEP_W", "1.0"))
         self._lock = threading.Lock()
         self._service = None
         self._started = False
@@ -536,6 +890,14 @@ class CpuTier:
             self._mark = torch.zeros(plan, dtype=torch.int32, device=dev)
             self._cnt = torch.zeros(plan, dtype=torch.int32, device=dev)
             self._order = torch.zeros(plan, dtype=torch.int32, device=dev)
+            # Pre-ensure path (rescue A+B): GPU-bound-miss dedup marker and the
+            # claimed-expert list the combine kernel restores sentinels from.
+            self._gpum = torch.zeros(plan, dtype=torch.int32, device=dev)
+            self._claimed_dev = torch.zeros(plan, dtype=torch.int32, device=dev)
+            # Slot row of the layer currently between split and combine (the
+            # combine kernel's sentinel-restore target; layers strictly
+            # alternate split -> combine on one stream).
+            self._cur_slot_row = cache.slot_for_id[0]
         self._counter_snapshot = (
             torch.zeros(self._num_layers, self._num_experts, dtype=torch.int64),
             torch.zeros(self._num_layers, self._num_experts, dtype=torch.int64),
@@ -552,6 +914,12 @@ class CpuTier:
     @property
     def ram_rows(self) -> int:
         return self._ram_rows
+
+    @property
+    def pre_ensure(self) -> bool:
+        """FREETOKEN_CT_PRE_ENSURE=1: the decode path calls split_pre before
+        cache.ensure_experts instead of split after it (rescue pieces A+B)."""
+        return self._pre_ensure
 
     # ------------------------------------------------------------------
     # item ⑤ admission signal: per-expert counters (port/m4-perexpert-counts)
@@ -601,6 +969,7 @@ class CpuTier:
         # lands before the protocol thread is up, that job is ignored and the
         # combine kernel spins on a seq nobody will ever serve (deadlock).
         self.start()
+        self._cur_slot_row = cache.slot_for_id[layer_id]
         K = int(topk_ids.numel() // bsz)
         _ct_split_kernel[(1,)](
             topk_ids,
@@ -636,6 +1005,8 @@ class CpuTier:
             TOK=self._cost["tok"],
             MAXN=int(self._cost["maxn"]),
             FORCE_N=self._force_n,
+            REUSE_MIN=self._reuse_min,
+            XSTEP_W=self._xstep_w,
             BLOCK_H=1024,
             BLOCK_P=1024,
             num_warps=4,
@@ -644,6 +1015,72 @@ class CpuTier:
         # pinned host mirror; the host never touches CUDA. ctrl carries seq and
         # is copied LAST, so a host observer seeing a new seq knows hx/picks
         # (copied earlier on the same stream) have also landed.
+        self._hx_host[:bsz].copy_(self._hx_dev[:bsz], non_blocking=True)
+        self._picks_host.copy_(self._picks_dev, non_blocking=True)
+        self._ctrl_host.copy_(self._ctrl_dev, non_blocking=True)
+        self.start()
+
+    def split_pre(self, layer_id: int, cache, hidden: torch.Tensor,
+                  topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> None:
+        """Claim-BEFORE-ensure split (FREETOKEN_CT_PRE_ENSURE=1; rescue A+B+C).
+
+        Runs on RAW routing BEFORE ``cache.ensure_experts``: claimed experts
+        get a slot-0 sentinel so lru_ensure treats them as pseudo-hits (no
+        victim eviction, no staged fetch -- the churn fix), and the CPU job
+        is published before ensure+fetch+GEMM, widening the overlap window
+        (the async fix). ``combine`` restores the sentinels. ``topk_ids`` is
+        never written (ensure's in-place rewrite is preserved); claimed
+        entries' weights are zeroed (ensure never touches weights).
+        """
+        if not self._built:
+            return
+        bsz = int(hidden.shape[0])
+        if bsz > self._max_tokens:
+            return  # never happens on the decode path; combine guards the same
+        # Same B7 discipline as split(): the service must exist before the
+        # first seq can be published.
+        self.start()
+        self._cur_slot_row = cache.slot_for_id[layer_id]
+        K = int(topk_ids.numel() // bsz)
+        _ct_split_pre_kernel[(1,)](
+            topk_ids,
+            topk_weights,
+            hidden,
+            cache.slot_for_id[layer_id],
+            self._row_map[layer_id],
+            self._mark,
+            self._cnt,
+            self._order,
+            self._gpum,
+            self._claimed_dev,
+            self._ctrl_dev,
+            self._seqc,
+            self._hx_dev,
+            self._picks_dev.view(-1),
+            self._stats_dev,
+            self._route_counts_dev,
+            self._miss_counts_dev,
+            self._ram_rows,
+            int(cache.num_experts),
+            layer_id,
+            bsz,
+            K=K,
+            H=self._hidden,
+            PLAN=int(cache.src_indices.numel()),
+            REUSE_MIN=self._reuse_min,
+            XSTEP_W=self._xstep_w,
+            TZC=self._cost["tzc"],
+            THIT=self._cost["thit"],
+            CA=self._cost["a"],
+            CB=self._cost["b"],
+            TOK=self._cost["tok"],
+            MAXN=int(self._cost["maxn"]),
+            FORCE_N=self._force_n,
+            BLOCK_H=1024,
+            BLOCK_P=1024,
+            num_warps=4,
+        )
+        # Same graph-pull publish contract as split() (ctrl with seq LAST).
         self._hx_host[:bsz].copy_(self._hx_dev[:bsz], non_blocking=True)
         self._picks_host.copy_(self._picks_dev, non_blocking=True)
         self._ctrl_host.copy_(self._ctrl_dev, non_blocking=True)
@@ -663,6 +1100,8 @@ class CpuTier:
             self._done_host,
             self._dflag,
             self._ctrl_dev,
+            self._claimed_dev,
+            self._cur_slot_row,
             bsz,
             H=int(out.shape[-1]),
             TIMEOUT_ITERS=timeout_iters,

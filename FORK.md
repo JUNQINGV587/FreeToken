@@ -355,3 +355,65 @@ Tests after the sync: CPU 10 passed (`test_rocm_arch`, `test_stats_timing`,
 `test_rocm_launch_kwargs` skips off-ROCm); GPU 15 passed (`test_row_store`,
 `test_ple_disk`, `test_pinned_tensor`), 0 Xid; regression `tests/moe+engine+utils+server`
 1316 passed / 128 skipped / 0 failed.
+
+## Port-branch entries pending merge (2026-10-07)
+
+Entries for the four `port/*` experiment branches, written at the file tail on
+purpose: the `m1-doorbell` and `m3-prefill-source` entries sit mid-file in their
+own branches, so keeping these in a separate tail section keeps the six-way merge
+conflict-free (union-append either way). Validation status for all four: CPU
+suites green on their branches; GPU validation is the deferred battery
+(`research/notes/engines/202610-port-branches-review.md` §6).
+
+- `feat(sched)`: **decode-share QoS two-parter** (`34b99ef223`, `3baea0f7e7`,
+  `port/m1-qos`) — dsv41's time-based decode share: under contention the
+  scheduler reserves a configurable share of each scheduling window for decode
+  so long prefills cannot starve running decodes, plus a contention chunk cap
+  that shrinks prefill chunks while requests wait. Switches:
+  `FREETOKEN_DECODE_SHARE` (fraction; unset = off = byte-identical scheduling),
+  `FREETOKEN_DECODE_SHARE_CAP_S` (allowance cap, default 10 s),
+  `FREETOKEN_LONG_PREFILL_WHEN_WAITING` (contention chunk cap in tokens).
+  Newly arriving requests bypass the throttle (`chunked_req is None`), so a
+  fresh prompt never queues behind its own allowance. Snapshot published on
+  `/v1/stats` under `sched_qos`. 22 CPU tests on branch; latency A/B defers to
+  the battery.
+- `feat(moe)`: **CPU tier -- RAM-resident miss compute** (`6c7809c253`,
+  `46ccb798c1`, `481fe8570f`, `677be89cb9`, `ccb259a4c6`, `4fe59ce9b1`,
+  `port/m2-cpu-tier`) — when the disk tier stages a decode-step miss whose row
+  already sits in the pinned RAM set, a Triton split kernel classifies the
+  routed entries and hands the CPU-ok experts to a C++ `CpuTierService`
+  (pinned-pool GEMV, ISA-tiered) instead of re-fetching them over PCIe; a
+  combine kernel spin-waits on a doorbell and folds the CPU partials back onto
+  the GPU GEMM output. Switch: `--moe-cpu-tier` (default off); cost model via
+  `FREETOKEN_CT_*` envs. The split kernel also records the cumulative [L,E]
+  per-expert route/miss counters that feed item ⑤'s online admission
+  (`port/m4-perexpert-counts`). Pure-CPU protocol/accounting tests on branch;
+  kernel-vs-mirror cross-check and the end-to-end decode win defer to the
+  battery.
+- `feat(moe)`: **prefill fat-GEMM experiment arm (②c)** (`f86be0fd81`,
+  `f3aa6bfc8c`, `d684bafc0b`, `7a4a1a13cc`, `port/m3-fat-gemm`) — prefill apply
+  can route through a fat-GEMM dispatch that dequantizes contiguous expert
+  banks and runs one wide GEMM instead of per-expert gathers, behind a decision
+  boundary (`FREETOKEN_PREFILL_FAT_GEMM`, default 0 = off; row threshold
+  `MIN_ROWS` default 32 to re-tune on the target). Ships with a fidelity gate
+  (`python -m freetoken.moe.prefill_fat_gemm`): bf16 top-1 agreement ≥ 0.98
+  and relative error ≤ 0.10 must hold before any default-on is considered, and
+  the run ledger surfaces in `/v1/stats`. Note for the A/B battery: the ②c
+  dequant scratch peaks at ~150 MB per expert (V4.1 geometry) — measure the
+  real peak in the battery arm; it sizes whether ②c can coexist with the
+  borrowed prefill ring on 48 GB cards.
+- `feat(moe)`: **VRAM-elastic guard + online admission skeleton (item ⑤)**
+  (`aae62c2f8b`, `58d3c7093c`, `d8acd60050`, `port/m4-cache-admission`;
+  per-expert signal: `port/m4-perexpert-counts`) — pure host-side policy for
+  elastic release/rewarm of MoE cache slots under prefill pressure and
+  route-count online admission that re-pins hot experts in the RAM set.
+  Switches: `FREETOKEN_VRAM_ELASTIC`, `FREETOKEN_ONLINE_ADMISSION` (both
+  default 0 = off = byte-identical cache behavior). Policy-only skeleton: the
+  guard construction, pin-layout handoff, stats passthrough and (as of the
+  per-expert-counts branch) the [L,E] route/miss signal are landed; the
+  engine/scheduler call sites and the CUDA apply (unmap + empty_cache +
+  re-add) are battery-#12 wiring. Until then `/v1/stats` carries
+  `wired: false` next to `enabled: true` so monitoring cannot misread an idle
+  policy as a working one. CPU tests cover release scope/gates, admission
+  boundaries (strict threshold, hysteresis, batch cap, period, decay) and the
+  self-sourced counter feed.

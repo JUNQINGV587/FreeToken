@@ -1,10 +1,18 @@
 """Weight loading for DeepSeek-V4-Flash (engine path).
 
   - :func:`iter_weights` streams resident (non-expert) tensors keyed by the model's
-    attribute paths (``model.`` + the checkpoint name). ``wo_a`` dequantized to bf16 to match
-    the reference bf16 einsum.
-  - :func:`iter_expert_pieces` streams the routed MXFP4 experts (e2m1 pairs + e8m0 per-32
-    scales, no global) as per-expert pieces for the expert quant method's banks.
+    attribute paths (``model.`` + the checkpoint name), TP-sharded to match each
+    module's parallel layout. ``wo_a`` dequantized to bf16 to match the reference
+    bf16 einsum (a checkpoint that ships ``wo_a`` without the e8m0 block scale is
+    taken at face value).
+  - :func:`iter_expert_pieces` streams the routed MXFP4 experts (e2m1 pairs + e8m0
+    per-32 scales, no global) as per-expert pieces for the expert quant method's banks.
+  - :func:`nvfp4_expert_spec` describes the NVFP4 expert layout of
+    ``nvidia/DeepSeek-V4-Flash-0731-NVFP4`` (ModelOpt ``dsv4-nvfp4-experts`` output —
+    the same quantization contract as ``nvidia/DeepSeek-V4.1-Flash-NVFP4``): canonical
+    ModelOpt tensor names, one bank per layer. The shared reader in
+    ``freetoken.moe.expert_pieces`` and the native NVFP4 banks in
+    ``freetoken.models.nvfp4_banks`` consume the spec.
 """
 
 from __future__ import annotations
@@ -18,12 +26,81 @@ import torch
 from tqdm import tqdm
 
 from freetoken.layers.quantization import QuantKind
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import get_tp_info, try_get_tp_info
 from freetoken.models.loader import drop_page_cache
+from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 
 from .args import DeepseekV4Args, load_args
 
 
+# --------------------------------------------------------------------------------------
+# TP partitioning (mirrors the module's parallel declarations).
+#
+# V4 attention is head-parallel: ``wq_b`` (LinearColParallelMerged, q_lora -> n_heads*head_dim)
+# and ``wo_a`` (einsum operand, N = o_groups*o_lora chunked by group) shard on N;
+# ``wo_b`` (LinearRowParallel) shards on K; ``attn_sink`` shards on the head axis.
+# ``wq_a`` and ``wkv`` are replicated. Shared experts are TP'd like any SwiGLU (gate/up on N,
+# down on K), the router (``gate.weight``/``gate.bias``/``gate.tid2eid``), compressors, indexer
+# and ``hc_*`` are replicated. With owner-EP (``moe_ep_size > 1``) the routed experts are not
+# sharded at all — each rank loads its own experts whole (``iter_expert_pieces``).
+#
+# Keys are checkpoint names after stripping a trailing ``.weight`` / ``.scale`` / ``.bias`` /
+# ``.input_scale`` so the same row matches the weight and its companions.
+_TP_SHARD_DIM: dict[str, int] = {
+    "attn.wq_b": 0,
+    "attn.attn_sink": 0,
+    "attn.wo_a": 0,
+    "attn.wo_b": 1,
+    "ffn.shared_experts.w1": 0,
+    "ffn.shared_experts.w3": 0,
+    "ffn.shared_experts.w2": 1,
+}
+_TP_VOCAB_KEYS = frozenset({"embed.weight", "head.weight"})
+
+
+def _tp_dim(name: str) -> int | None:
+    """Shard dimension for a checkpoint tensor under TP, or None when replicated."""
+    base = name
+    for suf in (".weight", ".scale", ".bias", ".input_scale"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    for pat, dim in _TP_SHARD_DIM.items():
+        if base.endswith(pat):
+            return dim
+    if base in _TP_VOCAB_KEYS:
+        return 0
+    return None
+
+
+def _tp_shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    """Slice a checkpoint tensor to this rank's TP partition (identity without TP info)."""
+    tp = try_get_tp_info()
+    if tp is None or tp.size == 1:
+        return tensor
+    dim = _tp_dim(name)
+    if dim is None:
+        return tensor
+
+    def _shard(t: torch.Tensor, dim: int) -> torch.Tensor:
+        if dim >= t.ndim:
+            # attn_sink is sharded by n_heads but its fp8 scale (if any) is [1].
+            return t
+        size = t.shape[dim]
+        if size < tp.size:
+            # Degenerate axis (e.g. a scale's singleton block dim): replicate.
+            return t
+        # All sharded axes (head/group counts, inter dims, block dims of fp8 scales) are
+        # TP-divisible.
+        assert size % tp.size == 0, f"{name}: dim {dim} size {size} not divisible by tp={tp.size}"
+        return t.narrow(dim, tp.rank * (size // tp.size), size // tp.size)
+
+    return _shard(tensor, dim)
+
+
+# --------------------------------------------------------------------------------------
+# Shard streaming.
+# --------------------------------------------------------------------------------------
 class _ShardReader:
     def __init__(self, folder: str, weight_map: dict, device):
         self._folder = folder
@@ -81,9 +158,11 @@ def iter_weights(
 ):
     """Stream resident (non-expert) weights as ``(name, tensor)`` keyed to engine params.
 
-    Routed MXFP4 experts come from the offload cache, so ``include_moe_experts`` must be
-    False (DeepSeek-V4 only runs ``--moe-strategy offload``). Tensors yielded in checkpoint
-    dtype (fp8 + e8m0 preserved); ``wo_a`` dequantized to bf16 to match the reference einsum.
+    Routed experts come from the offload cache (MXFP4 dialect or NVFP4 banks), so
+    ``include_moe_experts`` must be False (DeepSeek-V4 only runs ``--moe-strategy offload``).
+    Tensors yielded in checkpoint dtype (fp8 + e8m0 preserved) and TP-partitioned to the
+    module layouts; ``wo_a`` dequantized to bf16 to match the reference einsum (raw bf16
+    ``wo_a`` without a scale is passed through, TP-sharded like everything else).
     """
     if include_moe_experts:
         raise ValueError(
@@ -97,7 +176,7 @@ def iter_weights(
     reader = _ShardReader(model_path, _weight_map(model_path), device)
 
     def get(name: str) -> torch.Tensor:
-        return reader.get(name)
+        return _tp_shard(name, reader.get(name))
 
     def linear(src: str, dst: str):
         yield f"{dst}.weight", get(f"{src}.weight")
@@ -120,10 +199,15 @@ def iter_weights(
             yield from linear(f"{a}.wq_b", f"{m}.wq_b")
             yield from linear(f"{a}.wkv", f"{m}.wkv")
             yield f"{m}.kv_norm.weight", get(f"{a}.kv_norm.weight")
-            # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
-            yield f"{m}.wo_a", _dequant_fp8_block(
-                get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
-            )
+            # wo_a: FP8 + e8m0 block scale in the author's and nvidia's checkpoints,
+            # dequantized to bf16 (reference bf16 einsum); a checkpoint that ships a plain
+            # (bf16) wo_a without the scale is taken at face value.
+            if reader.has(f"{a}.wo_a.scale"):
+                yield f"{m}.wo_a", _dequant_fp8_block(
+                    get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
+                )
+            else:
+                yield f"{m}.wo_a", get(f"{a}.wo_a.weight")
             yield from linear(f"{a}.wo_b", f"{m}.wo_b")
             yield f"{m}.attn_sink", get(f"{a}.attn_sink")
 
@@ -173,13 +257,24 @@ _PROJ_ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
 _KIND_SUFFIX = {"weight": "", "scale": "_scale"}
 
 
-def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(
+    model_path: str, config, kind: QuantKind, *,
+    parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20,
+    ownership=None,
+):
     """Routed experts, one piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0
-    ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
+    ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped.
+
+    Handles the MXFP4 dialect of the author's ``DeepSeek-V4-Flash`` checkpoint (TP=1 only).
+    NVFP4 checkpoints (``nvidia/DeepSeek-V4-Flash-0731-NVFP4``) return None so the shared
+    reader falls back to :func:`nvfp4_expert_spec`, which also handles ``ownership``
+    (owner-EP row filtering)."""
     if kind is not QuantKind.MXFP4:
         return None
     if get_tp_info().size > 1:
-        raise NotImplementedError("DeepSeek-V4 expert banks support TP=1 only")
+        raise NotImplementedError("DeepSeek-V4 MXFP4 expert banks support TP=1 only")
+    if ownership is not None:
+        raise NotImplementedError("DeepSeek-V4 MXFP4 expert banks do not support owner-EP")
     from freetoken.models.weight import iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 
@@ -212,4 +307,32 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
-__all__ = ["iter_weights", "iter_expert_pieces"]
+# --------------------------------------------------------------------------------------
+# NVFP4 expert source spec (nvidia/DeepSeek-V4-Flash-0731-NVFP4).
+#
+# The nvidia repository's experts are ModelOpt ``dsv4-nvfp4-experts`` output with the
+# same quantization contract as nvidia/DeepSeek-V4.1-Flash-NVFP4: canonical tensor names
+# ``w1/w2/w3.{weight, weight_scale, weight_scale_2}`` per expert, per-16 fp8 (e4m3) local
+# scales, one fp32 global scale per tensor whose checkpoint value is already the
+# reciprocal the banks keep (``global_reciprocal=False``). The extra per-tensor
+# ``input_scale`` (F32) is ignored — ``activation_scheme: dynamic`` recomputes the
+# activation scale at runtime, and the V4.1 production checkpoint carries the same
+# tensor and ignores it too. With 43 MoE layers and no dense prefix the bank id is the
+# layer id itself.
+_NVFP4_EXPERT_KEY_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts\.")
+_NVFP4_KIND_MAP = {"weight": "weight", "weight_scale": "weight_scale", "weight_scale_2": "weight_scale_2"}
+
+
+def nvfp4_expert_spec(config) -> Nvfp4ExpertSourceSpec | None:
+    """NVFP4 expert layout for ``nvidia/DeepSeek-V4-Flash-0731-NVFP4``."""
+    return Nvfp4ExpertSourceSpec(
+        key_pattern=_NVFP4_EXPERT_KEY_RE,
+        proj_to_role={"w1": "gate", "w2": "down", "w3": "up"},
+        layer_to_bank=lambda layer, config: layer,
+        desc="DeepSeek-V4-Flash-0731 NVFP4 experts (modelopt)",
+        kind_map=_NVFP4_KIND_MAP,
+        global_reciprocal=False,
+    )
+
+
+__all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec"]

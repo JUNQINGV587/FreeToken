@@ -476,18 +476,27 @@ class CpuTier:
         self._top_k = max(int(top_k), 1)
         self._max_picks = self._max_tokens * self._top_k
         plan = int(cache.src_indices.numel())
-        gu0 = cache.bank_sources["gate_up_packed"][0]
+        # bank_sources may be keyed by canonical role ("gate_up") or by schema
+        # name ("gate_up_packed") depending on the registration path -- accept both.
+        from freetoken.moe.legacy_format import canonical_role
+
+        banks_by_role = {canonical_role(n): v for n, v in cache.bank_sources.items()}
+        if "gate_up" not in banks_by_role:
+            raise KeyError(
+                f"gate_up: cpu tier needs nvfp4 banks, have {sorted(cache.bank_sources)} "
+                f"(quant_format={getattr(cache, 'quant_format', None)!r})")
+        gu0 = banks_by_role["gate_up"][0]
         self._hidden = int(gu0.shape[2] * 2)
         dev = cache.slot_for_id.device
-        self._ctrl_host = alloc_pinned_tensor((_CTRL_LEN,), dtype=torch.int64)
+        self._ctrl_host = alloc_pinned_tensor(_CTRL_LEN, dtype=torch.int64)
         self._ctrl_host.zero_()
         # fp16 on the wire (matches the device staging so the D2H pull is a plain
         # memcpy -- a dtype-converting copy_ is not); the service converts to
         # bf16 through f32 on prep (exact).
-        self._hx_host = alloc_pinned_tensor((self._max_tokens, self._hidden), dtype=torch.float16)
-        self._picks_host = alloc_pinned_tensor((self._max_picks, 3), dtype=torch.int32)
-        self._hout = alloc_pinned_tensor((self._max_tokens, self._hidden), dtype=torch.float32)
-        self._done_host = alloc_pinned_tensor((1,), dtype=torch.int64)
+        self._hx_host = alloc_pinned_tensor(self._max_tokens, self._hidden, dtype=torch.float16)
+        self._picks_host = alloc_pinned_tensor(self._max_picks, 3, dtype=torch.int32)
+        self._hout = alloc_pinned_tensor(self._max_tokens, self._hidden, dtype=torch.float32)
+        self._done_host = alloc_pinned_tensor(1, dtype=torch.int64)
         self._done_host.zero_()
         with torch.inference_mode(False):
             self._ctrl_dev = torch.zeros(_CTRL_LEN, dtype=torch.int64, device=dev)
@@ -567,6 +576,11 @@ class CpuTier:
         bsz = int(hidden.shape[0])
         if bsz > self._max_tokens:
             return  # never happens on the decode path; combine guards the same
+        # Start the service BEFORE the first seq can be published: start_protocol
+        # snapshots ctrl[seq] as its ignore-baseline, so if the first job's D2H
+        # lands before the protocol thread is up, that job is ignored and the
+        # combine kernel spins on a seq nobody will ever serve (deadlock).
+        self.start()
         K = int(topk_ids.numel() // bsz)
         _ct_split_kernel[(1,)](
             topk_ids,
@@ -703,12 +717,20 @@ class CpuTier:
     @staticmethod
     def _bank_tables(cache) -> dict:
         """Per-layer pointer tables over the PINNED HOST bank rows (the tier's input)."""
-        from freetoken.moe.cpu_executor import _make_table
+        # Local equivalent of CpuExecutor._make_table: an int64 tensor of
+        # per-layer base addresses (the C++ service indexes tbl[layer_id]).
+        def _make_table(layers):
+            assert len(layers) == cache.num_layers, (len(layers), cache.num_layers)
+            return torch.tensor([t.data_ptr() for t in layers], dtype=torch.int64)
 
-        sources = cache.bank_sources  # name -> per-layer host tensors
-        gate_up = sources["gate_up_packed"]
+        # bank_sources may be keyed by canonical role ("gate_up") or by schema
+        # name ("gate_up_packed") depending on the registration path.
+        from freetoken.moe.legacy_format import canonical_role
+
+        sources = {canonical_role(n): v for n, v in cache.bank_sources.items()}
+        gate_up = sources["gate_up"]
         gu_scale = sources["gate_up_scale"]
-        down = sources["down_packed"]
+        down = sources["down"]
         dn_scale = sources["down_scale"]
         gate_up_global = sources.get("gate_up_global", gate_up)  # dummy for ds_fp4
         down_global = sources.get("down_global", down)
@@ -884,11 +906,14 @@ def _reference_moe(banks, layer_id: int, fmt: str, hidden: torch.Tensor,
                    n_tok: int, act: str, limit: float, alpha: float,
                    apply_on_input: bool) -> torch.Tensor:
     """Pure-PyTorch mirror of the service numerics (self-test reference)."""
+    from freetoken.moe.legacy_format import canonical_role
+
+    banks = {canonical_role(n): v for n, v in banks.items()}
     H = int(hidden.shape[-1])
     out = torch.zeros(n_tok, H, dtype=torch.float32)
-    gu_p = banks["gate_up_packed"][layer_id].cpu()
+    gu_p = banks["gate_up"][layer_id].cpu()
     gu_s = banks["gate_up_scale"][layer_id].cpu()
-    dn_p = banks["down_packed"][layer_id].cpu()
+    dn_p = banks["down"][layer_id].cpu()
     dn_s = banks["down_scale"][layer_id].cpu()
     gu_g = banks.get("gate_up_global")
     gu_g = gu_g[layer_id].cpu() if gu_g is not None else None

@@ -266,22 +266,42 @@ def _ct_split_kernel(
     # claimed expert: every routed entry at its slot gets slot 0 + weight 0
     # (GPU GEMM contributes exactly 0), the slot reservation is undone, and one
     # pick per (token, expert) pair is appended in routed order.
-    w_out = 0
+    # B9 (20261007 battery follow-up): the old expert-major sweep rewrote a
+    # claimed entry's slot to 0 BEFORE later claims re-scanned the entries, so
+    # any later-claimed expert whose VICTIM slot was 0 re-matched those entries
+    # and emitted duplicate weight-0 picks (numerically inert, but each cost a
+    # full 22MB DRAM expert read in the service). Two-phase now: flag the
+    # claimed slots first, then ONE routed sweep emits each pick exactly once.
+    # cnt_ptr is re-purposed as the slot -> (pin row + 1) map: passes 1-3 have
+    # consumed the per-ordinal counts, and the lane zero-pass below resets the
+    # slot domain (slots and ordinals share the index range < PLAN).
+    for p0 in range(0, PLAN, BLOCK_P):
+        p = p0 + p_off
+        pm = p < PLAN
+        tl.store(cnt_ptr + p, tl.zeros([BLOCK_P], dtype=tl.int32), mask=pm)
+    tl.debug_barrier()
     for j in range(0, npk):
         r = tl.load(order_ptr + j)
         e = tl.load(src_indices_ptr + r)
         s = tl.load(evict_slots_ptr + r)
         row = tl.load(row_map_ptr + e)
-        for i in range(0, bsz * K):
-            slot = tl.load(slots_ptr + i)
-            if slot == s:
-                wgt = tl.load(weights_ptr + i).to(tl.float32)
-                tl.store(picks_dev_ptr + w_out * 3 + 0, i // K)
-                tl.store(picks_dev_ptr + w_out * 3 + 1, row)
-                tl.store(picks_dev_ptr + w_out * 3 + 2, wgt.to(tl.int32, bitcast=True))
-                w_out += 1
-                tl.store(slots_ptr + i, slot * 0)  # slot 0 sentinel, dtype-preserving
-                tl.store(weights_ptr + i, 0.0)
+        tl.store(cnt_ptr + s, row + 1)  # rows >= 0, so 0 means "not claimed"
+    w_out = 0
+    for i in range(0, bsz * K):
+        slot = tl.load(slots_ptr + i)
+        fl = tl.load(cnt_ptr + slot)
+        if fl > 0:
+            wgt = tl.load(weights_ptr + i).to(tl.float32)
+            tl.store(picks_dev_ptr + w_out * 3 + 0, i // K)
+            tl.store(picks_dev_ptr + w_out * 3 + 1, fl - 1)
+            tl.store(picks_dev_ptr + w_out * 3 + 2, wgt.to(tl.int32, bitcast=True))
+            w_out += 1
+            tl.store(slots_ptr + i, slot * 0)  # slot 0 sentinel, dtype-preserving
+            tl.store(weights_ptr + i, 0.0)
+    for j in range(0, npk):
+        r = tl.load(order_ptr + j)
+        e = tl.load(src_indices_ptr + r)
+        s = tl.load(evict_slots_ptr + r)
         tl.store(slot_for_id_ptr + e, -1)
         tl.store(id_of_slot_ptr + s, -1)
         tl.store(mark_ptr + s, 0)  # claimed: drop from the staged plan below

@@ -341,13 +341,22 @@ class OffloadMoELayer(MoELayer):
             # defaults to off -- see DiskTier._prefetch_window for the 1.01%
             # adjacent-layer accuracy measurement that set that default.
             cache._disk_tier.prefetch_from_routing(self.layer_id, topk_ids)
+        tier = cache._cpu_tier
+        if tier is not None and tier.pre_ensure:
+            # ① rescue A+B (FREETOKEN_CT_PRE_ENSURE=1): claim RAM-resident
+            # misses BEFORE ensure_experts -- claimed experts become
+            # pseudo-hits via a slot-0 sentinel, so lru_ensure stages no
+            # eviction/fetch for them (no churn), and the CPU job overlaps
+            # ensure + fetch + GEMM. combine() restores the sentinels.
+            tier.split_pre(self.layer_id, cache, hidden_states, topk_weights,
+                           topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
-        if cache._cpu_tier is not None:
+        if tier is not None and not tier.pre_ensure:
             # RAM-resident miss tier (dsv41 M2): classify misses BEFORE the
             # doorbell/fetch -- pinned-bank rows are claimed for CPU compute,
             # the staged plan shrinks to the fetch remainder.
-            cache._cpu_tier.split(self.layer_id, cache, hidden_states, topk_weights,
-                                  topk_ids)
+            tier.split(self.layer_id, cache, hidden_states, topk_weights,
+                       topk_ids)
         cache.copy_missing()
         if (cache.disk_tier_enabled and self.layer_id == 0
                 and os.environ.get("FT_DISK_TIER_VERIFY")

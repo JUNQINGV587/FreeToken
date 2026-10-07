@@ -15,6 +15,7 @@ Covered:
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
@@ -23,8 +24,11 @@ import torch
 from freetoken.kernel import _cpu_moe
 from freetoken.moe.cpu_tier import (
     _SEQ_OFF,
+    CpuTier,
     _reference_moe,
     cost_select,
+    pre_ensure_claim_plan,
+    reuse_score,
 )
 
 L, E, H, I = 2, 4, 256, 128
@@ -269,6 +273,127 @@ def test_cost_select_duplicates_make_experts_cheaper_first():
 
 
 # ----------------------------------------------------------------------
+# 20261007 rescue piece C: reuse-aware claim filter (kernel pass mirror)
+# ----------------------------------------------------------------------
+def test_reuse_score_components():
+    assert reuse_score(1, 0, 0) == 1.0  # cold start: no history, freq 0
+    assert reuse_score(1, 50, 100) == 1.5  # cross-step freq 0.5
+    assert reuse_score(3, 10, 10, xstep_w=0.0) == 3.0  # w=0: this-step only
+    assert reuse_score(1, 10, 10, xstep_w=3.0) == 4.0  # w scales the freq term
+
+
+def test_cost_select_reuse_min_demotes_low_reuse():
+    cheap = dict(_COST, tzc=10.0, b=0.01, a=0.01)
+    entries = [(1, 0), (1, 1), (1, 2)]
+    # no filter: the cheap-CPU model claims all three
+    assert cost_select(entries, nh=2, nm=3, cost=cheap) == 3
+    # scores below reuse_min are demoted before ordering
+    assert cost_select(entries, nh=2, nm=3, cost=cheap,
+                       reuse_scores=[0.2, 1.5, 0.7], reuse_min=1.0) == 1
+    # boundary is inclusive: score == reuse_min is kept
+    assert cost_select(entries, nh=2, nm=3, cost=cheap,
+                       reuse_scores=[1.0, 0.1, 0.1], reuse_min=1.0) == 1
+    # everything demoted -> nothing served (tt(0) > 0 keeps the fetch path)
+    assert cost_select(entries, nh=2, nm=3, cost=cheap,
+                       reuse_scores=[0.0, 0.0, 0.0], reuse_min=0.5) == 0
+
+
+def test_cost_select_reuse_filter_off_by_default():
+    cheap = dict(_COST, tzc=10.0, b=0.01, a=0.01)
+    assert cost_select([(1, 0)], nh=1, nm=1, cost=cheap,
+                       reuse_scores=[0.0], reuse_min=-1.0) == 1
+
+
+def test_cost_select_force_n_bypasses_reuse_filter():
+    entries = [(1, 0), (1, 1)]
+    assert cost_select(entries, nh=2, nm=2, cost=_COST, force_n=2,
+                       reuse_scores=[0.0, 0.0], reuse_min=99.0) == 2
+
+
+# ----------------------------------------------------------------------
+# 20261007 rescue pieces A+B: pre-ensure claim bookkeeping mirror
+# ----------------------------------------------------------------------
+def _plan(**overrides):
+    args = dict(
+        ids=[5, 2, 5, 7, 2, 9],
+        K=3,
+        slot_for_id_row={5: -1, 2: 4, 7: -1, 9: -1},
+        row_map_row={5: 0, 2: 1, 7: 2, 9: -1},
+        route_counts_pre={5: 10, 7: 0, 9: 3},
+        calls_pre=10,
+        cost=dict(_COST, tzc=10.0, b=0.01, a=0.01),
+        ram_rows=64,
+    )
+    args.update(overrides)
+    return pre_ensure_claim_plan(**args)
+
+
+def test_pre_ensure_plan_claims_only_missed_pinned():
+    p = _plan()
+    # expert 2 is slot-resident (slot 4): never claimed; expert 9 misses but
+    # has no pin row: stays GPU-bound. 5 and 7 are CPU-ok misses.
+    assert set(p["claimed"]) <= {5, 7}
+    assert 2 not in p["claimed"] and 9 not in p["claimed"]
+    assert p["nh"] == 2 and p["n_miss"] == 4  # two entries hit slot 4
+
+
+def test_pre_ensure_plan_sentinel_weight_and_picks():
+    p = _plan()
+    assert set(p["sentinels"]) == set(p["claimed"])
+    zeroed = set(p["weight_zeroed"])
+    for i, e in enumerate([5, 2, 5, 7, 2, 9]):
+        assert (i in zeroed) == (e in p["claimed"])
+    # every pick addresses a pin row of a claimed expert, token = entry // K
+    assert len(p["picks"]) == len(zeroed)
+    for tok, row in p["picks"]:
+        assert 0 <= row < 64 and tok in (0, 1)
+    # publish order: selection order (5 has cnt 2 > 7's cnt 1 -> 7 first),
+    # entries in routed order within an expert
+    assert p["claimed"] == [7, 5]
+    assert p["picks"] == [(1, 2), (0, 0), (0, 0)]
+
+
+def test_pre_ensure_plan_reuse_demotion_leaves_expert_to_fetch():
+    # 5: cnt 2 + freq 10/10 = 3.0 >= 1.5 kept; 7: cnt 1 + freq 0 = 1.0 demoted
+    p = _plan(reuse_min=1.5)
+    assert set(p["claimed"]) == {5}
+    assert p["demoted"] == [7]
+    p0 = _plan()  # filter off: both CPU-ok misses are claimable
+    assert set(p0["claimed"]) == {5, 7}
+    assert p0["demoted"] == []
+
+
+def test_pre_ensure_plan_force_n_bypasses_reuse():
+    p = _plan(reuse_min=99.0, force_n=2)
+    assert set(p["claimed"]) == {5, 7}
+    assert p["demoted"] == []
+
+
+def test_pre_ensure_plan_determinism():
+    assert _plan() == _plan()
+
+
+def test_rescue_env_flags_default_off(monkeypatch):
+    for v in ("FREETOKEN_CT_PRE_ENSURE", "FREETOKEN_CT_REUSE_MIN",
+              "FREETOKEN_CT_XSTEP_W"):
+        monkeypatch.delenv(v, raising=False)
+    tier = CpuTier(None, None)
+    assert tier.pre_ensure is False
+    assert tier._reuse_min < 0.0
+    assert tier._xstep_w == 1.0
+
+
+def test_rescue_env_flags_parse(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_CT_PRE_ENSURE", "1")
+    monkeypatch.setenv("FREETOKEN_CT_REUSE_MIN", "1.5")
+    monkeypatch.setenv("FREETOKEN_CT_XSTEP_W", "3")
+    tier = CpuTier(None, None)
+    assert tier.pre_ensure is True
+    assert tier._reuse_min == 1.5
+    assert tier._xstep_w == 3.0
+
+
+# ----------------------------------------------------------------------
 # numerics vs the pure-torch reference (nvfp4 + ds_fp4)
 # ----------------------------------------------------------------------
 def _rel_rms(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -326,5 +451,40 @@ def test_determinism_across_repeated_jobs():
             assert torch.equal(first, bufs["hout"][:n_tok]), (
                 "per-pick scratch + ordered reduction must be bitwise stable"
             )
-    finally:
-        svc.shutdown()
+    finally:        svc.shutdown()
+
+# ----------------------------------------------------------------------
+# Kernel-logic regression via the triton interpreter (pure CPU): the helper
+# runs in a subprocess with TRITON_INTERPRET=1 set before triton is imported
+# (the interpreter's builtin patching only engages on a fresh import). It
+# exits 3 when the interpreter is unavailable -> the test skips.
+# ----------------------------------------------------------------------
+def _run_interp_helper() -> None:
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    helper = Path(__file__).with_name("_cpu_tier_interp_check.py")
+    env = dict(os.environ, TRITON_INTERPRET="1")
+    repo_python = str(Path(__file__).resolve().parents[2] / "python")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [repo_python] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    proc = subprocess.run([sys.executable, str(helper)], env=env,
+                          capture_output=True, text=True, timeout=300)
+    if proc.returncode == 3:
+        pytest.skip(f"triton interpreter unavailable: {proc.stdout.strip()}")
+    assert proc.returncode == 0, (
+        f"interp helper failed (rc={proc.returncode})\n{proc.stdout}\n{proc.stderr}")
+
+
+def test_split_kernel_b9_single_pick_per_claimed_entry():
+    """B9: a claimed entry rewritten to the slot-0 sentinel must not be
+    re-matched by a later claim whose victim slot is 0 (duplicate weight-0
+    picks -> wasted 22MB DRAM expert reads in the service)."""
+    _run_interp_helper()
+
+
+def test_split_pre_kernel_sentinel_and_picks_interp():
+    """Pre-ensure kernel == its python mirror: slot-0 sentinels, zeroed
+    weights, untouched ids, picks, stats (claim-before-ensure bookkeeping)."""
+    _run_interp_helper()

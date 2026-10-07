@@ -13,7 +13,8 @@ from freetoken.server.stats import build_stats
 
 
 def _state(*, cache_pools=None, enforced=None, page_size=1, model_max=262144,
-           served_modalities=(), mm=None, mm_stats=None, host_tier_stats=None):
+           served_modalities=(), mm=None, mm_stats=None, host_tier_stats=None,
+           qos_stats=None):
     pools = dict(cache_pools or {})
     state = SimpleNamespace(
         config=SimpleNamespace(
@@ -41,7 +42,7 @@ def _state(*, cache_pools=None, enforced=None, page_size=1, model_max=262144,
         prompt_tokens_total=0, completion_tokens_total=0, cached_tokens_total=0,
         cached_prompt_tokens_total=0, decode_tokens_total=0,
         prefill_seconds_total=0.0, decode_seconds_total=0.0,
-        moe_stats=None, mm_stats=mm_stats, host_tier_stats=host_tier_stats, decode_tps=lambda *_: 0.0, prefill_tps=lambda *_: 0.0,
+        moe_stats=None, mm_stats=mm_stats, host_tier_stats=host_tier_stats, qos_stats=qos_stats, decode_tps=lambda *_: 0.0, prefill_tps=lambda *_: 0.0,
     )
     return state
 
@@ -143,3 +144,17 @@ def test_stats_reports_the_host_tier_section_only_when_it_was_sampled():
     snap = {"capacity_pages": 12288, "spills": 3, "hits": 2, "misses": 1}
     doc = build_stats(_state(host_tier_stats=snap), p95_ms=0, ttft_mean_ms=0)
     assert doc["kv_host_tier"] == snap
+
+
+def test_stats_reports_the_sched_qos_section_only_when_it_was_sampled():
+    """Both QoS knobs are off by default, so the section must be None -- a deployment
+    without decode share / contention cap sees no schema change."""
+    assert build_stats(_state(), p95_ms=0, ttft_mean_ms=0)["sched_qos"] is None
+
+    snap = {
+        "decode_share": {"share": 0.25, "cap_s": 10.0, "allow_s": 1.5,
+                         "throttled": 4, "granted_s": 6.0, "consumed_s": 4.5},
+        "chunk_cap": {"cap_tokens": 7168, "contending": True, "capped_passes": 12},
+    }
+    doc = build_stats(_state(qos_stats=snap), p95_ms=0, ttft_mean_ms=0)
+    assert doc["sched_qos"] == snap

@@ -45,6 +45,10 @@ class StatsTracker:
         # residency); None until the first sample or when the tier is not enabled -- None is NOT
         # "enabled but idle", which is why the field is absent rather than zeroed.
         self.host_tier_stats: dict | None = None
+        # Last scheduler-QoS snapshot (decode-share allowance/throttle ledger and the
+        # contention chunk-cap state); None until the first sample or when neither
+        # FREETOKEN_DECODE_SHARE nor FREETOKEN_LONG_PREFILL_WHEN_WAITING is set.
+        self.qos_stats: dict | None = None
         # Cumulative timing, summed per request like llama.cpp's prompt/predicted seconds, so a
         # poller can diff consecutive polls into speeds; the sliding-window rates above decay
         # to zero between polls. Prefill runs from admission to a request's first output reply;
@@ -102,6 +106,8 @@ class StatsTracker:
             self.mm_stats = reply.mm_stats
         if getattr(reply, "host_tier_stats", None) is not None:
             self.host_tier_stats = reply.host_tier_stats
+        if getattr(reply, "qos_stats", None) is not None:
+            self.qos_stats = reply.qos_stats
         if getattr(reply, "kv_total_pages", 0) > 0:  # ignore 0/0 (prompt reply, owned-KV)
             self.kv_used_pages = reply.kv_used_pages
             self.kv_total_pages = reply.kv_total_pages
@@ -310,4 +316,8 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         # The host KV tier is a prefix-cache extension, so it sits beside that section rather
         # than under moe/mm. None when the deployment did not enable it.
         "kv_host_tier": tr.host_tier_stats,
+        # Scheduler QoS decisions (decode-share ledger, contention chunk-cap); None when both
+        # knobs are off, so a deployment without them sees no schema change. getattr because
+        # test harnesses (and any older tracker stand-in) may not carry the field.
+        "sched_qos": getattr(tr, "qos_stats", None),
     }

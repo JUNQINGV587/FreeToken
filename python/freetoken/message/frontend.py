@@ -55,6 +55,9 @@ class UserReply(BaseFrontendMsg):
     # Throttled host KV-tier snapshot (spills/restores/refusals + residency, see TierStats);
     # None until the first sample or when FREETOKEN_KV_HOST_TIER_PAGES is unset.
     host_tier_stats: dict | None = None
+    # Scheduler-QoS snapshot (decode-share ledger + contention chunk-cap), same pass-through
+    # and interval; None until the first sample or when neither knob is enabled.
+    qos_stats: dict | None = None
     # Scheduler-measured prefill span (see DetokenizeMsg.prefill_ms). Arrives once, on the
     # reply carrying the request's first generated token; 0.0 on every other reply.
     prefill_ms: float = 0.0

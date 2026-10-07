@@ -29,8 +29,10 @@ from freetoken.utils import (
 )
 
 from .cache import CacheManager
+from .chunk_policy import contention_chunk_cap_tokens
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .decode_share import DecodeSharePolicy
 from .interleave import DecodeInterleavePolicy
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
@@ -101,6 +103,12 @@ class Scheduler(SchedulerIOMixin):
         self._interleave = DecodeInterleavePolicy(
             getattr(config, "decode_interleave_every", None)
         )
+        # Time-based decode share (dsv41 port, off unless FREETOKEN_DECODE_SHARE > 0): a
+        # step that carried prefill and took T wall seconds earns f*T of decode-only
+        # allowance (cap 10 s), spent by throttling the next prefill chunks. Fresh
+        # waiting arrivals are never held back (dsv41 D130: without that exception
+        # short TTFT blew up to 117 s). None keeps the historical order exactly.
+        self._decode_share = DecodeSharePolicy.from_env()
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
@@ -486,6 +494,7 @@ class Scheduler(SchedulerIOMixin):
             moe_stats = self._moe_stats_snapshot()
             mm_stats = self._mm_stats_snapshot()
             host_tier_stats = self._host_tier_stats_snapshot()
+            qos_stats = self._qos_stats_snapshot()
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -500,6 +509,8 @@ class Scheduler(SchedulerIOMixin):
                     m.mm_stats = mm_stats
                 if host_tier_stats is not None:
                     m.host_tier_stats = host_tier_stats
+                if qos_stats is not None:
+                    m.qos_stats = qos_stats
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -638,6 +649,40 @@ class Scheduler(SchedulerIOMixin):
             return None  # tier not enabled: nothing to report, and nothing to remember
         self._host_tier_stats_last_at = now
         return stats
+
+    def _qos_stats_snapshot(self) -> dict | None:
+        """Throttled scheduler-QoS snapshot for /v1/stats.
+
+        Reports the decode-share ledger (allowance, prefill throttles, grant/consume
+        totals) and the contention chunk-cap state (cap, whether requests are contending,
+        capped passes). None when neither knob is enabled -- the historical default -- and
+        the throttle only engages for a configuration that actually samples. Sampled at
+        most once per second like its MoE/host-tier siblings, and a failing sample must
+        never break the reply stream."""
+        share = getattr(self, "_decode_share", None)
+        pm = getattr(self, "prefill_manager", None)
+        cap = contention_chunk_cap_tokens()
+        if share is None and cap <= 0:
+            return None
+        now = time.monotonic()
+        if now - getattr(self, "_qos_stats_last_at", 0.0) < 1.0:
+            return None
+        try:
+            snap = {
+                "decode_share": share.snapshot() if share is not None else None,
+                "chunk_cap": {
+                    "cap_tokens": cap,
+                    "contending": pm is not None and len(pm.pending_list) >= 2,
+                    "capped_passes": (
+                        pm.contention_capped_passes if pm is not None else 0
+                    ),
+                },
+            }
+        except Exception as e:  # noqa: BLE001 -- observability must not break serving
+            logger.warning(f"qos stats snapshot failed: {e!r}")
+            return None
+        self._qos_stats_last_at = now
+        return snap
 
     def _mm_stats_snapshot(self) -> dict | None:
         """Throttled encoder embedding-cache snapshot for /v1/stats (live entries/bytes).
@@ -1081,11 +1126,30 @@ class Scheduler(SchedulerIOMixin):
         # object simply does not have rather than something that breaks it. A missing
         # policy is the historical prefill-first order.
         policy = getattr(self, "_interleave", None)
+        share = getattr(self, "_decode_share", None)
+        # Settle the just-finished step's span BEFORE deciding this slot: the allowance a
+        # prefill step earned must already be visible when the throttle decision is made
+        # (dsv41's hook updates its DS dict in the same order).
+        if share is not None:
+            share.close_span()
         batch = None
         if policy is not None and policy.wants_decode():
             batch = self.decode_manager.schedule_next_batch()
             if batch is not None:
                 policy.note_decode()
+        if (
+            batch is None
+            and share is not None
+            and share.wants_decode(
+                decoding=self.decode_manager.runnable,
+                waiting_new=self.prefill_manager.has_new_waiting,
+            )
+        ):
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                share.note_throttle()
+                if policy is not None:
+                    policy.note_decode()
         if batch is None:
             batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
             if batch is not None and policy is not None:
@@ -1096,6 +1160,8 @@ class Scheduler(SchedulerIOMixin):
                 policy.note_decode()
         if batch is None:
             return None
+        if share is not None:
+            share.note_step(had_prefill=batch.is_prefill)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input

@@ -978,6 +978,99 @@ def test_fetch_pending_remap_all_ram_still_translates(checkpoint):
     assert cache.evict_slots[:2].tolist() == [5, 6]
 
 
+def _fill_pin_rows(cache, layout):
+    """Simulate the checkpoint loader: bank row r of each layer holds the
+    pinned expert layout[layer][r]'s content (all 6 banks)."""
+    for bank_idx, (host_layers, _gpu) in enumerate(cache.banks):
+        for layer, rows in enumerate(layout):
+            for r, expert in enumerate(rows):
+                row = _expected_rows(layer, expert)[bank_idx]
+                host_layers[layer][r].contiguous().view(torch.uint8).reshape(-1).copy_(row)
+
+
+def test_apply_pin_swaps_hot_swaps_row_content_and_maps(checkpoint):
+    """Admission apply (FREETOKEN_ADMISSION_APPLY): the challenger's disk row
+    replaces the incumbent's RAM slot and the two trade places in the pin
+    maps; every other row stays put. Layer 0 pins {1,3} (map [2,0,3,1]):
+    swap ((0,1),(0,2)) moves expert 2 into bank row 0, demotes expert 1."""
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2, pin_rows=[[1, 3], [0, 2]])
+    _fill_pin_rows(cache, [[1, 3], [0, 2]])
+
+    report = tier.apply_pin_swaps([((0, 1), (0, 2))])
+
+    assert report["applied"] == [((0, 1), (0, 2))]
+    assert report["failed"] == 0
+    assert report["io_bytes"] == tier._db_row_bytes
+    # Bank row 0 of layer 0 now holds expert 2's checkpoint bytes (6 banks).
+    expected = _expected_rows(0, 2)
+    for bank_idx, (host_layers, _gpu) in enumerate(cache.banks):
+        assert torch.equal(
+            host_layers[0][0].contiguous().view(torch.uint8).reshape(-1),
+            expected[bank_idx])
+    # The untouched pin row (expert 3 in row 1) is byte-identical.
+    expected3 = _expected_rows(0, 3)
+    for bank_idx, (host_layers, _gpu) in enumerate(cache.banks):
+        assert torch.equal(
+            host_layers[0][1].contiguous().view(torch.uint8).reshape(-1),
+            expected3[bank_idx])
+    # Maps flipped; layer 1 untouched; bijection preserved.
+    assert tier._row_map_cpu[0].tolist() == [2, 3, 0, 1]
+    assert tier._row_map_cpu[1].tolist() == [0, 2, 1, 3]
+    assert sorted(tier._row_map_cpu[0].tolist()) == [0, 1, 2, 3]
+    assert tier._pin_ids_cpu[0].tolist() == [2, 3]
+    assert tier._nonpin_dev[0].tolist() == [0, 1]
+    # Device tensors updated IN PLACE (captured graphs baked their pointers).
+    assert tier._row_map_dev[0].tolist() == [2, 3, 0, 1]
+    assert tier._pin_ids_dev[0].tolist() == [2, 3]
+    assert tier._pin_ids_dev_i64[0].tolist() == [2, 3]
+    # Residency classification follows the new layout: experts 0/1 disk now.
+    assert tier._routed_disk(0, torch.tensor([0, 1, 2, 3])).tolist() == [0, 1]
+    assert tier._remapped
+    # Bookkeeping: apply does its own accounting, NOT fetch demand.
+    s = tier.stats()
+    assert s["apply_swaps"] == 1
+    assert s["apply_failures"] == 0
+    assert s["apply_io_bytes"] == tier._db_row_bytes
+    assert s["apply_host_ms"] >= 0.0
+    assert tier._fetches == 0
+    # The demoted expert still serves from disk through the normal fetch path.
+    tier._fetch_expert_inner(0, 1, 5)
+    for bank_idx, (_host, gpu_cache) in enumerate(cache.banks):
+        assert torch.equal(
+            gpu_cache[5].contiguous().view(torch.uint8).reshape(-1),
+            _expected_rows(0, 1)[bank_idx])
+    assert tier._fetches == 1
+
+
+def test_apply_pin_swaps_disk_read_failure_keeps_old_row(checkpoint, monkeypatch):
+    """Prepare-phase preadv failure: the pair is dropped with the layout
+    untouched (old row kept, maps unflipped), counted as an apply failure."""
+    cache = _fake_cache()
+    tier = _tier(checkpoint, cache, ram_experts=2, pin_rows=[[1, 3], [0, 2]])
+    _fill_pin_rows(cache, [[1, 3], [0, 2]])
+
+    def _boom(fd, bufs, off):
+        raise OSError(5, "injected EIO")
+
+    monkeypatch.setattr("os.preadv", _boom)
+    report = tier.apply_pin_swaps([((0, 1), (0, 2))])
+
+    assert report["applied"] == []
+    assert report["failed"] == 1
+    expected = _expected_rows(0, 1)
+    for bank_idx, (host_layers, _gpu) in enumerate(cache.banks):
+        assert torch.equal(
+            host_layers[0][0].contiguous().view(torch.uint8).reshape(-1),
+            expected[bank_idx])
+    assert tier._row_map_cpu[0].tolist() == [2, 0, 3, 1]
+    assert tier._pin_ids_cpu[0].tolist() == [1, 3]
+    s = tier.stats()
+    assert s["apply_swaps"] == 0
+    assert s["apply_failures"] == 1
+    assert s["apply_io_bytes"] == 0
+
+
 class _SegIndex:
     """Handcrafted segment layouts for _row_groups merge-math tests."""
     scalar_banks = (2, 5)
@@ -1090,6 +1183,11 @@ def _bare_tier() -> DiskTier:
     t._pf_pin_bytes = 0
     t._pf_disk_rows = 0
     t._pf_disk_bytes = 0
+    # Admission apply ledger, defaults == zero.
+    t._apply_swaps = 0
+    t._apply_failures = 0
+    t._apply_io_bytes = 0
+    t._apply_host_ns = 0
     return t
 
 

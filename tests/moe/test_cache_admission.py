@@ -253,3 +253,110 @@ def test_cache_slot_bytes_feeds_rewarmed_bytes(monkeypatch):
     cache.set_bank_sources({"gate_up": [torch.randn(4, 8, 4)], "down": [torch.randn(4, 4, 4)]})
     # fp32 rows: (8*4 + 4*4) * 4 = 192 bytes per slot
     assert cache.elastic_guard.slot_bytes == 192
+
+
+# ---- admission swap apply (FREETOKEN_ADMISSION_APPLY, 20261007) -------------
+
+
+def test_admission_defer_commit_keeps_membership_until_commit():
+    a = _admission(period=1)
+    a.defer_commit = True
+    counts = _counts({(0, 0): 100, (0, 5): 100})
+    miss = _counts({(0, 0): 11, (0, 5): 90})
+    swaps = a.update(counts, miss)
+    assert swaps == [((0, 0), (0, 5))]
+    # Planned and counted, but membership untouched until the physical apply
+    # commits back through commit_swaps.
+    assert a.pin_rows[0] == [0, 1, 2]
+    assert a.swaps == 1 and a.applied_swaps == 0
+    assert a.commit_swaps(swaps) == 1
+    assert a.pin_rows[0] == [1, 2, 5]
+    assert a.applied_swaps == 1
+    # Stale pairs (membership moved on) skip instead of corrupting the layout.
+    assert a.commit_swaps([((0, 0), (0, 6))]) == 0
+    assert a.pin_rows[0] == [1, 2, 5]
+    assert a.applied_swaps == 1
+    s = a.summary()
+    assert s["apply_deferred"] is True
+    assert s["applied_swaps"] == 1
+    assert s["steps"] >= 1 and s["warmup_steps"] == a.config.warmup_steps
+
+
+class _ApplyTier:
+    """Disk-tier stub: records apply calls, reports every pair applied."""
+
+    def __init__(self, applied_n: int | None = None):
+        self.calls = []
+        self._n = applied_n
+
+    def apply_pin_swaps(self, swaps):
+        self.calls.append(list(swaps))
+        n = len(swaps) if self._n is None else self._n
+        return {"applied": list(swaps)[:n], "failed": len(swaps) - n,
+                "io_bytes": 1000 * n, "host_us": 5}
+
+
+def _apply_cache(monkeypatch, warmup: int = 0, apply_on: bool = True):
+    monkeypatch.setattr(ca, "ONLINE_ADMISSION", True)
+    monkeypatch.setattr(ca, "ADMISSION_APPLY", apply_on)
+    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=SLOTS,
+                            device=torch.device("cpu"))
+    cache.admission.config.warmup_steps = warmup
+    cache.admission.set_pin_rows([[0, 1], [2, 3]])
+    return cache
+
+
+def test_apply_env_off_is_noop(monkeypatch):
+    cache = _apply_cache(monkeypatch, apply_on=False)
+    tier = _ApplyTier()
+    cache._disk_tier = tier
+    assert cache.admission.defer_commit is False  # legacy count-only mode
+    assert cache.apply_admission_swaps([((0, 0), (0, 2))]) is None
+    assert tier.calls == []
+
+
+def test_apply_requires_disk_tier(monkeypatch):
+    cache = _apply_cache(monkeypatch)
+    assert cache.admission.defer_commit is True
+    # No disk tier: the all-RAM cache has nothing to swap -> clean no-op.
+    assert cache.apply_admission_swaps([((0, 0), (0, 2))]) is None
+    assert cache.admission.pin_rows[0] == [0, 1]
+
+
+def test_apply_warmup_gate_skips_and_counts(monkeypatch):
+    cache = _apply_cache(monkeypatch, warmup=2)
+    tier = _ApplyTier()
+    cache._disk_tier = tier
+    swaps = [((0, 0), (0, 2))]
+    cache.note_decode_step()  # step 1 < warmup 2: counts not yet stable
+    assert cache.apply_admission_swaps(swaps) is None
+    assert tier.calls == []
+    assert cache.admission.apply_warmup_skips == 1
+    assert cache.admission.pin_rows[0] == [0, 1]  # not committed during warmup
+    cache.note_decode_step()  # step 2: armed
+    report = cache.apply_admission_swaps(swaps)
+    assert report["applied"] == swaps
+    assert tier.calls == [swaps]
+    assert cache.admission.pin_rows[0] == [1, 2]
+    assert cache.admission.applied_swaps == 1
+
+
+def test_apply_commits_only_physically_applied_pairs(monkeypatch):
+    cache = _apply_cache(monkeypatch)
+    tier = _ApplyTier(applied_n=1)  # second pair's disk read failed
+    cache._disk_tier = tier
+    report = cache.apply_admission_swaps([((0, 0), (0, 2)), ((0, 1), (0, 3))])
+    assert report["failed"] == 1
+    assert cache.admission.pin_rows[0] == [1, 2]  # only the applied pair
+    assert cache.admission.applied_swaps == 1
+
+
+def test_apply_syncs_elastic_guard_freeze_set(monkeypatch):
+    monkeypatch.setattr(ca, "VRAM_ELASTIC", True)
+    cache = _apply_cache(monkeypatch)
+    cache._disk_tier = _ApplyTier()
+    guard = cache.elastic_guard
+    guard.set_pin_rows(cache.admission.pin_rows)
+    assert guard._pinned == {0, 1, 6, 7}  # flat ids layer*E+e
+    cache.apply_admission_swaps([((0, 0), (0, 2))])
+    assert guard._pinned == {1, 2, 6, 7}  # release freeze follows the layout

@@ -60,6 +60,8 @@ _TP_VOCAB_KEYS = frozenset({"embed.weight", "head.weight"})
 
 def _tp_dim(name: str) -> int | None:
     """Shard dimension for a checkpoint tensor under TP, or None when replicated."""
+    if name in _TP_VOCAB_KEYS:
+        return 0
     base = name
     for suf in (".weight", ".scale", ".bias", ".input_scale"):
         if base.endswith(suf):
@@ -68,8 +70,6 @@ def _tp_dim(name: str) -> int | None:
     for pat, dim in _TP_SHARD_DIM.items():
         if base.endswith(pat):
             return dim
-    if base in _TP_VOCAB_KEYS:
-        return 0
     return None
 
 

@@ -1112,6 +1112,14 @@ class Engine:
                 "index, so experts released at load would never be refetched "
                 f"(quant_format={banks.quant_format!r})")
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        if config.moe_cpu_tier:
+            # RAM-resident miss tier (dsv41 M2): decode misses on pinned bank rows
+            # are computed on the CPU instead of fetched. Attaching registers the
+            # pinned protocol buffers; the worker pool starts lazily on the first
+            # split. Must be attached AFTER the disk tier (pin row map is its) and
+            # BEFORE CUDA-graph capture (the split/combine kernels get captured).
+            self._cpu_tier = cache.attach_cpu_tier(
+                top_k=max(int(config.model_config.num_experts_per_tok), 1))
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -1611,6 +1619,9 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        tier = getattr(self, "_cpu_tier", None)
+        if tier is not None:
+            tier.stop()  # release the pinned-pool workers before graph teardown
         rec = getattr(self, "moe_offload_cache", None)
         if rec is not None and getattr(rec, "route_recorder", None) is not None:
             rec.route_recorder.close()  # flush the ordered route trace (meta + body)

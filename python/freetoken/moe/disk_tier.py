@@ -11,7 +11,10 @@ kernel already assigned, then shrinks the miss list so the existing PCIe
 v0 scope (prototype):
 * native NVFP4 layout only (the "triton" backend banks -- what sm_120 picks);
 * ``decode_target == "gpu"`` (offload) only -- the CPU executor reads banks
-  directly and would read released pages;
+  directly and would read released pages. The RAM-resident miss tier
+  (``--moe-cpu-tier``, moe/cpu_tier.py, dsv41 M2) is the deliberate exception:
+  its CPU workers read ONLY the RAM-pinned bank rows [0, ram_experts) -- the
+  rows this tier never releases -- never disk rows (those keep the fetch path);
 * synchronous fetch (the layer waits for its disk misses); no CUDA-graph
   capture (the miss-list D2H/H2D round trip is host-side and variable);
 * prefill_overlap off (the double-buffer prefill path bypasses the slot cache).

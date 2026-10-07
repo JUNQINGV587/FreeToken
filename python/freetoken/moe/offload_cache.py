@@ -213,6 +213,7 @@ class OffloadMoeCache:
         # Disk tier (None when off): a moe.disk_tier.DiskTier that fetches
         # disk-resident slot-cache misses before the PCIe copy path.
         self._disk_tier = None
+        self._cpu_tier = None
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= self._prefill_depth * self.num_experts, (
@@ -1460,6 +1461,11 @@ class OffloadMoeCache:
                 out["disk_tier"] = self._disk_tier.stats()
             except Exception:  # noqa: BLE001 -- diagnostics must not break serving
                 pass
+        if self._cpu_tier is not None:
+            try:
+                out["cpu_tier"] = self._cpu_tier.stats()
+            except Exception:  # noqa: BLE001 -- diagnostics must not break serving
+                pass
         return out
 
     def raise_if_unhealthy(self) -> None:
@@ -1503,6 +1509,21 @@ class OffloadMoeCache:
             # CUDA-graph decode: record doorbell-fetch kernels during capture,
             # serve the disk reads from a host thread at replay time.
             self._disk_tier.init_graph_bridge(self, graph_k_max)
+
+    def attach_cpu_tier(self, top_k: int, threads: int = 0):
+        """Enable the RAM-resident miss tier (dsv41 M2; moe/cpu_tier.py).
+
+        Decode misses on RAM-pinned bank rows are computed on the CPU from the
+        pinned row instead of fetched; the disk tier must be attached FIRST (the
+        pin row map is its). Returns the tier for engine lifecycle management
+        (shutdown). Off = byte-identical fetch behavior.
+        """
+        from freetoken.moe.cpu_tier import CpuTier
+
+        assert self._disk_tier is not None, "cpu tier needs the disk tier's pin row map"
+        self._cpu_tier = CpuTier(self, self._disk_tier, threads=threads)
+        self._cpu_tier.attach(top_k=top_k)
+        return self._cpu_tier
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"

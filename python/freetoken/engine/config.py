@@ -85,6 +85,11 @@ class EngineConfig:
     # path to a freetoken.ram_pin_set.v1 JSON document. The pinned experts are
     # packed into the same host-bank rows, so the host budget is unchanged.
     moe_ram_pin_file: str | None = None
+    # RAM-resident miss tier (dsv41 M2): decode misses that hit a RAM-pinned bank
+    # row are COMPUTED on the CPU from that row instead of being fetched -- only
+    # the token's hidden state and the H-sized partial cross PCIe. Requires the
+    # disk tier (the pin row map is its); off = byte-identical fetch behavior.
+    moe_cpu_tier: bool = False
     # auto mode only: host RAM kept out of the tier budget (GiB). The PLE context
     # table has its own disk backend (ple_backend) and is unaffected by all of this.
     disk_tier_auto_reserve_gb: float = 16.0

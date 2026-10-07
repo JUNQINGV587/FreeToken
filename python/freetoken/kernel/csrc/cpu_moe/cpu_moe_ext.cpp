@@ -2109,6 +2109,516 @@ struct CpuMoeExecutor {
   }
 };
 
+// ---------------------- cpu tier service (RAM-resident miss compute) ----------------------
+// M2 (dsv41 ct/ct_vllm.py protocol port): instead of fetching every slot-cache
+// miss over PCIe, the GPU split kernel (moe/cpu_tier.py, Triton) classifies each
+// miss and publishes the CPU-picked (token, bank-row, weight) triples plus the
+// tokens' hidden states through a pinned request block. This service spins on
+// the block's seq, computes each picked expert from its PINNED HOST BANK ROW
+// with the same ISA-dispatched GEMV kernels and per-route numerics as
+// CpuMoeExecutor (nvfp4 / ds_fp4), and accumulates the weighted partials into
+// pinned hout in PICK ORDER: per-pick scratch + an ordered reduction, so the
+// result is bitwise deterministic (no atomic-order dependence). The device-side
+// combine kernel spins on the done word, then adds hout into the GPU GEMM
+// output. Both threads make ZERO CUDA calls (graph_fetch.py transport contract:
+// the graph PULLS, the host never touches CUDA).
+class CpuTierService {
+ public:
+  static constexpr int64_t SEQ_OFF = 7;  // ctrl[7]: the D2H memcpy lands it LAST
+
+  int num_threads;
+  int num_layers;
+  int H, I;
+  int max_tokens, max_picks;
+  int act, apply_on_input;
+  int fmt;  // WF_NVFP4 or WF_DSFP4 only
+  float swiglu_alpha, swiglu_limit;
+  // Per-layer pointer tables (same _make_table contract as CpuMoeExecutor).
+  const uint64_t *gate_up_tbl, *gu_scale_tbl, *gu_global_tbl;
+  const uint64_t *down_tbl, *dn_scale_tbl, *dn_global_tbl;
+  nvdot_fn nvdot;
+  dsdot_fn dsdot;
+  float e2m1_lut[16];
+  float e4m3_lut[256];
+  float e8m0_lut[256];
+  std::string isa_str;
+  const char* isa;
+
+  // Pinned protocol buffers shared with the device kernels (see class comment).
+  // ctrl (int64): [0]=layer [1]=bsz [2]=npk [3..6]=spare [7]=seq.
+  volatile int64_t* ctrl = nullptr;
+  const uint16_t* hx = nullptr;      // [max_tokens, H] fp16 on the wire (halves PCIe)
+  const int32_t* picks = nullptr;    // [max_picks * 3]: token, bank row, weight bits
+  float* hout = nullptr;             // [max_tokens, H] fp32 partial sums (we write)
+  volatile int64_t* done = nullptr;  // we release seq here; combine spins on it
+
+  std::vector<float> xe_scratch, xo_scratch;   // [max_tokens * H/2]
+  std::vector<bf16_t> xq_scratch;              // [max_tokens * H]   (ds_fp4 only)
+  std::vector<bf16_t> g_scratch;               // [max_picks * I]
+  std::vector<float> ge_scratch, go_scratch;   // [max_picks * I/2]
+  std::vector<float> partial_scratch;          // [max_picks * H]
+  // Per-token pick lists (CSR offsets + store), rebuilt per job in pick order.
+  std::vector<int> tp_off, tp_store;
+
+  std::vector<std::thread> workers;
+  std::thread service_thread;
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> job_gen{0}, completed_gen{0};
+  std::atomic<int> done_count{0};
+  std::atomic<int> bar_count{0};
+  std::atomic<int> bar_sense{0};
+  std::atomic<int64_t> work_next[5];  // per-phase counters, reset by the dispatcher
+  int cur_layer = 0, cur_bsz = 0, cur_npk = 0;
+  int n_iblk = 0, n_hblk = 0;
+  std::vector<int> core_ids;
+  int service_core;
+  std::atomic<uint64_t> jobs{0}, busy_ns{0};
+  std::atomic<int> fatal_code{0};
+  int64_t served_seq = 0;
+  bool protocol_started = false;
+
+  // Backoff: hot-poll briefly (the decode replay's per-layer burst), then nap
+  // (graph_fetch.py's _SPIN_HOT/_SPIN_NAP_S contract, same worst wake latency).
+  static constexpr int64_t kSpinHot = 16384;
+  static constexpr int64_t kNapUs = 50;
+
+  static int64_t flag_load_acquire(const volatile int64_t* p) {
+#if defined(_MSC_VER)
+    const int64_t v = *p;
+    _ReadWriteBarrier();
+    return v;
+#else
+    return __atomic_load_n(const_cast<const int64_t*>(p), __ATOMIC_ACQUIRE);
+#endif
+  }
+
+  static void flag_store_release(volatile int64_t* p, int64_t v) {
+#if defined(_MSC_VER)
+    _ReadWriteBarrier();
+    *p = v;
+#else
+    __atomic_store_n(const_cast<int64_t*>(p), v, __ATOMIC_RELEASE);
+#endif
+  }
+
+  CpuTierService(int num_threads_, int num_layers_, int hidden_size, int inter_size,
+                 int max_tokens_, int max_picks_, int activation_id,
+                 int apply_router_weight_on_input, int weight_format,
+                 double swiglu_alpha_, double swiglu_limit_, uintptr_t gate_up_ptr,
+                 uintptr_t gate_up_scale_ptr, uintptr_t gate_up_global_ptr,
+                 uintptr_t down_ptr, uintptr_t down_scale_ptr, uintptr_t down_global_ptr,
+                 uintptr_t ctrl_ptr, uintptr_t hx_ptr, uintptr_t picks_ptr,
+                 uintptr_t hout_ptr, uintptr_t done_ptr, std::vector<int> core_ids_,
+                 int service_core_)
+      : num_threads(num_threads_ > 0 ? num_threads_ : 1),
+        num_layers(num_layers_),
+        H(hidden_size),
+        I(inter_size),
+        max_tokens(max_tokens_),
+        max_picks(max_picks_),
+        act(activation_id),
+        apply_on_input(apply_router_weight_on_input),
+        fmt(weight_format),
+        gate_up_tbl(reinterpret_cast<const uint64_t*>(gate_up_ptr)),
+        gu_scale_tbl(reinterpret_cast<const uint64_t*>(gate_up_scale_ptr)),
+        gu_global_tbl(reinterpret_cast<const uint64_t*>(gate_up_global_ptr)),
+        down_tbl(reinterpret_cast<const uint64_t*>(down_ptr)),
+        dn_scale_tbl(reinterpret_cast<const uint64_t*>(down_scale_ptr)),
+        dn_global_tbl(reinterpret_cast<const uint64_t*>(down_global_ptr)),
+        swiglu_alpha(static_cast<float>(swiglu_alpha_)),
+        swiglu_limit(static_cast<float>(swiglu_limit_)),
+        ctrl(reinterpret_cast<volatile int64_t*>(ctrl_ptr)),
+        hx(reinterpret_cast<const uint16_t*>(hx_ptr)),
+        picks(reinterpret_cast<const int32_t*>(picks_ptr)),
+        hout(reinterpret_cast<float*>(hout_ptr)),
+        done(reinterpret_cast<volatile int64_t*>(done_ptr)),
+        core_ids(std::move(core_ids_)),
+        service_core(service_core_) {
+    if (fmt != WF_NVFP4 && fmt != WF_DSFP4)
+      throw std::invalid_argument(
+          "CpuTierService supports nvfp4/ds_fp4 banks only (bf16/mxfp4/q4_0 misses "
+          "stay on the fetch path)");
+    DotChoice c = select_dot();
+    nvdot = select_nvdot();
+    dsdot = select_dsdot();
+    isa_str = std::string(c.name);
+    isa = isa_str.c_str();
+    for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
+    for (int i = 0; i < 256; ++i) e4m3_lut[i] = e4m3_decode((uint8_t)i);
+    for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
+    xe_scratch.assign(static_cast<size_t>(max_tokens) * (H / 2), 0.0f);
+    xo_scratch.assign(static_cast<size_t>(max_tokens) * (H / 2), 0.0f);
+    // bf16 staging for the wire format conversion (both fmts; ds_fp4's FP8
+    // round-trip then runs in place on it).
+    xq_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
+    g_scratch.assign(static_cast<size_t>(max_picks) * I, 0);
+    ge_scratch.assign(static_cast<size_t>(max_picks) * (I / 2), 0.0f);
+    go_scratch.assign(static_cast<size_t>(max_picks) * (I / 2), 0.0f);
+    partial_scratch.assign(static_cast<size_t>(max_picks) * H, 0.0f);
+    tp_off.assign(static_cast<size_t>(max_tokens) + 1, 0);
+    tp_store.assign(static_cast<size_t>(max_picks), 0);
+    for (int t = 0; t < num_threads; ++t)
+      workers.emplace_back([this, t] { worker_loop(t); });
+  }
+
+  ~CpuTierService() { shutdown(); }
+
+  void pin_self(int tid) {
+#if CPU_MOE_HAS_AFFINITY
+    if (core_ids.empty()) return;
+    const int cpu = core_ids[tid % static_cast<int>(core_ids.size())];
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)tid;
+#endif
+  }
+
+  void barrier(int& local_sense) {
+    local_sense ^= 1;
+    if (bar_count.fetch_add(1) + 1 == num_threads) {
+      bar_count.store(0);
+      bar_sense.store(local_sense);
+    } else {
+      while (bar_sense.load() != local_sense) {
+#if CPU_MOE_X86
+        _mm_pause();
+#endif
+      }
+    }
+  }
+
+  const char* isa_name() const { return isa; }
+  uint64_t host_jobs_count() const { return jobs.load(); }
+  uint64_t host_busy_ns_count() const { return busy_ns.load(); }
+  int fatal() const { return fatal_code.load(); }
+
+  // Phase 0: zero this token's hout row; convert the fp16 wire format to bf16
+  // (through f32 -- exact); ds_fp4 FP8-round-trips the input (DSV4 act_quant,
+  // same reference grid as the executor); deinterleave to fp32 even/odd.
+  void do_prep(int64_t p) {
+    const int tok = static_cast<int>(p);
+    float* out = hout + static_cast<size_t>(tok) * H;
+    for (int h = 0; h < H; ++h) out[h] = 0.0f;
+    const uint16_t* src16 = hx + static_cast<size_t>(tok) * H;
+    bf16_t* xb = xq_scratch.data() + static_cast<size_t>(tok) * H;
+    for (int h = 0; h < H; ++h) xb[h] = f32_to_bf16(fp16_to_f32(src16[h]));
+    const bf16_t* src = xb;
+    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(src, xb, H);
+    deinterleave_bf16_f32(src, xe_scratch.data() + static_cast<size_t>(tok) * (H / 2),
+                          xo_scratch.data() + static_cast<size_t>(tok) * (H / 2), H);
+  }
+
+  // Phase 1: gate/up GEMV + activation for one (pick, i-block). Bank row `e` indexes
+  // the layer's pinned host bank directly -- the whole point of the tier (no fetch).
+  void do_pass1(int64_t p) {
+    const int64_t ib = p % n_iblk;
+    const int pick = static_cast<int>(p / n_iblk);
+    const int tok = picks[static_cast<size_t>(pick) * 3];
+    const int e = picks[static_cast<size_t>(pick) * 3 + 1];
+    float w;
+    std::memcpy(&w, picks + static_cast<size_t>(pick) * 3 + 2, sizeof(float));
+    const float* xe = xe_scratch.data() + static_cast<size_t>(tok) * (H / 2);
+    const float* xo = xo_scratch.data() + static_cast<size_t>(tok) * (H / 2);
+    const uint8_t* gu_packed_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, cur_layer));
+    const uint8_t* gu_scale_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, cur_layer));
+    bf16_t* g_row = g_scratch.data() + static_cast<size_t>(pick) * I;
+    const int i0 = static_cast<int>(ib) * IBLK;
+    const int i1 = std::min(I, i0 + IBLK);
+    if (fmt == WF_DSFP4) {
+      // Mirror CpuMoeExecutor::do_pass1_dsfp4 exactly: bf16-round each gate/up dot,
+      // clamp only when lim > 0, silu(gate) * up, bf16 round (no router weight here;
+      // the reduction applies it, matching do_pass2_dsfp4).
+      const int N2 = 2 * I, Hh = H / 2, Hs = H / 32;
+      const uint8_t* gp = gu_packed_l + static_cast<size_t>(e) * N2 * Hh;
+      const uint8_t* gs = gu_scale_l + static_cast<size_t>(e) * N2 * Hs;
+      const float lim = swiglu_limit;
+      for (int i = i0; i < i1; ++i) {
+        float gate = bf16_to_f32(f32_to_bf16(
+            dsdot(gp + static_cast<size_t>(i) * Hh, gs + static_cast<size_t>(i) * Hs, xe,
+                  xo, H, e2m1_lut, e8m0_lut)));
+        float up = bf16_to_f32(f32_to_bf16(
+            dsdot(gp + static_cast<size_t>(I + i) * Hh, gs + static_cast<size_t>(I + i) * Hs,
+                  xe, xo, H, e2m1_lut, e8m0_lut)));
+        if (lim > 0.0f) {
+          if (gate > lim) gate = lim;
+          if (up > lim) up = lim;
+          else if (up < -lim) up = -lim;
+        }
+        const float glu = gate / (1.0f + std::exp(-gate));
+        g_row[i] = f32_to_bf16(glu * up);
+      }
+      return;
+    }
+    // nvfp4: mirror do_pass1 + gemm1_dot (fp32 nvdot path).
+    const uint16_t* gu_global_l =
+        reinterpret_cast<const uint16_t*>(tbl_at(gu_global_tbl, cur_layer));
+    const float w_in = apply_on_input ? w : 1.0f;
+    const int Hh = H / 2, Hs = H / 16;
+    const bool clamped = act == ACT_SWIGLUOAI || act == ACT_SWIGLU_CLAMP;
+    const float up_bias = act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
+    for (int i = i0; i < i1; ++i) {
+      const size_t rg = static_cast<size_t>(e) * (2 * I) + i;
+      const size_t ru = rg + I;
+      float gate = nvdot(gu_packed_l + rg * Hh, gu_scale_l + rg * Hs,
+                         fp16_to_f32(gu_global_l[rg]), xe, xo, H, e2m1_lut, e4m3_lut) * w_in;
+      float up = nvdot(gu_packed_l + ru * Hh, gu_scale_l + ru * Hs,
+                       fp16_to_f32(gu_global_l[ru]), xe, xo, H, e2m1_lut, e4m3_lut) * w_in;
+      if (clamped) {
+        if (gate > lim) gate = lim;
+        if (up > lim) up = lim;
+        else if (up < -lim) up = -lim;
+        const float glu = gate / (1.0f + std::exp(-gate * alpha));
+        g_row[i] = f32_to_bf16(glu * (up + up_bias));
+      } else {
+        g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+      }
+    }
+  }
+
+  // Phase 2: per-pick intermediate prep (mirror prep_g_row): ds_fp4 FP8 round-trip,
+  // then deinterleave to fp32 even/odd.
+  void do_prt(int64_t p) {
+    bf16_t* g = g_scratch.data() + static_cast<size_t>(p) * I;
+    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I);
+    deinterleave_bf16_f32(g, ge_scratch.data() + static_cast<size_t>(p) * (I / 2),
+                          go_scratch.data() + static_cast<size_t>(p) * (I / 2), I);
+  }
+
+  // Phase 3: down GEMV for one (pick, h-block) into the per-pick fp32 partial
+  // (unweighted; the ordered reduction applies the router weight).
+  void do_pass2(int64_t p) {
+    const int64_t hb = p % n_hblk;
+    const int pick = static_cast<int>(p / n_hblk);
+    const int e = picks[static_cast<size_t>(pick) * 3 + 1];
+    const uint8_t* dn_packed_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, cur_layer));
+    const uint8_t* dn_scale_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, cur_layer));
+    const float* ge = ge_scratch.data() + static_cast<size_t>(pick) * (I / 2);
+    const float* go = go_scratch.data() + static_cast<size_t>(pick) * (I / 2);
+    float* out = partial_scratch.data() + static_cast<size_t>(pick) * H;
+    const int h0 = static_cast<int>(hb) * HBLK;
+    const int h1 = std::min(H, h0 + HBLK);
+    if (fmt == WF_DSFP4) {
+      const int Ih = I / 2, Is = I / 32;
+      const uint8_t* dp = dn_packed_l + static_cast<size_t>(e) * H * Ih;
+      const uint8_t* ds = dn_scale_l + static_cast<size_t>(e) * H * Is;
+      for (int h = h0; h < h1; ++h)
+        out[h] = dsdot(dp + static_cast<size_t>(h) * Ih, ds + static_cast<size_t>(h) * Is,
+                       ge, go, I, e2m1_lut, e8m0_lut);
+      return;
+    }
+    const uint16_t* dn_global_l =
+        reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, cur_layer));
+    const int Ih = I / 2, Is = I / 16;
+    for (int h = h0; h < h1; ++h) {
+      const size_t r = static_cast<size_t>(e) * H + h;
+      out[h] = nvdot(dn_packed_l + r * Ih, dn_scale_l + r * Is, fp16_to_f32(dn_global_l[r]),
+                     ge, go, I, e2m1_lut, e4m3_lut);
+    }
+  }
+
+  // Phase 4: ordered reduction for one (token, h-block): picks accumulate in PICK
+  // ORDER (bitwise deterministic). ds_fp4 rounds each route's weighted output to bf16
+  // before the fp32 sum (the reference's down[T, top_k, H] bf16 -> .sum(dim=1));
+  // nvfp4 accumulates plain fp32 (do_pass2), with the weight already applied at the
+  // input when apply_router_weight_on_input is set.
+  void do_reduce(int64_t p) {
+    const int64_t hb = p % n_hblk;
+    const int tok = static_cast<int>(p / n_hblk);
+    const int h0 = static_cast<int>(hb) * HBLK;
+    const int h1 = std::min(H, h0 + HBLK);
+    float* out = hout + static_cast<size_t>(tok) * H;
+    const int p0 = tp_off[tok], p1 = tp_off[tok + 1];
+    for (int h = h0; h < h1; ++h) {
+      float acc = 0.0f;
+      for (int j = p0; j < p1; ++j) {
+        const int pick = tp_store[j];
+        float w;
+        std::memcpy(&w, picks + static_cast<size_t>(pick) * 3 + 2, sizeof(float));
+        const float y = partial_scratch[static_cast<size_t>(pick) * H + h];
+        if (fmt == WF_DSFP4)
+          acc += bf16_to_f32(f32_to_bf16(y * w));
+        else
+          acc += y * (apply_on_input ? 1.0f : w);
+      }
+      out[h] = acc;
+    }
+  }
+
+  void run_one(int& local_sense, int ph, int64_t total) {
+    // Per-phase work-stealing counter (reset by the dispatcher before the job
+    // generation bump, like the executor's submit()); totals derive from the
+    // dispatcher-published cur_* fields, so workers never write shared state.
+    auto& ctr = work_next[ph];
+    for (;;) {
+      const int64_t p = ctr.fetch_add(1, std::memory_order_relaxed);
+      if (p >= total) break;
+      switch (ph) {
+        case 0: do_prep(p); break;
+        case 1: do_pass1(p); break;
+        case 2: do_prt(p); break;
+        case 3: do_pass2(p); break;
+        default: do_reduce(p); break;
+      }
+    }
+    barrier(local_sense);
+  }
+
+  void job_body() {
+    int local_sense = 0;
+    run_one(local_sense, 0, cur_bsz);
+    if (cur_npk > 0) {
+      run_one(local_sense, 1, static_cast<int64_t>(cur_npk) * n_iblk);
+      run_one(local_sense, 2, cur_npk);
+      run_one(local_sense, 3, static_cast<int64_t>(cur_npk) * n_hblk);
+    }
+    run_one(local_sense, 4, static_cast<int64_t>(cur_bsz) * n_hblk);
+  }
+
+  void worker_loop(int tid) {
+    pin_self(tid);
+    uint64_t my_gen = 0;
+    int64_t idle = 0;
+    for (;;) {
+      const uint64_t g = job_gen.load(std::memory_order_acquire);
+      if (stop.load(std::memory_order_relaxed)) return;
+      if (g == my_gen) {
+        if (++idle > kSpinHot)
+          std::this_thread::sleep_for(std::chrono::microseconds(kNapUs));
+#if CPU_MOE_X86
+        else
+          _mm_pause();
+#endif
+        continue;
+      }
+      idle = 0;
+      my_gen = g;
+      job_body();
+      if (done_count.fetch_add(1, std::memory_order_acq_rel) + 1 == num_threads)
+        completed_gen.store(my_gen, std::memory_order_release);
+    }
+  }
+
+  // Build the per-token CSR pick lists (pick order preserved), set the phase
+  // geometry, dispatch one pool generation and wait for it. Single-threaded
+  // prologue: O(npk), a few µs against a ms-scale job.
+  void run_job(int layer, int bsz, int npk) {
+    const auto t0 = std::chrono::steady_clock::now();
+    cur_layer = layer;
+    cur_bsz = bsz;
+    cur_npk = npk;
+    n_iblk = (I + IBLK - 1) / IBLK;
+    n_hblk = (H + HBLK - 1) / HBLK;
+    for (int tok = 0; tok <= bsz; ++tok) tp_off[tok] = 0;
+    for (int p = 0; p < npk; ++p) {
+      const int tok = picks[static_cast<size_t>(p) * 3];
+      if (tok >= 0 && tok < bsz) ++tp_off[tok + 1];
+    }
+    for (int tok = 0; tok < bsz; ++tok) tp_off[tok + 1] += tp_off[tok];
+    std::vector<int> fill(tp_off.begin(), tp_off.begin() + bsz);
+    for (int p = 0; p < npk; ++p) {
+      const int tok = picks[static_cast<size_t>(p) * 3];
+      if (tok >= 0 && tok < bsz) tp_store[fill[tok]++] = p;
+    }
+    done_count.store(0, std::memory_order_relaxed);
+    bar_count.store(0, std::memory_order_relaxed);
+    bar_sense.store(0, std::memory_order_relaxed);
+    for (auto& c : work_next) c.store(0, std::memory_order_relaxed);
+    const uint64_t g = job_gen.load(std::memory_order_relaxed) + 1;
+    job_gen.store(g, std::memory_order_release);
+    while (completed_gen.load(std::memory_order_acquire) != g) {
+#if CPU_MOE_X86
+      _mm_pause();
+#endif
+    }
+    jobs.fetch_add(1, std::memory_order_relaxed);
+    busy_ns.fetch_add(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count()),
+        std::memory_order_relaxed);
+  }
+
+  // Synchronous test/calibration entry: run one job from the CURRENT pinned
+  // hx/picks contents, bypassing the seq protocol (the pool does the compute).
+  void run_job_sync(int layer, int bsz, int npk) { run_job(layer, bsz, npk); }
+
+  // Start the protocol thread: spin on ctrl.seq, serve jobs, release done.
+  void start_protocol() {
+    if (protocol_started) return;
+    protocol_started = true;
+    served_seq = flag_load_acquire(&ctrl[SEQ_OFF]);  // ignore capture-time noise
+    service_thread = std::thread([this] { service_loop(); });
+  }
+
+  void service_loop() {
+#if CPU_MOE_HAS_AFFINITY
+    if (service_core >= 0) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(service_core, &set);
+      pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    }
+#endif
+    int64_t idle = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      const int64_t seq = flag_load_acquire(&ctrl[SEQ_OFF]);
+      if (seq == served_seq) {
+        if (++idle > kSpinHot)
+          std::this_thread::sleep_for(std::chrono::microseconds(kNapUs));
+#if CPU_MOE_X86
+        else
+          _mm_pause();
+#endif
+        continue;
+      }
+      idle = 0;
+      // The D2H memcpy writes the block linearly with seq LAST, so observing a
+      // new seq (acquire) implies the header fields have landed.
+      const int layer = static_cast<int>(ctrl[0]);
+      const int bsz = static_cast<int>(ctrl[1]);
+      const int npk = static_cast<int>(ctrl[2]);
+      if (layer < 0 || layer >= num_layers || bsz < 0 || bsz > max_tokens || npk < 0 ||
+          npk > max_picks) {
+        // Corrupt header: never ack (the combine times out loudly) -- the
+        // graph_fetch.py FATAL contract, a hang beats a silent wrong output.
+        std::fprintf(stderr,
+                     "[freetoken/cpu_tier] FATAL: corrupt request header layer=%d "
+                     "bsz=%d npk=%d (num_layers=%d max_tokens=%d max_picks=%d); "
+                     "refusing to serve (server will hang and must be restarted)\n",
+                     layer, bsz, npk, num_layers, max_tokens, max_picks);
+        fatal_code.store(1, std::memory_order_relaxed);
+        served_seq = seq;  // do not spin on the same corrupt seq forever
+        continue;
+      }
+      run_job(layer, bsz, npk);
+      // Release: every hout store is visible before the GPU's combine sees done
+      // (x86 TSO orders store->store; the combine's sys-scope acquire pairs).
+      flag_store_release(done, seq);
+      served_seq = seq;
+    }
+  }
+
+  void shutdown() {
+    if (stop.exchange(true)) return;
+    // Unblock any in-flight (or future) device-side combine spin immediately --
+    // the executor's coordinator teardown contract (done = INT64_MAX).
+    if (done != nullptr) flag_store_release(done, INT64_MAX);
+    job_gen.fetch_add(1, std::memory_order_release);  // wake workers to see stop
+    if (service_thread.joinable()) service_thread.join();
+    for (auto& w : workers)
+      if (w.joinable()) w.join();
+  }
+};
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -2150,6 +2660,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("ready_addr"), py::arg("slot"));
   m.def("memop_sync", &cumemop_sync, py::arg("stream"), py::arg("done_addr"),
         py::arg("slot"));
+  py::class_<CpuTierService>(m, "CpuTierService")
+      .def(py::init<int, int, int, int, int, int, int, int, int, double, double, uintptr_t,
+                    uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+                    uintptr_t, uintptr_t, uintptr_t, uintptr_t, std::vector<int>, int>(),
+           py::arg("num_threads"), py::arg("num_layers"), py::arg("hidden_size"),
+           py::arg("inter_size"), py::arg("max_tokens"), py::arg("max_picks"),
+           py::arg("activation_id"), py::arg("apply_router_weight_on_input"),
+           py::arg("weight_format"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
+           py::arg("gate_up_ptr"), py::arg("gate_up_scale_ptr"),
+           py::arg("gate_up_global_ptr"), py::arg("down_ptr"), py::arg("down_scale_ptr"),
+           py::arg("down_global_ptr"), py::arg("ctrl_ptr"), py::arg("hx_ptr"),
+           py::arg("picks_ptr"), py::arg("hout_ptr"), py::arg("done_ptr"),
+           py::arg("core_ids"), py::arg("service_core"))
+      .def("start_protocol", &CpuTierService::start_protocol)
+      .def("run_job_sync", &CpuTierService::run_job_sync, py::arg("layer_id"),
+           py::arg("bsz"), py::arg("npk"), py::call_guard<py::gil_scoped_release>())
+      .def("host_jobs", &CpuTierService::host_jobs_count)
+      .def("host_busy_ns", &CpuTierService::host_busy_ns_count)
+      .def("fatal", &CpuTierService::fatal)
+      .def("isa_name", &CpuTierService::isa_name)
+      .def("shutdown", &CpuTierService::shutdown);
   // ABI capability marker: the highest ActKind this build implements in the
   // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act
   // id the epilogue must handle -- a prebuilt .so from before ACT_SWIGLUOAI

@@ -29,10 +29,13 @@ ONLINE_ADMISSION = _env_bool("FREETOKEN_ONLINE_ADMISSION")
 # Honesty bit for /v1/stats (review 202610, m4 finding): until the GPU battery
 # (review item #12) lands the engine/scheduler call sites AND the CUDA apply,
 # these policies run with no production traffic -- "enabled" must not be read
-# as "working". Flip to True in the battery-#12 commit that wires the
-# scheduler's note_prefill_step/note_decode_step/admission_update calls and
-# the release/rewarm CUDA apply (unmap + empty_cache + re-add).
-WIRED = False
+# as "working". Wired 2026-10-07 in the port battery: engine.forward_batch now
+# calls note_prefill_step/note_decode_step/admission_update every step and the
+# release/rewarm CUDA apply lives in OffloadMoeCache.apply_elastic_release /
+# apply_elastic_rewarm (invalidate + empty_cache + re-add via staging path).
+# NOTE: the admission SWAP apply (RAM-row hot-swap of the pin layout) is still
+# not wired -- admission counts/evaluates only; that is a separate build.
+WIRED = True
 
 
 class ElasticConfig:

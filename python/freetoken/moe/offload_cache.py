@@ -410,9 +410,11 @@ class OffloadMoeCache:
         if guard is None:
             return None
         if self.id_of_slot.is_cuda:
-            # The release plan reads the slot map on the host; the device-side
-            # plan/apply is GPU-battery wiring. Calm/step tracking still runs.
-            return guard.note_prefill(tokens, None)
+            # The release plan reads the slot map on the host: one small
+            # (cache_size ints) blocking D2H per prefill step. Prefill steps
+            # are tens of ms and this only matters once the guard is armed,
+            # so the sync is off the decode hot path entirely.
+            return guard.note_prefill(tokens, self.id_of_slot.to("cpu", copy=True))
         return guard.note_prefill(tokens, self.id_of_slot)
 
     def note_decode_step(self) -> list[int] | None:
@@ -447,6 +449,44 @@ class OffloadMoeCache:
             else:
                 route_counts = torch.zeros(self.num_layers, self.num_experts)
         return self._admission.update(route_counts, miss_counts)
+
+    def apply_elastic_release(self, slots: list[int]) -> None:
+        """Item 5 CUDA apply: invalidate the released slots + return allocator slack.
+
+        The slot pool is one unified allocation per bank, so no per-slot
+        driver-level unmap exists; the release's device effect is eviction of
+        the released entries (their slots rejoin the free pool for the coming
+        prefill's staging) plus an ``empty_cache`` so the allocator's unrelated
+        cached blocks (prefill workspaces) go back to the driver ahead of the
+        big prefill. Guard bookkeeping already happened in note_prefill.
+        """
+        if not slots or not self.id_of_slot.is_cuda:
+            return
+        idx = torch.as_tensor(slots, dtype=torch.long, device=self.id_of_slot.device)
+        flat = self.id_of_slot[idx].long()
+        valid = flat >= 0
+        if bool(valid.any()):
+            self.slot_for_id.view(-1)[flat[valid]] = -1
+            self.id_of_slot[idx[valid]] = -1
+        torch.cuda.empty_cache()
+
+    def apply_elastic_rewarm(self, keep: list[int]) -> None:
+        """Item 5 CUDA apply: re-add the guard's keep set through the normal
+        miss-staging path -- ensure_experts plans the rows, copy_missing does
+        the host->device copies and map updates. Runs on the engine stream
+        between steps, so the copies order behind the step that produced them
+        and ahead of the next one."""
+        if not keep:
+            return
+        by_layer: dict[int, list[int]] = {}
+        for flat_id in keep:
+            layer, expert = divmod(int(flat_id), self.num_experts)
+            by_layer.setdefault(layer, []).append(expert)
+        for layer, experts in by_layer.items():
+            self.ensure_experts(
+                layer, torch.as_tensor(experts, dtype=torch.int32, device=self.device)
+            )
+        self.copy_missing()
 
     @property
     def prefill_depth(self) -> int:

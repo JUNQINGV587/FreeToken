@@ -1484,6 +1484,11 @@ class Engine:
             # was released from its spin with incomplete staging; fail the step
             # here, before its tokens are sampled.
             self.moe_offload_cache.raise_if_unhealthy()
+            # Item 5 (dsv41 port) scheduler-call-site wiring: per-step hooks for
+            # the elastic release/rewarm guard and the route-count online
+            # admission. Cheap no-ops unless the FREETOKEN_VRAM_ELASTIC /
+            # FREETOKEN_ONLINE_ADMISSION envs armed the guards at attach time.
+            self._moe_item5_step_hooks(batch)
 
         for req in batch.reqs:
             req.complete_one()
@@ -1508,6 +1513,30 @@ class Engine:
             top_ids_cpu=top_ids,
             top_logprobs_cpu=top_logprobs,
         )
+
+    def _moe_item5_step_hooks(self, batch: Batch) -> None:
+        """Item 5 (dsv41 port): per-step elastic guard + online admission hooks.
+
+        Decode step: note_decode_step feeds the calm counter and returns the
+        rewarm keep set once calm (applied through the normal staging path);
+        admission_update folds the step's route/miss counts into the decayed
+        per-row scores (a real evaluation only every ``period`` steps; the swap
+        apply -- a RAM-row hot-swap -- is not wired, swaps are counted only).
+        Prefill step: note_prefill_step may return slots to release ahead of a
+        big prefill (applied as invalidation + empty_cache). With the envs off
+        both guards are None and every call below is a cheap no-op.
+        """
+        cache = self.moe_offload_cache
+        if batch.is_prefill:
+            tokens = sum(int(r.extend_len) for r in batch.reqs)
+            slots = cache.note_prefill_step(tokens)
+            if slots:
+                cache.apply_elastic_release(slots)
+            return
+        keep = cache.note_decode_step()
+        cache.admission_update()
+        if keep:
+            cache.apply_elastic_rewarm(keep)
 
     def _warmup_prefill_lens(self) -> list[int]:
         """Prefill lengths that cross every size bucket the in-repo Triton prefill kernels specialize on."""

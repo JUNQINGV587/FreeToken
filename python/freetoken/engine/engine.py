@@ -1520,8 +1520,11 @@ class Engine:
         Decode step: note_decode_step feeds the calm counter and returns the
         rewarm keep set once calm (applied through the normal staging path);
         admission_update folds the step's route/miss counts into the decayed
-        per-row scores (a real evaluation only every ``period`` steps; the swap
-        apply -- a RAM-row hot-swap -- is not wired, swaps are counted only).
+        per-row scores (a real evaluation only every ``period`` steps) and,
+        with FREETOKEN_ADMISSION_APPLY on, apply_admission_swaps physically
+        hot-swaps the planned RAM rows here -- between this decode step's
+        enqueue and the next batch, the design-doc fence point (the disk tier
+        drains the device before its host-side bank writes).
         Prefill step: note_prefill_step may return slots to release ahead of a
         big prefill (applied as invalidation + empty_cache). With the envs off
         both guards are None and every call below is a cheap no-op.
@@ -1534,7 +1537,9 @@ class Engine:
                 cache.apply_elastic_release(slots)
             return
         keep = cache.note_decode_step()
-        cache.admission_update()
+        swaps = cache.admission_update()
+        if swaps:
+            cache.apply_admission_swaps(swaps)
         if keep:
             cache.apply_elastic_rewarm(keep)
 

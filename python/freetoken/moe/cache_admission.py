@@ -25,6 +25,9 @@ def _env_bool(name: str) -> bool:
 # Master switches (item 5.3.4). Default off == current behavior.
 VRAM_ELASTIC = _env_bool("FREETOKEN_VRAM_ELASTIC")
 ONLINE_ADMISSION = _env_bool("FREETOKEN_ONLINE_ADMISSION")
+# RAM-row hot-swap apply for admission swaps (20261007, port2/admission-apply).
+# Default off == evaluate/count only, byte-identical to the pre-apply behavior.
+ADMISSION_APPLY = _env_bool("FREETOKEN_ADMISSION_APPLY")
 
 # Honesty bit for /v1/stats (review 202610, m4 finding): until the GPU battery
 # (review item #12) lands the engine/scheduler call sites AND the CUDA apply,
@@ -33,8 +36,10 @@ ONLINE_ADMISSION = _env_bool("FREETOKEN_ONLINE_ADMISSION")
 # calls note_prefill_step/note_decode_step/admission_update every step and the
 # release/rewarm CUDA apply lives in OffloadMoeCache.apply_elastic_release /
 # apply_elastic_rewarm (invalidate + empty_cache + re-add via staging path).
-# NOTE: the admission SWAP apply (RAM-row hot-swap of the pin layout) is still
-# not wired -- admission counts/evaluates only; that is a separate build.
+# 2026-10-07: the admission SWAP apply (RAM-row hot-swap of the pin layout) is
+# now also wired -- OffloadMoeCache.apply_admission_swaps runs it between
+# decode steps behind FREETOKEN_ADMISSION_APPLY (design:
+# /data/research/notes/engines/20261007-admission-apply-design.md).
 WIRED = True
 
 
@@ -69,6 +74,10 @@ class AdmissionConfig:
         self.hysteresis = float(os.getenv("FREETOKEN_ADMISSION_HYSTERESIS", "1.5"))
         # Per-cycle score decay (dsv41 DSV41_EC_DECAY=0.9).
         self.decay = float(os.getenv("FREETOKEN_ADMISSION_DECAY", "0.9"))
+        # Decode steps before swap apply arms at all (dsv41 DSV41_EC_WARMUP=64,
+        # same rationale as ElasticConfig.warmup_steps): early routing is too
+        # noisy to pick rows worth a disk read + row swap.
+        self.warmup_steps = int(os.getenv("FREETOKEN_ADMISSION_WARMUP_STEPS", "64"))
 
 
 class ElasticCacheGuard:
@@ -194,6 +203,13 @@ class OnlineAdmission:
     The pin layout stays in the pin_manager shape (per-layer sorted local-id
     lists -- disk_tier.pin_rows_to_row_map's input), so applying a swap is a
     layout rebuild, never a new format.
+
+    ``defer_commit`` (set by OffloadMoeCache when FREETOKEN_ADMISSION_APPLY is
+    on): ``_evaluate`` returns the swap plan and counts it, but does NOT mutate
+    the pin membership; the cache commits the physically-applied pairs back via
+    ``commit_swaps`` after DiskTier.apply_pin_swaps succeeds. With the flag off
+    (default) evaluation commits membership immediately, the count-only legacy
+    behavior.
     """
 
     def __init__(self, num_layers: int, num_experts: int,
@@ -208,9 +224,15 @@ class OnlineAdmission:
         self._scores = torch.zeros(num_layers, num_experts, dtype=torch.float64)
         self._misses = torch.zeros(num_layers, num_experts, dtype=torch.float64)
         self._since_eval = 0
-        # Side profile (item 5.3.3/5.3.5).
+        self._steps = 0
+        self.defer_commit = False
+        # Side profile (item 5.3.3/5.3.5). ``swaps`` counts PLANNED swaps (what
+        # _evaluate proposes); ``applied_swaps`` counts pairs the disk tier
+        # physically hot-swapped and the cache committed back.
         self.evaluations = 0
         self.swaps = 0
+        self.applied_swaps = 0
+        self.apply_warmup_skips = 0
         self._last_miss_rate_max = 0.0
 
     def set_pin_rows(self, pin_rows: list[list[int]]) -> None:
@@ -223,11 +245,38 @@ class OnlineAdmission:
 
     def note_step(self) -> None:
         self._since_eval += 1
+        self._steps += 1
 
     @property
     def evaluation_due(self) -> bool:
         """True once ``period`` decode steps elapsed since the last evaluation."""
         return self._since_eval >= self.config.period
+
+    @property
+    def apply_warmup_done(self) -> bool:
+        """True once ``warmup_steps`` decode steps elapsed (apply may run)."""
+        return self._steps >= self.config.warmup_steps
+
+    def commit_swaps(self, pairs) -> int:
+        """Commit physically-applied swap pairs into the pin membership.
+
+        Called by OffloadMoeCache.apply_admission_swaps after the disk tier's
+        row hot-swap succeeded for each pair. Pairs that failed their disk read
+        (or were skipped by the warmup gate) never reach here and are re-
+        proposed by a later evaluation once their signals persist.
+        """
+        committed = 0
+        for (layer, out_e), (layer2, in_e) in pairs:
+            assert layer == layer2
+            rows = self._pin[layer]
+            if out_e not in rows or in_e in rows:
+                continue  # stale plan (layout moved on); skip rather than corrupt
+            rows.remove(out_e)
+            rows.append(in_e)
+            rows.sort()
+            committed += 1
+        self.applied_swaps += committed
+        return committed
 
     def update(self, route_counts, miss_counts=None) -> list[tuple[tuple[int, int], tuple[int, int]]]:
         """Fold one cycle's per-row counts in; evaluate when the period elapses.
@@ -294,6 +343,10 @@ class OnlineAdmission:
                 consumed.add(in_e)
                 swaps.append((layer, out_e, in_e))
         for layer, out_e, in_e in swaps:
+            if self.defer_commit:
+                # APPLY mode: membership moves only after the disk tier has
+                # physically hot-swapped the row (cache calls commit_swaps).
+                break
             rows = self._pin[layer]
             rows.remove(out_e)
             rows.append(in_e)
@@ -309,4 +362,9 @@ class OnlineAdmission:
             "swaps": self.swaps,
             "miss_rate_max": round(self._last_miss_rate_max, 4),
             "pin_rows": sum(len(r) for r in self._pin),
+            "apply_deferred": self.defer_commit,
+            "steps": self._steps,
+            "warmup_steps": self.config.warmup_steps,
+            "applied_swaps": self.applied_swaps,
+            "apply_warmup_skips": self.apply_warmup_skips,
         }

@@ -419,15 +419,28 @@ class OffloadMoELayer(MoELayer):
             # No-op inside capture -- with graphs on the replay-time trigger is the
             # graph-doorbell host thread (moe/graph_fetch.py, FT_GRAPH_FETCH_PREFETCH).
             inner._disk_tier.prefetch_from_routing(self.layer_id, topk_ids)
+        tier = inner._cpu_tier
+        if tier is not None and tier.pre_ensure:
+            # B10c: the owner path must run the same ① A+B rescue as the
+            # non-owner branch (FREETOKEN_CT_PRE_ENSURE=1), on the RAW GLOBAL
+            # route BEFORE admission rewrites topk_ids to slot ids. The tier's
+            # tables are all in the local namespace, so the kernel claims
+            # only this rank's owned experts (geometry.global_start filter) --
+            # a remote entry is served by its owner rank, never claimed here.
+            # Claimed experts become pseudo-hits via the slot-0 sentinel, so
+            # ensure_route stages no eviction/fetch for them; combine()
+            # restores the sentinels from ctrl[3]+claimed_ptr.
+            tier.split_pre_owner(self.layer_id, owner, hidden_states,
+                                 topk_weights, topk_ids)
         if owner.graph_safe:
             update = owner.ensure_route_graph(self.layer_id, topk_weights, topk_ids)
         else:
             update = owner.ensure_route(self.layer_id, topk_weights, topk_ids)
-        if inner._cpu_tier is not None:
+        if tier is not None and not tier.pre_ensure:
             # Same three-way classification on the owner-local namespace:
             # update.slot_ids are local slots, the staged plan lives on inner.
-            inner._cpu_tier.split(self.layer_id, inner, hidden_states, update.weights,
-                                  update.slot_ids)
+            tier.split(self.layer_id, inner, hidden_states, update.weights,
+                       update.slot_ids)
         owner.copy_missing()
         if (inner.disk_tier_enabled
                 and os.environ.get("FT_DISK_TIER_VERIFY")

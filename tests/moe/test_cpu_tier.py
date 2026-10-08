@@ -373,6 +373,63 @@ def test_pre_ensure_plan_determinism():
     assert _plan() == _plan()
 
 
+def _owner_plan(**overrides):
+    """Owner-EP mirror (B10c): rank 1 owns global 8..15 (local 0..7); the
+    slot/row-map dicts are LOCAL-namespace, ids are the RAW GLOBAL route."""
+    args = dict(
+        ids=[0, 9, 8, 3, 9, 10],
+        K=3,
+        slot_for_id_row={0: -1, 1: 4, 2: -1},
+        row_map_row={0: 0, 1: 1, 2: 2},
+        route_counts_pre={0: 0, 2: 10},
+        calls_pre=10,
+        cost=dict(_COST, tzc=10.0, b=0.01, a=0.01),
+        ram_rows=64,
+        global_start=8,
+        local_num_experts=8,
+    )
+    args.update(overrides)
+    return pre_ensure_claim_plan(**args)
+
+
+def test_pre_ensure_owner_plan_filters_to_owned():
+    p = _owner_plan()
+    # global 9 == local 1 is slot-resident (hit); globals 0 and 3 are remote
+    # (another rank's experts) and must never be classified or claimed.
+    assert p["nh"] == 2 and p["n_remote"] == 2 and p["n_miss"] == 2
+    assert p["claimed"] == [0, 2]  # LOCAL ids: owned pinned misses only
+    assert all(0 <= e < 8 for e in p["claimed"] + p["sentinels"])
+
+
+def test_pre_ensure_owner_plan_sentinel_weight_and_picks():
+    p = _owner_plan()
+    assert set(p["sentinels"]) == {0, 2}
+    # only the OWNED claimed entries (indices 2, 5) are weight-zeroed;
+    # remote entries (0, 3) and the owned hit (1, 4) keep their weights.
+    assert set(p["weight_zeroed"]) == {2, 5}
+    # one pick per claimed (token, expert) pair, publish order = selection
+    # order then routed order: local 0 at entry 2 (tok 0, pin row 0),
+    # local 2 at entry 5 (tok 1, pin row 2)
+    assert p["picks"] == [(0, 0), (1, 2)]
+
+
+def test_pre_ensure_owner_plan_reuse_demotion():
+    # local 0: cnt 1 + freq 0/10 = 1.0 < 1.5 demoted; local 2: 1 + 10/10 kept
+    p = _owner_plan(reuse_min=1.5)
+    assert p["demoted"] == [0]
+    assert set(p["claimed"]) == {2}
+
+
+def test_pre_ensure_owner_plan_defaults_bit_identical():
+    # global_start=0 / local_num_experts=None is the identity filter: the
+    # owner-aware signature reproduces the legacy non-owner plan exactly.
+    legacy = _plan()
+    explicit = _plan(global_start=0, local_num_experts=None)
+    assert legacy == explicit
+    assert legacy["n_remote"] == 0
+    assert _owner_plan() == _owner_plan()  # determinism on the owner path
+
+
 def test_rescue_env_flags_default_off(monkeypatch):
     for v in ("FREETOKEN_CT_PRE_ENSURE", "FREETOKEN_CT_REUSE_MIN",
               "FREETOKEN_CT_XSTEP_W"):
@@ -487,4 +544,11 @@ def test_split_kernel_b9_single_pick_per_claimed_entry():
 def test_split_pre_kernel_sentinel_and_picks_interp():
     """Pre-ensure kernel == its python mirror: slot-0 sentinels, zeroed
     weights, untouched ids, picks, stats (claim-before-ensure bookkeeping)."""
+    _run_interp_helper()
+
+
+def test_split_pre_kernel_owner_ep_filter_interp():
+    """B10c: the pre-ensure kernel with a nonzero GLOBAL_START claims only
+    this rank's owned experts (remote entries feed the cost model's GEMM
+    term but are never classified/claimed/counted); twin == owner mirror."""
     _run_interp_helper()

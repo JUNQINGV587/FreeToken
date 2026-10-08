@@ -106,7 +106,7 @@ def check_pre_ensure_sentinel_and_picks() -> None:
     kern[(1,)](
         ids, weights, hidden, sf, row_map, mark, cnt, order, gpum, claimed,
         ctrl, seqc, hx, picks, stats, rc, mc,
-        RAM2, E2, layer, B2, K=K2, H=H2, PLAN=PLAN2,
+        RAM2, E2, layer, B2, 0, K=K2, H=H2, PLAN=PLAN2,
         REUSE_MIN=-1.0, XSTEP_W=1.0,
         TZC=10.0, THIT=0.03, CA=0.01, CB=0.01, TOK=0.35, MAXN=384,
         FORCE_N=-1, BLOCK_H=1024, BLOCK_P=1024, num_warps=1,
@@ -131,10 +131,77 @@ def check_pre_ensure_sentinel_and_picks() -> None:
     print("OK pre-ensure-sentinel")
 
 
+def check_pre_ensure_owner_ep_filter() -> None:
+    """B10c: the pre-ensure kernel with a nonzero GLOBAL_START claims ONLY
+    this rank's owned experts. Remote entries are never classified, claimed,
+    sentinel'd, weight-zeroed, picked, or counter-bumped -- they only feed
+    the cost model's GEMM term. Twin must equal the python mirror run with
+    global_start/local_num_experts."""
+    kern = _twin(ct._ct_split_pre_kernel)
+    layer, E2, H2, K2, B2, PLAN2, RAM2, G0 = 1, 8, 16, 3, 2, 16, 6, 8
+    # global route on rank 1 (owns 8..15 == local 0..7): two remote entries
+    # (0, 3), one owned hit (9 == local 1 resident at slot 4), two owned
+    # pinned misses (8 == local 0 row 0, 10 == local 2 row 2).
+    raw = [0, 9, 8, 3, 9, 10]
+    slot_row = [-1, 4, -1, -1, -1, -1, -1, -1]
+    pin_row = [0, 1, 2, 3, -1, 4, -1, 5]
+    ids = torch.tensor(raw, dtype=torch.int32)
+    weights = torch.arange(1, 7, dtype=torch.float32)
+    hidden = torch.zeros(B2, H2, dtype=torch.float16)
+    sf = torch.tensor(slot_row, dtype=torch.int32)
+    row_map = torch.tensor(pin_row, dtype=torch.int32)
+    z = lambda: torch.zeros(PLAN2, dtype=torch.int32)
+    mark, cnt, order, gpum, claimed = z(), z(), z(), z(), z()
+    ctrl = torch.zeros(8, dtype=torch.int64)
+    seqc = torch.zeros(1, dtype=torch.int64)
+    hx = torch.zeros(B2, H2, dtype=torch.float16)
+    picks = torch.zeros(48, dtype=torch.int32)
+    stats = torch.zeros(2 * 16, dtype=torch.int64)
+    rc = torch.zeros(2 * E2, dtype=torch.int64)
+    mc = torch.zeros(2 * E2, dtype=torch.int64)
+    kern[(1,)](
+        ids, weights, hidden, sf, row_map, mark, cnt, order, gpum, claimed,
+        ctrl, seqc, hx, picks, stats, rc, mc,
+        RAM2, E2, layer, B2, G0, K=K2, H=H2, PLAN=PLAN2,
+        REUSE_MIN=-1.0, XSTEP_W=1.0,
+        TZC=10.0, THIT=0.03, CA=0.01, CB=0.01, TOK=0.35, MAXN=384,
+        FORCE_N=-1, BLOCK_H=1024, BLOCK_P=1024, num_warps=1,
+    )
+    mirror = ct.pre_ensure_claim_plan(
+        raw, K2,
+        {e: slot_row[e] for e in range(E2)},
+        {e: pin_row[e] for e in range(E2)},
+        {}, 0, dict(tzc=10.0, thit=0.03, a=0.01, b=0.01, tok=0.35, maxn=384),
+        RAM2, global_start=G0, local_num_experts=E2)
+    assert mirror["nh"] == 2 and mirror["n_remote"] == 2 and mirror["n_miss"] == 2
+    ncl, npk = int(ctrl[3]), int(ctrl[2])
+    assert sorted(int(claimed[j]) for j in range(ncl)) == sorted(mirror["claimed"])
+    for e in mirror["claimed"]:  # LOCAL ids only; sentinel in the local row
+        assert 0 <= e < E2
+        assert int(sf[e]) == 0
+    for i in range(len(raw)):
+        assert (float(weights[i]) == 0.0) == (i in mirror["weight_zeroed"])
+    # remote entries (indices 0, 3) must keep their weights
+    assert float(weights[0]) != 0.0 and float(weights[3]) != 0.0
+    assert [int(x) for x in ids] == raw  # ids never written
+    got = [(int(picks[j * 3]), int(picks[j * 3 + 1])) for j in range(npk)]
+    assert got == mirror["picks"], (got, mirror["picks"])
+    assert int(stats[layer * 16 + 0]) == mirror["nh"]
+    assert int(stats[layer * 16 + 1]) == mirror["n_miss"]
+    # route/miss counters bumped ONLY for owned entries (local namespace)
+    assert int(rc[layer * E2 + 1]) == 2 and int(rc[layer * E2 + 0]) == 1
+    assert int(rc[layer * E2 + 2]) == 1
+    assert int(rc[: layer * E2].sum()) == 0
+    assert int(rc[layer * E2:].sum()) == 4  # remote 0, 3 never counted
+    assert int(mc[layer * E2 + 0]) == 1 and int(mc[layer * E2 + 2]) == 1
+    print("OK pre-ensure-owner-ep")
+
+
 def main() -> int:
     try:
         check_b9_single_pick_per_claimed_entry()
         check_pre_ensure_sentinel_and_picks()
+        check_pre_ensure_owner_ep_filter()
     except AssertionError:
         raise  # real check failure -> exit 1
     except Exception as exc:  # interpreter/twin drift -> caller skips

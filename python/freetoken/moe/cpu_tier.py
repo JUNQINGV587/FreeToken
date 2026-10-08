@@ -76,7 +76,10 @@ all default off, off == pre-rescue behaviour):
       claimed experts get a slot-0 sentinel so lru_ensure treats them as hits
       (no staged eviction/fetch -> no churn) and the CPU job overlaps
       ensure+fetch+GEMM instead of fetch+GEMM alone. The combine kernel
-      restores slot_for_id[e] = -1 from the claimed list.
+      restores slot_for_id[e] = -1 from the claimed list. Wired on both
+      decode paths: the non-owner branch via split_pre, the owner-EP branch
+      via split_pre_owner (B10c), whose GLOBAL_START filter claims only this
+      rank's owned experts on the raw global route.
   FREETOKEN_CT_REUSE_MIN  piece C: claim only misses whose reuse score
       (this-step duplicates + XSTEP_W * cross-step routing frequency) is >=
       this threshold; -1 = off (claim every CPU-ok miss, the old policy).
@@ -405,6 +408,7 @@ def _ct_split_pre_kernel(
     E,  # local experts per layer (route/miss counter row width)
     layer_id,
     bsz,
+    GLOBAL_START,  # first global expert id this rank owns (0 on the non-owner path)
     K: tl.constexpr,
     H: tl.constexpr,
     PLAN,
@@ -432,6 +436,16 @@ def _ct_split_pre_kernel(
     GEMM contributes exactly 0 for them. The combine kernel restores
     ``slot_for_id[e] = -1`` from ``claimed_ptr``.
 
+    Owner EP (B10c): ``ids_ptr`` holds GLOBAL route ids while every table is
+    in the local namespace (slot_for_id/row_map/counters are [E] with
+    E = local_num_experts). An entry is owned iff
+    ``GLOBAL_START <= g < GLOBAL_START + E``; only owned entries are
+    classified/claimed (e = g - GLOBAL_START), a remote entry is served by
+    its own rank's tier and only counts toward the cost model's GEMM term
+    (admission points it at a resident slot with weight 0, so it costs a hit
+    but never a fetch). With GLOBAL_START = 0 and E = num_experts the filter
+    is the identity and the path is bit-identical to the pre-owner kernel.
+
     Sentinels bump ``usage[0]`` once per claimed expert per step, so slot 0's
     resident is effectively pinned -- a deliberate 1/cache_size capacity tax,
     documented in the design doc. Determinism contract identical to the
@@ -457,29 +471,36 @@ def _ct_split_pre_kernel(
     tl.debug_barrier()  # scratch visible to the scalar loops below (same block)
 
     # ---- scalar pass A: classify raw routing, count per-expert entries ------
-    # Candidates are keyed by EXPERT ID (not staged ordinal): the legacy
+    # Candidates are keyed by LOCAL expert id (not staged ordinal): the legacy
     # kernel's staged order is ascending expert id (lru_ensure ranks misses by
     # id), so (count asc, expert asc) reproduces its total order exactly.
+    # Owner EP: ids are global; the ownership filter maps them into the local
+    # namespace and remote entries fall through to the n_remote count.
     rc_base = route_counts_ptr + layer_id.to(tl.int64) * E
     mc_base = miss_counts_ptr + layer_id.to(tl.int64) * E
     nh = 0
     n_miss_entries = 0
+    n_remote = 0
     for i in range(0, bsz * K):
-        e = tl.load(ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + e)
-        tl.store(rc_base + e, tl.load(rc_base + e) + 1)
-        if s >= 0:
-            nh += 1
-        else:
-            n_miss_entries += 1
-            tl.store(mc_base + e, tl.load(mc_base + e) + 1)
-            row = tl.load(row_map_ptr + e)
-            ok = (row >= 0) & (row < ram_rows)
-            if ok:
-                tl.store(mark_ptr + e, 1)
-                tl.store(cnt_ptr + e, tl.load(cnt_ptr + e) + 1)
+        g = tl.load(ids_ptr + i)
+        if (g >= GLOBAL_START) & (g < GLOBAL_START + E):
+            e = g - GLOBAL_START
+            s = tl.load(slot_for_id_ptr + e)
+            tl.store(rc_base + e, tl.load(rc_base + e) + 1)
+            if s >= 0:
+                nh += 1
             else:
-                tl.store(gpum_ptr + e, 1)
+                n_miss_entries += 1
+                tl.store(mc_base + e, tl.load(mc_base + e) + 1)
+                row = tl.load(row_map_ptr + e)
+                ok = (row >= 0) & (row < ram_rows)
+                if ok:
+                    tl.store(mark_ptr + e, 1)
+                    tl.store(cnt_ptr + e, tl.load(cnt_ptr + e) + 1)
+                else:
+                    tl.store(gpum_ptr + e, 1)
+        else:
+            n_remote += 1
 
     # ---- reuse filter (piece C): demote low-reuse candidates to GPU-bound ---
     # Same semantics as the legacy kernel's filter: FORCE_N bypasses it;
@@ -530,7 +551,10 @@ def _ct_split_pre_kernel(
         tt = 0.0
         for k in range(0, MAXN + 1):
             if k <= ncpu:
-                gpu_ms = THIT * (nh + n_miss_entries - k) + TZC * (n_miss_entries - k)
+                # Owner EP: remote entries add GEMM time (admission points
+                # them at a resident slot with weight 0, so they cost a hit)
+                # but never a fetch -- THIT only, outside the -k terms.
+                gpu_ms = THIT * (nh + n_remote + n_miss_entries - k) + TZC * (n_miss_entries - k)
                 cpu_ms = CA
                 for i in range(0, k):
                     e = tl.load(order_ptr + i)
@@ -546,7 +570,8 @@ def _ct_split_pre_kernel(
     # ---- scalar pass D: claim the chosen experts, emit per-pair picks -------
     # sentinel FIRST (per claimed expert, once), then its routed entries in
     # routed order: weight -> 0 (GEMM contributes exactly 0) and one pick per
-    # (token, expert) pair. ids_ptr is never written.
+    # (token, expert) pair. ids_ptr is never written. Entries are matched by
+    # GLOBAL id (e + GLOBAL_START == e when the filter is the identity).
     w_out = 0
     for j in range(0, npk):
         e = tl.load(order_ptr + j)
@@ -555,7 +580,7 @@ def _ct_split_pre_kernel(
         tl.store(claimed_ptr + j, e)
         for i in range(0, bsz * K):
             ei = tl.load(ids_ptr + i)
-            if ei == e:
+            if ei == e + GLOBAL_START:
                 wgt = tl.load(weights_ptr + i).to(tl.float32)
                 tl.store(picks_dev_ptr + w_out * 3 + 0, i // K)
                 tl.store(picks_dev_ptr + w_out * 3 + 1, row)
@@ -712,29 +737,53 @@ def pre_ensure_claim_plan(ids: list[int], K: int, slot_for_id_row: dict[int, int
                           row_map_row: dict[int, int], route_counts_pre: dict[int, int],
                           calls_pre: int, cost: dict[str, float], ram_rows: int,
                           reuse_min: float = -1.0, xstep_w: float = 1.0,
-                          force_n: int = -1) -> dict:
+                          force_n: int = -1, global_start: int = 0,
+                          local_num_experts: int | None = None) -> dict:
     """Pure-python mirror of ``_ct_split_pre_kernel``'s decision + bookkeeping.
 
     Reproduces the kernel's passes on raw routing: classify (hit / CPU-ok
     candidate / GPU-bound), piece-C reuse demotion (skipped under force_n),
     (count asc, expert asc) ordering, dsv41 cost selection, then the claim
-    side effects. Returns a dict with ``claimed`` (expert ids in selection
-    order), ``sentinels`` (same set -- the kernel writes slot_for_id[e] = 0),
-    ``weight_zeroed`` (entry indices whose weight becomes 0), ``picks``
-    ((token, row) per (token, expert) pair in publish order), ``demoted``
-    (reuse-filtered candidates, ascending), ``nh``/``n_miss``/``ncpu``/
-    ``npk``. Exists so the A+B+C bookkeeping is testable on pure CPU.
+    side effects. Returns a dict with ``claimed`` (LOCAL expert ids in
+    selection order), ``sentinels`` (same set -- the kernel writes
+    slot_for_id[e] = 0), ``weight_zeroed`` (entry indices whose weight
+    becomes 0), ``picks`` ((token, row) per (token, expert) pair in publish
+    order), ``demoted`` (reuse-filtered candidates, ascending),
+    ``nh``/``n_miss``/``n_remote``/``ncpu``/``npk``. Exists so the A+B+C
+    bookkeeping is testable on pure CPU.
+
+    Owner EP (B10c): with ``local_num_experts`` set, ``ids`` holds GLOBAL
+    route ids and an entry is owned iff
+    ``global_start <= g < global_start + local_num_experts``; only owned
+    entries are classified or claimed (local id ``e = g - global_start``;
+    the slot/row-map/counter dicts are keyed by LOCAL id). Remote entries
+    count as ``n_remote`` and join the cost model's GEMM term like hits
+    (admission points them at a resident slot with weight 0: a THIT cost,
+    never a TZC fetch). With the defaults the filter is the identity and the
+    plan is bit-identical to the non-owner behaviour.
     """
     nh = 0
+    n_remote = 0
     cnt: dict[int, int] = {}
-    for e in ids:
-        if slot_for_id_row[e] >= 0:
+
+    def _local(g: int) -> int | None:
+        if local_num_experts is None:
+            return g
+        if global_start <= g < global_start + local_num_experts:
+            return g - global_start
+        return None
+
+    for g in ids:
+        e = _local(g)
+        if e is None:
+            n_remote += 1
+        elif slot_for_id_row[e] >= 0:
             nh += 1
         else:
             row = row_map_row[e]
             if 0 <= row < ram_rows:
                 cnt[e] = cnt.get(e, 0) + 1
-    n_miss = len(ids) - nh
+    n_miss = len(ids) - nh - n_remote
     demoted: set[int] = set()
     if force_n < 0 and reuse_min >= 0.0:
         for e in list(cnt):
@@ -742,14 +791,17 @@ def pre_ensure_claim_plan(ids: list[int], K: int, slot_for_id_row: dict[int, int
                 demoted.add(e)
                 del cnt[e]
     order = sorted(cnt, key=lambda e: (cnt[e], e))
-    npk = cost_select([(cnt[e], e) for e in order], nh, n_miss, cost, force_n=force_n)
+    # Remote entries cost GEMM time but never a fetch: they join nh in the
+    # cost model's gpu(k) THIT term only (stats keep them separate).
+    npk = cost_select([(cnt[e], e) for e in order], nh + n_remote, n_miss, cost,
+                      force_n=force_n)
     claimed = order[:npk]
     picks: list[tuple[int, int]] = []
     weight_zeroed: list[int] = []
     for e in claimed:
         row = row_map_row[e]
-        for i, ei in enumerate(ids):
-            if ei == e:
+        for i, g in enumerate(ids):
+            if _local(g) == e:
                 picks.append((i // K, row))
                 weight_zeroed.append(i)
     return {
@@ -760,6 +812,7 @@ def pre_ensure_claim_plan(ids: list[int], K: int, slot_for_id_row: dict[int, int
         "demoted": sorted(demoted),
         "nh": nh,
         "n_miss": n_miss,
+        "n_remote": n_remote,
         "ncpu": len(order),
         "npk": npk,
     }
@@ -1068,6 +1121,7 @@ class CpuTier:
             int(cache.num_experts),
             layer_id,
             bsz,
+            0,  # GLOBAL_START: non-owner cache ids ARE the kernel's namespace
             K=K,
             H=self._hidden,
             PLAN=int(cache.src_indices.numel()),
@@ -1085,6 +1139,77 @@ class CpuTier:
             num_warps=4,
         )
         # Same graph-pull publish contract as split() (ctrl with seq LAST).
+        self._hx_host[:bsz].copy_(self._hx_dev[:bsz], non_blocking=True)
+        self._picks_host.copy_(self._picks_dev, non_blocking=True)
+        self._ctrl_host.copy_(self._ctrl_dev, non_blocking=True)
+        self.start()
+
+    def split_pre_owner(self, layer_id: int, owner, hidden: torch.Tensor,
+                        topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> None:
+        """Owner-EP variant of :meth:`split_pre` (B10c; FREETOKEN_CT_PRE_ENSURE=1).
+
+        ``owner`` is the OwnerOffloadMoeCache wrapper; the tier itself is
+        attached to the wrapped inner cache, so every table (slot_for_id /
+        pin row map / route+miss counters) is in the LOCAL expert namespace
+        while ``topk_ids`` holds the RAW GLOBAL route. The kernel claims only
+        this rank's owned experts (``geometry.global_start``), never a remote
+        one -- a remote entry is served by its owner rank's own tier and only
+        feeds the cost model's GEMM term. Runs BEFORE
+        ``owner.ensure_route[_graph]``: claimed local experts get the slot-0
+        sentinel, so admission treats them as pseudo-hits (no eviction, no
+        staged fetch); ``combine`` restores the sentinels.
+        """
+        if not self._built:
+            return
+        bsz = int(hidden.shape[0])
+        if bsz > self._max_tokens:
+            return  # never happens on the decode path; combine guards the same
+        inner = owner._cache
+        # Same B7 discipline as split(): the service must exist before the
+        # first seq can be published.
+        self.start()
+        self._cur_slot_row = inner.slot_for_id[layer_id]
+        K = int(topk_ids.numel() // bsz)
+        _ct_split_pre_kernel[(1,)](
+            topk_ids,
+            topk_weights,
+            hidden,
+            inner.slot_for_id[layer_id],
+            self._row_map[layer_id],
+            self._mark,
+            self._cnt,
+            self._order,
+            self._gpum,
+            self._claimed_dev,
+            self._ctrl_dev,
+            self._seqc,
+            self._hx_dev,
+            self._picks_dev.view(-1),
+            self._stats_dev,
+            self._route_counts_dev,
+            self._miss_counts_dev,
+            self._ram_rows,
+            int(inner.num_experts),  # local E: counter row width + owned range
+            layer_id,
+            bsz,
+            int(owner.geometry.global_start),
+            K=K,
+            H=self._hidden,
+            PLAN=int(inner.src_indices.numel()),
+            REUSE_MIN=self._reuse_min,
+            XSTEP_W=self._xstep_w,
+            TZC=self._cost["tzc"],
+            THIT=self._cost["thit"],
+            CA=self._cost["a"],
+            CB=self._cost["b"],
+            TOK=self._cost["tok"],
+            MAXN=int(self._cost["maxn"]),
+            FORCE_N=self._force_n,
+            BLOCK_H=1024,
+            BLOCK_P=1024,
+            num_warps=4,
+        )
+        # Same graph-pull publish contract as split_pre (ctrl with seq LAST).
         self._hx_host[:bsz].copy_(self._hx_dev[:bsz], non_blocking=True)
         self._picks_host.copy_(self._picks_dev, non_blocking=True)
         self._ctrl_host.copy_(self._ctrl_dev, non_blocking=True)

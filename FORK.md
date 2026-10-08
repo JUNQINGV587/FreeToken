@@ -478,7 +478,16 @@ any flag before it.
   changes -- output is exact-arithmetic equivalent but NOT bitwise identical;
   compare with rel-RMS / `torch.allclose`, never `torch.equal`. 28 CPU tests
   on branch (incl. TRITON_INTERPRET kernel twins); sanitizer + decode wins
-  defer to the battery.
+  defer to the battery. **B10c follow-up** (`5c120c091b`, `92b58deccd`,
+  `3464e23c57`, `port2/owner-pre-ensure`): the pre-ensure claim is now wired
+  into the OWNER-EP decode path too (`_decode_owner` previously fell through
+  to the legacy split, so `PRE_ENSURE=1` was a no-op in production ep>1
+  geometry). `split_pre_owner` runs the same kernel on the raw global route
+  BEFORE `ensure_route[_graph]` with a `GLOBAL_START` ownership filter --
+  only this rank's owned experts are classified/claimed (remote entries feed
+  the cost model's GEMM term like hits but are never claimed, sentinel'd,
+  weight-zeroed, or counter-bumped); the reuse filter (piece C) applies
+  identically. Same env, default off = byte-identical legacy owner split.
 - `feat(moe)`: **learned block bulk prefetch for cold prefill** (`5efd1173d7`,
   `e0c9fd93e3`, `port2/bulk-prefetch`) — cold prefill leaves the disk idle in
   the GEMM/attention windows (~6.4% honest ceiling); a learned per-layer

@@ -34,6 +34,7 @@ import struct
 from dataclasses import dataclass
 
 _RECORD_HDR = struct.Struct("<bii")  # phase(int8), layer_id(int32), n(int32)
+_TOKENS_HDR = struct.Struct("<ii")  # record index (int32), token id (int32)
 
 
 @dataclass
@@ -94,6 +95,7 @@ class RouteTraceRecorder:
         # server never reaches, so a short capture silently loses its last requests.
         # Override the cadence for experiments: FT_ROUTE_TRACE_FLUSH=64.
         self._flush_every = int(os.environ.get("FT_ROUTE_TRACE_FLUSH", "8192"))
+        self._tokens_f = None  # lazy <path>.tokens sidecar (decode token-id markers)
         self._write_meta()
 
     def _write_meta(self) -> None:
@@ -128,10 +130,35 @@ class RouteTraceRecorder:
             self._flush()
             self._write_meta()
 
+    def record_tokens(self, token_ids) -> None:
+        """Append decode token-id markers to the ``<path>.tokens`` sidecar.
+
+        One ``(rec_idx, token_id)`` entry per decode step; ``rec_idx`` is the
+        body record count at the marker, so the next ``num_layers`` decode
+        records belong to that token. Offline lookahead training needs the
+        content (token id) that produced each routing decision; the body
+        format stays untouched, so every existing tool keeps working.
+        ``token_ids`` is a torch tensor on the engine path, any iterable of
+        ints in tests."""
+        if self._overflow:
+            return
+        if self._tokens_f is None:
+            # unbuffered: each 8-byte marker is a syscall straight to disk, so
+            # a live capture is observable (and a crash loses nothing).
+            self._tokens_f = open(self.path + ".tokens", "wb", buffering=0)
+        if hasattr(token_ids, "detach"):
+            ids = token_ids.detach().reshape(-1).cpu().tolist()
+        else:
+            ids = list(token_ids)
+        for tok in ids:
+            self._tokens_f.write(_TOKENS_HDR.pack(self._n, int(tok)))
+
     def close(self) -> None:
         try:
             self._flush()
             self._f.close()
+            if self._tokens_f is not None:
+                self._tokens_f.close()
         finally:
             self._write_meta()
 
@@ -162,6 +189,25 @@ def read_trace(path: str):
             ids = tuple(struct.unpack(f"<{n}i", raw)) if n else ()
             records.append((phase, layer_id, ids))
     return meta, records
+
+
+def read_tokens(path: str):
+    """Return ``[(rec_idx, token_id)]`` from the ``<path>.tokens`` sidecar.
+
+    Empty when the trace was recorded without the sidecar. Pair with
+    ``read_trace``: a marker at ``rec_idx`` means the next ``num_layers``
+    decode-phase records belong to that token."""
+    out = []
+    tp = path + ".tokens"
+    if not os.path.exists(tp):
+        return out
+    with open(tp, "rb") as f:
+        while True:
+            raw = f.read(_TOKENS_HDR.size)
+            if len(raw) < _TOKENS_HDR.size:
+                break
+            out.append(_TOKENS_HDR.unpack(raw))
+    return out
 
 
 # ----------------------------------------------------------------- LRU mirror

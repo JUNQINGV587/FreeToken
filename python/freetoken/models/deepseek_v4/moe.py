@@ -8,6 +8,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
@@ -138,6 +139,7 @@ class MoE(BaseOP):
 
     def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
         self.dim = args.dim
+        self.layer_id = layer_id
         # One rendezvous per layer instead of two: shared and routed expert outputs
         # are partial sums over the same TP group, so their adds commute with the
         # all-reduce (qwen4_exp/moe.py precedent). Not bit-identical to the split
@@ -151,6 +153,14 @@ class MoE(BaseOP):
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate.forward(x, input_ids.flatten())
+        # Route-trace token-id sidecar: one marker per decode step at layer 0,
+        # so the offline lookahead analysis can pair routing with the token
+        # that produced it. Only active under --moe-trace-route.
+        if self.layer_id == 0:
+            rec = getattr(getattr(self.experts, "offload_cache", None),
+                          "route_recorder", None)
+            if rec is not None and not get_global_ctx().batch.is_prefill:
+                rec.record_tokens(input_ids)
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.

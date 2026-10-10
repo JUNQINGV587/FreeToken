@@ -22,6 +22,7 @@ _spec.loader.exec_module(_rt)
 LRU = _rt.LRU
 RouteTraceRecorder = _rt.RouteTraceRecorder
 read_trace = _rt.read_trace
+read_tokens = _rt.read_tokens
 replay = _rt.replay
 replay_ep2 = _rt.replay_ep2
 
@@ -64,6 +65,35 @@ def test_roundtrip(tmp_path):
     assert records[0] == (0, 0, (5, 300, 7))
     assert records[1] == (0, 1, (10, 11))
     assert records[2] == (1, 0, (1, 2, 3))
+
+
+def test_token_sidecar(tmp_path):
+    """record_tokens writes (rec_idx, token_id) markers to <path>.tokens;
+    rec_idx aligns each marker with the body records of its token."""
+    import struct
+
+    path = str(tmp_path / "tr.bin")
+    rec = RouteTraceRecorder(
+        path, num_experts=512, num_layers=48, cache_size=2840, top_k=10,
+        model="flash", decode_target="gpu",
+    )
+
+    def put(phase, layer, ids):
+        rec._buf += struct.Struct("<bii").pack(phase, layer, len(ids))
+        rec._buf += struct.pack(f"<{len(ids)}i", *ids)
+        rec._n += 1
+
+    rec.record_tokens([100])  # token 100's marker: the next records are its
+    put(0, 0, [5, 300, 7])
+    put(0, 1, [10, 11])
+    rec.record_tokens([101])
+    put(0, 0, [1, 2, 3])
+    rec.close()
+
+    assert read_tokens(path) == [(0, 100), (2, 101)]
+    meta, records = read_trace(path)
+    assert meta.records == 3  # the sidecar never alters the body
+    assert read_tokens(str(tmp_path / "absent.bin")) == []  # no sidecar -> []
 
 
 def test_lru_batch_protection():

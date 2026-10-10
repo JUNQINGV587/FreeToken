@@ -1467,13 +1467,61 @@ class Engine:
             mrope=config.model_config.model_is_mrope,
         )
 
+
+    def _step_profile_arm(self, use_graph):
+        """FREETOKEN_STEP_PROFILE: env-gated torch profiler around decode graph replays."""
+        import os
+        if not use_graph or not os.getenv("FREETOKEN_STEP_PROFILE"):
+            return None
+        skip = int(os.getenv("FREETOKEN_STEP_PROFILE", "0") or 0)
+        steps = int(os.getenv("FREETOKEN_STEP_PROFILE_STEPS", "2") or 2)
+        seen = getattr(self, "_step_prof_seen", 0)
+        done = getattr(self, "_step_prof_done", 0) or 0
+        if done >= steps:
+            return None
+        self._step_prof_seen = seen + 1
+        if seen < skip:
+            return None
+        import torch
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False, with_stack=False,
+        )
+        self._step_prof_active = prof
+        return prof
+
+    def _step_profile_finish(self, prof):
+        import os
+        import torch
+        prof.stop()
+        done = int(getattr(self, "_step_prof_done", 0) or 0)
+        prefix = os.getenv("FREETOKEN_STEP_PROFILE_OUT", "/tmp/ft_step_profile")
+        trace = f"{prefix}.step{done}.json"
+        prof.export_chrome_trace(trace)
+        try:
+            table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=25)
+            with open(f"{prefix}.step{done}.txt", "w") as fh:
+                fh.write(table)
+        except Exception as exc:  # never let profiling break serving
+            print(f"[step-profile] table failed: {exc}", flush=True)
+        self._step_prof_done = done + 1
+        print(f"[step-profile] wrote {trace} (step {done})", flush=True)
+        return None
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        _prof = self._step_profile_arm(use_graph)  # FREETOKEN_STEP_PROFILE (default off)
+        if _prof is not None:
+            _prof.start()
+        try:
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        finally:
+            if _prof is not None:
+                self._step_profile_finish(_prof)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.

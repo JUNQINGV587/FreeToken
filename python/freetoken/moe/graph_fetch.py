@@ -358,6 +358,12 @@ class GraphFetchBridge:
         # device->host copy. Off by default: it competes for NVMe bandwidth with the very
         # demand reads this thread is serving, so it is A/B-measured before shipping.
         self._issue_prefetch = os.environ.get("FT_GRAPH_FETCH_PREFETCH", "0") == "1"
+        # Intra-row fan-out for count==1 requests (default ON): this drive does
+        # ~1.6 GB/s single-stream but ~6 GB/s over 4 concurrent readers
+        # (measured 2026-10-10), so a single-row doorbell request reads its
+        # merged groups in parallel on the row pool. FT_GRAPH_FETCH_ROW_SERIAL=1
+        # forces the old serial loop (debug/A-B).
+        self._row_parallel = os.environ.get("FT_GRAPH_FETCH_ROW_SERIAL", "0") != "1"
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._watchdog_thread: threading.Thread | None = None
@@ -650,7 +656,8 @@ class GraphFetchBridge:
             # by the spin, so the previous request's install kernel (stream
             # order) has consumed the rows before this request could exist.
             if count == 1:
-                self._read_into_staging(layer, int(blk[2]), 0)
+                self._read_into_staging(layer, int(blk[2]), 0,
+                                        parallel_rows=self._row_parallel)
             else:
                 # Parallel rows: one row's preadv (DMA, GIL released) overlaps
                 # another row's memmove (CPU). f.result() re-raises a worker
@@ -690,7 +697,28 @@ class GraphFetchBridge:
                 # decode path never runs, so nothing else would ever call this.
                 self.tier.end_turn()
 
-    def _read_into_staging(self, layer: int, expert: int, j: int) -> None:
+    def _read_row_group(self, tier, j: int, shard_idx: int, a0: int,
+                        a1: int, members) -> None:
+        """preadv one merged run + scatter its members into staging row j.
+
+        Runs on the service thread (serial path) or on a row-pool worker
+        (intra-row fan-out); each caller uses its own TLS bounce slab, and a
+        row's members write disjoint staging regions, so group-parallel reads
+        need no locking."""
+        bounce = self._bounce_buf()
+        fd, _direct = tier._fd(shard_idx)
+        slen = a1 - a0
+        mv = (ctypes.c_char * slen).from_address(bounce.data_ptr())
+        os.preadv(fd, [mv], a0)
+        tier._preadv_calls += 1
+        src_base = bounce.data_ptr() - a0
+        for bank_idx, d0, d1, off, nbytes in members:
+            ctypes.memmove(
+                self.staging_host[bank_idx][j][d0:d1].data_ptr(),
+                src_base + off, nbytes)
+
+    def _read_into_staging(self, layer: int, expert: int, j: int,
+                           parallel_rows: bool = False) -> None:
         """preadv one expert's rows (all banks) into pinned staging row j.
 
         ``expert`` is the LOCAL (slot-cache) id; _group_runs/_fill_scalar_row
@@ -717,7 +745,6 @@ class GraphFetchBridge:
             # "Inplace update to inference tensor outside InferenceMode" (2026-10-03).
             tier.mark_turn_src(layer, expert, 1)  # served from stash (cf. fetch_pending)
             return
-        bounce = self._bounce_buf()
         scalar_banks = getattr(tier._index, "scalar_banks", ())
         _row_groups = getattr(tier, "_row_groups", None)
         if _row_groups is not None and not getattr(self, "_convert", False):
@@ -727,19 +754,19 @@ class GraphFetchBridge:
             for bank_idx in scalar_banks:
                 tier._fill_scalar_row(bank_idx, layer, expert,
                                       self.staging_host[bank_idx][j])
-            for shard_idx, a0, a1, members, _end in _row_groups(
-                    layer, expert):
-                fd, _direct = tier._fd(shard_idx)
-                slen = a1 - a0
-                mv = (ctypes.c_char * slen).from_address(bounce.data_ptr())
-                os.preadv(fd, [mv], a0)
-                tier._preadv_calls += 1
-                src_base = bounce.data_ptr() - a0
-                for bank_idx, d0, d1, off, nbytes in members:
-                    ctypes.memmove(
-                        self.staging_host[bank_idx][j][d0:d1].data_ptr(),
-                        src_base + off, nbytes)
+            groups = list(_row_groups(layer, expert))
+            if parallel_rows and len(groups) > 1:
+                futs = [self._row_pool.submit(
+                            self._read_row_group, tier, j,
+                            shard_idx, a0, a1, members)
+                        for shard_idx, a0, a1, members, _end in groups]
+                for f in futs:
+                    f.result()
+            else:
+                for shard_idx, a0, a1, members, _end in groups:
+                    self._read_row_group(tier, j, shard_idx, a0, a1, members)
             return
+        bounce = self._bounce_buf()
         for bank_idx, (_host, _gpu) in enumerate(tier._banks):
             dst_row = self.staging_host[bank_idx][j]
             if not getattr(self, "_convert", False) and bank_idx in scalar_banks:

@@ -271,6 +271,48 @@ def test_request_kernel_remaps_through_row_map(tmp_path):
         b.shutdown()
 
 
+class _FakeRowGroupsTier(_FakeTier):
+    """_FakeTier + the native cross-bank merged plan: every expert row is
+    served as two half-row groups on bank 0, so the intra-row fan-out path
+    (parallel_rows) has multiple groups to split across the row pool."""
+
+    def _row_groups(self, layer, expert):
+        a0 = expert * ROW
+        half = ROW // 2
+        return [
+            [0, a0, a0 + half, [(0, 0, half, a0, half)], a0 + half],
+            [0, a0 + half, a0 + ROW, [(0, half, ROW, a0 + half, half)],
+             a0 + ROW],
+        ]
+
+
+@pytest.mark.parametrize("serial", [False, True])
+def test_single_row_group_fanout(tmp_path, monkeypatch, serial):
+    """count==1 doorbell request: with parallel_rows the row's merged groups
+    are read concurrently on the row pool; both modes must produce the exact
+    on-disk bytes (the drive's ~3.8x concurrency headroom is what the fan-out
+    exists to use)."""
+    monkeypatch.setenv("FT_GRAPH_FETCH_ROW_SERIAL", "1" if serial else "0")
+    tier = _FakeRowGroupsTier(tmp_path, ram=0)
+    cache = _FakeCache(tier)
+    b = GraphFetchBridge(tier, cache, k_max=K_MAX)
+    try:
+        b.enable()
+        _set_plan(cache, srcs=[5], slots=[20])
+        _launch_request(b, cache)
+        assert int(b.req_host[0]) == 1
+        deadline = time.time() + 10
+        while int(b.resp_host[0]) < 1 and time.time() < deadline:
+            time.sleep(0.001)
+        b.disable()
+        assert int(b.resp_host[0]) == 1, "service thread never acked"
+        # Row 5's byte pattern fills the whole staged row regardless of mode.
+        assert b.staging_host[0][0].unique().tolist() == [5]
+        assert tier._preadv_calls == 2  # both half-row groups were read
+    finally:
+        b.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # DS-FP4 conversion mode (triton_dsfp4): the doorbell stages NATIVE NVFP4 scale
 # bytes and installs them through the device-side convert kernel.

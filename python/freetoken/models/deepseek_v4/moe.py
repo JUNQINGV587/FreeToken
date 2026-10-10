@@ -3,6 +3,8 @@ experts (GPU slot-cache / cpu / hybrid decode paths)."""
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -60,9 +62,9 @@ class Expert(BaseOP):
         self.w3 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3")
         self.swiglu_limit = swiglu_limit
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
         h = fused_swiglu(self.w1.forward(x), self.w3.forward(x), self.swiglu_limit, x.dtype)
-        return self.w2.forward(h)
+        return self.w2.forward(h, reduce=reduce)
 
 
 class DSV4OffloadMoELayer(OffloadMoELayer):
@@ -136,6 +138,11 @@ class MoE(BaseOP):
 
     def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
         self.dim = args.dim
+        # One rendezvous per layer instead of two: shared and routed expert outputs
+        # are partial sums over the same TP group, so their adds commute with the
+        # all-reduce (qwen4_exp/moe.py precedent). Not bit-identical to the split
+        # path (one bf16 add moves across the fp32-accumulated reduce).
+        self._merge_shared_ar = os.environ.get("FREETOKEN_DSV4_MERGE_SHARED_AR", "1") != "0"
         self.gate = Gate(layer_id, args)
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit, quant_config=quant_config, prefix=f"{prefix}.shared_experts")
         self.experts = DSV4OffloadMoELayer(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.experts")
@@ -147,10 +154,13 @@ class MoE(BaseOP):
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.
-        shared = self.shared_experts.forward(x)
+        shared = self.shared_experts.forward(x, reduce=not self._merge_shared_ar)
         # routed_forward may mutate the ids in place (offload decode slot remap);
         # indices.to(int32) always copies (int64 source), so no clone needed here.
         routed = self.experts.routed_forward(
-            x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
+            x, weights.float().contiguous(), indices.to(torch.int32).contiguous(),
+            reduce=not self._merge_shared_ar,
         )
+        if self._merge_shared_ar:
+            return self.experts._maybe_all_reduce(routed + shared).view(shape)
         return (routed + shared).view(shape)

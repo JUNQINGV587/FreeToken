@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import try_get_tp_info
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
@@ -29,12 +30,17 @@ class Attention(BaseOP):
     def __init__(self, layer_id: int, args: DeepseekV4Args, *, quant_config=None, prefix: str = ""):
         self.layer_id = layer_id
         self.dim = args.dim
-        self.n_heads = args.n_heads
+        # per-rank counts for the head axis and the output groups: attn_sink, the q unflatten
+        # and wo_a rows are local, while the col/row-parallel layers take the global totals and
+        # shard internally (the checkpoint stores the unsharded attn_sink, so the loader cuts it).
+        tp = try_get_tp_info()
+        self.tp_size = tp.size if tp is not None else 1
+        self.n_heads = args.n_heads // self.tp_size
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.n_groups = args.o_groups
+        self.n_groups = args.o_groups // self.tp_size
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
@@ -43,14 +49,14 @@ class Attention(BaseOP):
         # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
         self.wq_a = LinearReplicated(self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = LinearColParallelMerged(self.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.wq_b = LinearColParallelMerged(self.q_lora_rank, [args.n_heads * self.head_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
         self.wkv = LinearReplicated(self.dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by group like wo_b shards on K.
         wo_a_rows = self.n_groups * args.o_lora_rank
-        wo_a_k = self.n_heads * self.head_dim // self.n_groups
+        wo_a_k = args.n_heads * self.head_dim // args.o_groups
         self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
-        self.wo_b = LinearRowParallel(self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
+        self.wo_b = LinearRowParallel(args.o_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
         self.softmax_scale = self.head_dim ** -0.5
 
         if self.compress_ratio:

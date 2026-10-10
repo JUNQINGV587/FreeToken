@@ -2122,6 +2122,10 @@ struct CpuMoeExecutor {
 // combine kernel spins on the done word, then adds hout into the GPU GEMM
 // output. Both threads make ZERO CUDA calls (graph_fetch.py transport contract:
 // the graph PULLS, the host never touches CUDA).
+// Worker index of the calling thread inside CpuTierService; -1 outside the pool.
+// Only used to pick ONE thread as the phase-timing sampler (observation only).
+static thread_local int g_cpu_tier_tid = -1;
+
 class CpuTierService {
  public:
   static constexpr int64_t SEQ_OFF = 7;  // ctrl[7]: the D2H memcpy lands it LAST
@@ -2173,6 +2177,15 @@ class CpuTierService {
   std::vector<int> core_ids;
   int service_core;
   std::atomic<uint64_t> jobs{0}, busy_ns{0};
+  // FREETOKEN_CT_INLINE_MAX: run a job on the coordinator thread with no pool
+  // dispatch and no phase barriers when npk <= this (decode routes 1-3 CPU misses
+  // per layer, where five barriers cost more than the whole job). 0 = off.
+  int inline_max = 0;
+  std::atomic<uint64_t> inline_jobs{0};
+  // Per-phase wall-clock attribution (observation only). Sampled from the tid-0
+  // worker: every phase ends in a pool barrier, so that thread's phase times are
+  // representative of the whole generation.
+  std::atomic<uint64_t> phase_ns[5]{};
   std::atomic<int> fatal_code{0};
   int64_t served_seq = 0;
   bool protocol_started = false;
@@ -2257,6 +2270,8 @@ class CpuTierService {
     partial_scratch.assign(static_cast<size_t>(max_picks) * H, 0.0f);
     tp_off.assign(static_cast<size_t>(max_tokens) + 1, 0);
     tp_store.assign(static_cast<size_t>(max_picks), 0);
+    if (const char* im = getenv("FREETOKEN_CT_INLINE_MAX"))
+      inline_max = std::max(0, atoi(im));
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -2293,6 +2308,12 @@ class CpuTierService {
   const char* isa_name() const { return isa; }
   uint64_t host_jobs_count() const { return jobs.load(); }
   uint64_t host_busy_ns_count() const { return busy_ns.load(); }
+  // Nanoseconds in one job phase (0=prep,1=pass1,2=prt,3=pass2,4=reduce),
+  // accumulated by the tid-0 sampler. Observation only.
+  uint64_t host_inline_jobs_count() const { return inline_jobs.load(); }
+  uint64_t phase_ns_count(int ph) const {
+    return (ph >= 0 && ph < 5) ? phase_ns[ph].load() : 0;
+  }
   int fatal() const { return fatal_code.load(); }
 
   // Phase 0: zero this token's hout row; convert the fp16 wire format to bf16
@@ -2471,19 +2492,67 @@ class CpuTierService {
     barrier(local_sense);
   }
 
+  // Single-thread fast path: same phases, no dispatch and no barriers. The
+  // per-phase work-stealing counters and the pool counters stay untouched.
+  void job_body_inline() {
+    auto t_ph = std::chrono::steady_clock::now();
+    auto mark = [&](int ph) {
+      const auto now = std::chrono::steady_clock::now();
+      phase_ns[ph].fetch_add(
+          static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_ph)
+                  .count()),
+          std::memory_order_relaxed);
+      t_ph = now;
+    };
+    for (int64_t p = 0; p < cur_bsz; ++p) do_prep(p);
+    mark(0);
+    if (cur_npk > 0) {
+      const int64_t n1 = static_cast<int64_t>(cur_npk) * n_iblk;
+      for (int64_t p = 0; p < n1; ++p) do_pass1(p);
+      mark(1);
+      for (int64_t p = 0; p < cur_npk; ++p) do_prt(p);
+      mark(2);
+      const int64_t n3 = static_cast<int64_t>(cur_npk) * n_hblk;
+      for (int64_t p = 0; p < n3; ++p) do_pass2(p);
+      mark(3);
+    }
+    const int64_t n4 = static_cast<int64_t>(cur_bsz) * n_hblk;
+    for (int64_t p = 0; p < n4; ++p) do_reduce(p);
+    mark(4);
+  }
+
   void job_body() {
     int local_sense = 0;
+    const bool timed = (g_cpu_tier_tid == 0);
+    auto t_ph = std::chrono::steady_clock::now();
+    auto mark = [&](int ph) {
+      if (!timed) return;
+      const auto now = std::chrono::steady_clock::now();
+      phase_ns[ph].fetch_add(
+          static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_ph)
+                  .count()),
+          std::memory_order_relaxed);
+      t_ph = now;
+    };
     run_one(local_sense, 0, cur_bsz);
+    mark(0);
     if (cur_npk > 0) {
       run_one(local_sense, 1, static_cast<int64_t>(cur_npk) * n_iblk);
+      mark(1);
       run_one(local_sense, 2, cur_npk);
+      mark(2);
       run_one(local_sense, 3, static_cast<int64_t>(cur_npk) * n_hblk);
+      mark(3);
     }
     run_one(local_sense, 4, static_cast<int64_t>(cur_bsz) * n_hblk);
+    mark(4);
   }
 
   void worker_loop(int tid) {
     pin_self(tid);
+    g_cpu_tier_tid = tid;
     uint64_t my_gen = 0;
     int64_t idle = 0;
     for (;;) {
@@ -2526,6 +2595,18 @@ class CpuTierService {
     for (int p = 0; p < npk; ++p) {
       const int tok = picks[static_cast<size_t>(p) * 3];
       if (tok >= 0 && tok < bsz) tp_store[fill[tok]++] = p;
+    }
+    if (inline_max > 0 && npk <= inline_max) {
+      job_body_inline();
+      inline_jobs.fetch_add(1, std::memory_order_relaxed);
+      jobs.fetch_add(1, std::memory_order_relaxed);
+      busy_ns.fetch_add(
+          static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count()),
+          std::memory_order_relaxed);
+      return;
     }
     done_count.store(0, std::memory_order_relaxed);
     bar_count.store(0, std::memory_order_relaxed);
@@ -2678,6 +2759,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("bsz"), py::arg("npk"), py::call_guard<py::gil_scoped_release>())
       .def("host_jobs", &CpuTierService::host_jobs_count)
       .def("host_busy_ns", &CpuTierService::host_busy_ns_count)
+      .def("host_phase_ns", &CpuTierService::phase_ns_count, py::arg("phase"))
+      .def("host_inline_jobs", &CpuTierService::host_inline_jobs_count)
       .def("fatal", &CpuTierService::fatal)
       .def("isa_name", &CpuTierService::isa_name)
       .def("shutdown", &CpuTierService::shutdown);

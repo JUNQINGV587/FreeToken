@@ -1229,6 +1229,15 @@ class CpuTier:
         svc = self._service
         busy_ns = int(svc.host_busy_ns()) if svc is not None else 0
         jobs = int(svc.host_jobs()) if svc is not None else 0
+        # Per-phase attribution (observation only; see cpu_moe_ext.cpp job_body).
+        phase_ns = (
+            [int(svc.host_phase_ns(i)) for i in range(5)]
+            if svc is not None and hasattr(svc, "host_phase_ns") else [0] * 5
+        )
+        inline_jobs = (
+            int(svc.host_inline_jobs())
+            if svc is not None and hasattr(svc, "host_inline_jobs") else 0
+        )
         dev = self._stats_dev.view(-1, 16)
         hits = int(dev[:, 0].sum().item())
         misses = int(dev[:, 1].sum().item())
@@ -1247,6 +1256,9 @@ class CpuTier:
             "timeouts": timeouts,
             "host_busy_ms": busy_ns / 1e6,
             "host_jobs": jobs,
+            # prep / pass1 / prt / pass2 / reduce, in ms (tid-0 sampler).
+            "phase_ms": [v / 1e6 for v in phase_ns],
+            "inline_jobs": inline_jobs,
             "splits": calls,
             "isa": svc.isa_name() if svc is not None else None,
             "cost": dict(self._cost),

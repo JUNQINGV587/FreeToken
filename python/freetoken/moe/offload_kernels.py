@@ -19,6 +19,45 @@ _HYBRID_FETCH_BY_RECENCY = (
 )
 
 
+@triton.jit
+def _scratch_assign_kernel(
+    ids_ptr, slot_for_id_ptr, row_map_ptr,
+    stage_list_ptr, stage_count_ptr, plan_src_ptr, plan_dst_ptr, plan_count_ptr,
+    K: tl.constexpr, PLAN: tl.constexpr, RAM_ROWS: tl.constexpr,
+    SCRATCH_BASE: tl.constexpr, ID_BASE: tl.constexpr,
+):
+    """Stage RAM-pinned routed experts into the reserved scratch slots (R1).
+
+    Runs BEFORE ``lru_ensure`` on the raw routing: an expert whose host home is the
+    RAM pin set gets ``slot_for_id[e] = SCRATCH_BASE + j``, which ``lru_ensure`` reads
+    as a hit -- so it never picks a victim for it and no resident is evicted. The
+    reserved range is deliberately outside the managed view the LRU is given, so those
+    slots can never be chosen as victims either. ``stage_list``/``stage_count`` carry
+    this layer's previous assignment: it is cleared here first, which is what bounds
+    the residency of a scratch slot to the single forward pass that staged it.
+    """
+    n_prev = tl.load(stage_count_ptr)
+    for j in range(0, PLAN):
+        if j < n_prev:
+            e = tl.load(stage_list_ptr + j)
+            tl.store(slot_for_id_ptr + ID_BASE + e, -1)
+    n = 0
+    for i in range(0, K):
+        e = tl.load(ids_ptr + i)
+        if e >= 0:
+            if tl.load(slot_for_id_ptr + ID_BASE + e) < 0:
+                row = tl.load(row_map_ptr + e)
+                if row < RAM_ROWS:
+                    if n < PLAN:
+                        tl.store(stage_list_ptr + n, e)
+                        tl.store(plan_src_ptr + n, row)
+                        tl.store(plan_dst_ptr + n, SCRATCH_BASE + n)
+                        tl.store(slot_for_id_ptr + ID_BASE + e, SCRATCH_BASE + n)
+                        n += 1
+    tl.store(stage_count_ptr, n.to(tl.int64))
+    tl.store(plan_count_ptr, n.to(tl.int64))
+
+
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
@@ -28,11 +67,15 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
     """
+    # Managed range only: with FREETOKEN_MOE_SCRATCH the top slots are the RAM
+    # staging pool and must never enter the victim scan (see OffloadMoeCache).
+    managed = getattr(cache, "managed_slots", cache.id_of_slot.numel())
+    _scratch_stage(cache, layer_id, expert_ids, managed)
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
-        cache.id_of_slot,
-        cache.usage,
+        cache.id_of_slot[:managed],
+        cache.usage[:managed],
         cache.step,
         expert_ids,
         cache.src_indices,
@@ -40,6 +83,44 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         cache.num_indices,
         stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
         id_base=layer_id * cache.num_experts,
+    )
+
+
+def _scratch_stage(cache, layer_id: int, expert_ids: torch.Tensor, managed: int) -> None:
+    """Assign this layer's RAM-pinned misses to scratch slots and stage them over PCIe.
+
+    No-op unless ``FREETOKEN_MOE_SCRATCH`` sized the cache AND the fused multi-bank
+    copy is available (without it we would need one launch per bank per layer, which is
+    not worth the code here -- the historic path stays in charge)."""
+    tier = getattr(cache, "_disk_tier", None)
+    if not getattr(cache, "scratch_slots", 0) or tier is None:
+        return
+    if not cache._copy_fused_ok or cache._copy_dst_ptrs is None:
+        if not getattr(cache, "_scratch_warned", False):
+            cache._scratch_warned = True
+            print("[moe-scratch] fused multi-bank copy unavailable; scratch staging off",
+                  flush=True)
+        return
+    rows_ram = int(getattr(tier, "_ram", 0))
+    if rows_ram <= 0:
+        return
+    plan = cache._scratch_plan
+    _scratch_assign_kernel[(1,)](
+        expert_ids,
+        cache.slot_for_id.view(-1),
+        tier._row_map_dev[layer_id],
+        plan["stage_list"], plan["stage_count"],
+        plan["src"], plan["dst"], cache.num_indices_scratch,
+        K=expert_ids.numel(), PLAN=cache.evict_slots.numel(), RAM_ROWS=rows_ram,
+        SCRATCH_BASE=managed, ID_BASE=layer_id * cache.num_experts,
+    )
+    from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+    fast_index_copy_multi_jit(
+        cache._copy_dst_ptrs,
+        cache._copy_src_ptrs[layer_id],
+        cache._copy_feat_bytes,
+        plan["dst"], plan["src"], cache.num_indices_scratch,
     )
 
 

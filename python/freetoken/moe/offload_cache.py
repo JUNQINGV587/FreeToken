@@ -233,6 +233,33 @@ class OffloadMoeCache:
         # Reverse map, in the flat id space flashlib's slot_cache works in:
         # id == layer_id * num_experts + expert, so one array replaces the (layer,
         # expert) pair and evicting a slot needs no decode.
+        # Scratch staging (R1, FREETOKEN_MOE_SCRATCH, 0 = the historic layout):
+        # slots [managed_slots, cache_size) are reserved for rows whose host home is
+        # the RAM pin set, so staging them never evicts a resident expert. The maps
+        # are allocated full length and lru_ensure only ever sees the managed part,
+        # which is what keeps the victim scan inside the cache proper.
+        self.scratch_slots = max(0, int(os.environ.get("FREETOKEN_MOE_SCRATCH", "0")))
+        if self.scratch_slots:
+            assert self.scratch_slots < self.cache_size, (
+                f"FREETOKEN_MOE_SCRATCH={self.scratch_slots} leaves no managed slots "
+                f"(cache_size={self.cache_size})"
+            )
+        self.managed_slots = self.cache_size - self.scratch_slots
+        if self.scratch_slots:
+            # Per-layer scratch staging bookkeeping (see offload_kernels._scratch_stage):
+            # plan arrays mirror evict_slots/src_indices, stage_list/stage_count carry
+            # the layer's previous assignment so the next call can clear it.
+            self._scratch_plan = {
+                "stage_list": torch.zeros((max(self.num_experts, self.cache_size),),
+                                          dtype=torch.int32, device=self.device),
+                "stage_count": torch.zeros((1,), dtype=torch.int64, device=self.device),
+                "src": torch.zeros((max(self.num_experts, self.cache_size),),
+                                   dtype=torch.int32, device=self.device),
+                "dst": torch.zeros((max(self.num_experts, self.cache_size),),
+                                   dtype=torch.int32, device=self.device),
+            }
+            self.num_indices_scratch = torch.zeros((1,), dtype=torch.int64, device=self.device)
+            self._scratch_warned = False
         self.id_of_slot = torch.full(
             (self.cache_size,),
             -1,
@@ -260,6 +287,12 @@ class OffloadMoeCache:
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
         # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
         plan_slots = max(self.num_experts, self.cache_size)
+        if self.scratch_slots and self.scratch_slots < 64:
+            # The staging kernel clamps at the pool size, so a small pool stays
+            # correct (the overflow falls back to normal LRU admission) but stops
+            # being effective; decode routes batch*top_k rows per layer.
+            print(f"[moe-scratch] scratch_slots={self.scratch_slots} is small for "
+                  f"batch*top_k up to {plan_slots}; 64+ recommended", flush=True)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)

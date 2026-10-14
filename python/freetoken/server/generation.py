@@ -482,20 +482,26 @@ def resolve_sampling(
     )
 
 
-def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def render_messages(
+    messages: list[dict[str, Any]], *, hoist_system: bool = True
+) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
     ValueError on a non-text content part (text-only server). Shared by all adapters.
 
     Some chat templates (e.g. Qwen3.6) require the system message at index 0;
     hoist system messages to the front and merge multiples into one to satisfy
-    that constraint."""
+    that constraint. Pass hoist_system=False when the caller already handles
+    inline system placement (the Anthropic adapter decides it per template via
+    inline_system_policy)."""
     rendered = [_render_message(m) for m in messages]
     # OpenAI's developer role is the current spelling of system. Map it here --
     # before the hoist -- because templates that "know" developer still treat it
     # as position-locked system (raise unless index 0), so tokenize.py's
     # template-mention guard would leave mid-list developer messages to 400.
     rendered = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in rendered]
+    if not hoist_system:
+        return rendered
     system_msgs = [m for m in rendered if m.get("role") == "system"]
     if system_msgs and rendered[0].get("role") != "system":
         non_system = [m for m in rendered if m.get("role") != "system"]

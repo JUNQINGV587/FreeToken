@@ -318,7 +318,9 @@ def convert_anthropic_prompt(
         elif req.thinking.get("type") == "disabled":
             ctk = thinking_toggle_kwargs(False)
 
-    return render_messages(messages), template_tools, parser_tools, ctk
+    # Inline system placement is decided downstream (inline_system_policy probes the
+    # template), so do not hoist here: that would rewrite the cached prompt prefix.
+    return render_messages(messages, hoist_system=False), template_tools, parser_tools, ctk
 
 
 def convert_anthropic_to_genspec(

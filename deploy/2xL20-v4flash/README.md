@@ -79,7 +79,7 @@ API server is ready to serve on 0.0.0.0:1925        (140s)
 
 | 配方 | 槽位 | KV | 图后余量 | 单流 | 3 路 | 真 3x24K |
 |---|---|---|---|---|---|---|
-| 部署前(旧) | 1200 | 1048576 / 13.97 GiB | 7.67 GiB | 7.15 | 11.26 | 不达标 |
+| 部署前(旧) | 1200 | 1048576 / 13.97 GiB | 7.67 GiB | 7.15 | 11.26 | 未测 |
 | **本配方** | **2000** | **262144 / 8.50 GiB** | **2.91 GiB** | **8.68** | **17.58**(部署后复测 16.74) | **通过**(187.2s) |
 
 基准工具(在宿主机 `/data/build`, 不在本仓库): `ft-bench3.py`(`/v1/chat/completions`, 256 max tokens, 15-token prompt),
@@ -117,13 +117,23 @@ API server is ready to serve on 0.0.0.0:1925        (140s)
 
 ## 10. 回滚
 
-```bash
-docker stop freetoken-dsv4f
-docker rename freetoken-dsv4f-old-20261014-2318 freetoken-dsv4f
-docker start freetoken-dsv4f
-```
+本配方只改参数, 不产生代码改动, 所以回滚 = 把下面 6 项改回旧值, 然后 `docker rm -f freetoken-dsv4f`
+再跑一遍 §3 的 `docker run`:
 
-存档容器名带日期; 旧启动脚本备份为 `start_ftv4f.sh.bak-<ts>`。
+| 参数 | 本配方 | 回滚到(旧配方) |
+|---|---|---|
+| `--moe-cache-size` | 2000 | 1200 |
+| `--num-tokens` | 262144 | 1048576 |
+| `--memory-ratio` | 0.98 | 0.95 |
+| `--swa-num-pages-override` | 不设 | 435 |
+| `--cuda-graph-max-bs` | 4 | 16 |
+| `--disk-tier-auto-reserve-gb` | 0 | 8 |
+
+更省事的做法: 重建前先把当前实例存档
+(`docker stop freetoken-dsv4f && docker rename freetoken-dsv4f freetoken-dsv4f-old-<ts>`),
+这样回滚就只是一条 `docker rename` 换回来。本仓库不假定存档容器一定存在(它可能被清理),
+所以上表才是权威口径。宿主上的脚本备份 `/data/build/start_ftv4f.sh.bak-<ts>` 只作参考,
+不在仓库里、不保证存在。
 
 ## 11. 验收清单
 

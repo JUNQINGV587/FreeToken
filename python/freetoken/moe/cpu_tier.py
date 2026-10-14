@@ -867,10 +867,14 @@ class CpuTier:
     CPU partials onto the GPU GEMM output of the same layer.
     """
 
-    def __init__(self, cache, disk_tier, threads: int = 0, timeout_ns: int | None = None):
+    def __init__(self, cache, disk_tier, threads: int = 0, timeout_ns: int | None = None,
+                 act_block: int | None = None):
         self._cache = cache
         self._disk = disk_tier
         self._threads = threads
+        # ds_fp4 W4A8 activation round-trip block (the checkpoint's fp8 block: 128 on V4,
+        # 32 on V4.1); the C++ service mirrors CpuMoeExecutor's act_quant grid with it.
+        self._act_block = act_block
         self._timeout_ns = int(
             os.environ.get("FREETOKEN_CT_TIMEOUT_NS", _DEFAULT_TIMEOUT_NS)
             if timeout_ns is None else timeout_ns
@@ -1298,6 +1302,10 @@ class CpuTier:
                 core_ids,
                 -1,  # service_core: unpinned (the worker pool owns the cores)
             )
+            if self._act_block is not None:
+                # Land the tier's FP8 round-trips on the same reference grid as the GPU
+                # executor's act_quant (CpuMoeExecutor.set_act_block, moe/cpu_executor.py).
+                self._service.set_act_block(int(self._act_block))
             self._banks_ref = banks  # keep the pointer tables + bank tensors alive
             self._service.start_protocol()
             self._started = True

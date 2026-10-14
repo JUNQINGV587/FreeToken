@@ -2319,6 +2319,10 @@ class CpuTierService {
   int max_tokens, max_picks;
   int act, apply_on_input;
   int fmt;  // WF_NVFP4 or WF_DSFP4 only
+  // ds_fp4 activation FP8 round-trip block (the checkpoint's fp8 block: 128 on V4, 32 on
+  // V4.1); set via set_act_block so the tier's round-trip lands on the same reference grid
+  // as CpuMoeExecutor's act_quant (moe/cpu_executor.py sets the same value).
+  int act_block = 128;
   float swiglu_alpha, swiglu_limit;
   // Per-layer pointer tables (same _make_table contract as CpuMoeExecutor).
   const uint64_t *gate_up_tbl, *gu_scale_tbl, *gu_global_tbl;
@@ -2493,7 +2497,7 @@ class CpuTierService {
     bf16_t* xb = xq_scratch.data() + static_cast<size_t>(tok) * H;
     for (int h = 0; h < H; ++h) xb[h] = f32_to_bf16(fp16_to_f32(src16[h]));
     const bf16_t* src = xb;
-    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(src, xb, H);
+    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(src, xb, H, act_block);
     deinterleave_bf16_f32(src, xe_scratch.data() + static_cast<size_t>(tok) * (H / 2),
                           xo_scratch.data() + static_cast<size_t>(tok) * (H / 2), H);
   }
@@ -2572,7 +2576,7 @@ class CpuTierService {
   // then deinterleave to fp32 even/odd.
   void do_prt(int64_t p) {
     bf16_t* g = g_scratch.data() + static_cast<size_t>(p) * I;
-    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I);
+    if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I, act_block);
     deinterleave_bf16_f32(g, ge_scratch.data() + static_cast<size_t>(p) * (I / 2),
                           go_scratch.data() + static_cast<size_t>(p) * (I / 2), I);
   }
@@ -2870,6 +2874,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("picks_ptr"), py::arg("hout_ptr"), py::arg("done_ptr"),
            py::arg("core_ids"), py::arg("service_core"))
       .def("start_protocol", &CpuTierService::start_protocol)
+      .def("set_act_block",
+           [](CpuTierService& s, int v) { s.act_block = v; },
+           py::arg("value"))
       .def("run_job_sync", &CpuTierService::run_job_sync, py::arg("layer_id"),
            py::arg("bsz"), py::arg("npk"), py::call_guard<py::gil_scoped_release>())
       .def("host_jobs", &CpuTierService::host_jobs_count)

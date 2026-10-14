@@ -1709,18 +1709,22 @@ class OffloadMoeCache:
             # serve the disk reads from a host thread at replay time.
             self._disk_tier.init_graph_bridge(self, graph_k_max)
 
-    def attach_cpu_tier(self, top_k: int, threads: int = 0):
+    def attach_cpu_tier(self, top_k: int, threads: int = 0, act_block: int | None = None):
         """Enable the RAM-resident miss tier (dsv41 M2; moe/cpu_tier.py).
 
         Decode misses on RAM-pinned bank rows are computed on the CPU from the
         pinned row instead of fetched; the disk tier must be attached FIRST (the
         pin row map is its). Returns the tier for engine lifecycle management
         (shutdown). Off = byte-identical fetch behavior.
+
+        ``act_block``: the checkpoint's fp8 activation block (128 on V4, 32 on
+        V4.1) for the tier's ds_fp4 FP8 round-trip -- pass the same value the
+        decode executor gets, so both land on one reference grid.
         """
         from freetoken.moe.cpu_tier import CpuTier
 
         assert self._disk_tier is not None, "cpu tier needs the disk tier's pin row map"
-        self._cpu_tier = CpuTier(self, self._disk_tier, threads=threads)
+        self._cpu_tier = CpuTier(self, self._disk_tier, threads=threads, act_block=act_block)
         self._cpu_tier.attach(top_k=top_k)
         return self._cpu_tier
 

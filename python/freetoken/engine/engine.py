@@ -1154,7 +1154,11 @@ class Engine:
             # split. Must be attached AFTER the disk tier (pin row map is its) and
             # BEFORE CUDA-graph capture (the split/combine kernels get captured).
             self._cpu_tier = cache.attach_cpu_tier(
-                top_k=max(int(config.model_config.num_experts_per_tok), 1))
+                top_k=max(int(config.model_config.num_experts_per_tok), 1),
+                # ds_fp4 W4A8 round-trip grid: the checkpoint's fp8 block (128 on V4,
+                # 32 on V4.1), the same value the decode executor is built with, so the
+                # tier's CPU partials land on that reference grid.
+                act_block=method.cfg.act_block if method is not None else None)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are

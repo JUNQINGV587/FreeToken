@@ -124,6 +124,7 @@ async def handle_anthropic_messages(
                 getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
             ),
             default_thinking_mode=getattr(state.config, "default_thinking_mode", "auto"),
+            inline_system_policy=getattr(state.config, "anthropic_inline_system", "auto"),
         )
         uid = await submit_generation(spec, state)
     except AdmissionThrottledError as exc:
@@ -175,7 +176,10 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
             400, "invalid_request_error", "messages: no tokenizable content"
         )
     try:
-        n_tokens = await count_prompt_tokens(messages, template_tools, ctk, state)
+        n_tokens = await count_prompt_tokens(
+            messages, template_tools, ctk, state,
+            inline_system_policy=getattr(state.config, "anthropic_inline_system", "auto"),
+        )
     except GenerationError as exc:
         # The chat template could not render this conversation (bad role ordering, an unmatched
         # tool_result, ...) — a client error, exactly as /v1/messages classifies the same failure.
@@ -197,9 +201,8 @@ def convert_anthropic_prompt(
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
-    # Collect all system content (top-level `system` + any system-role messages
-    # Claude Code interleaves in the array) and emit ONE system message at the
-    # front: strict chat templates (e.g. Qwen3.5) require system at the beginning.
+    # Hoisting turn-specific reminders rewrites the cached prompt prefix.
+    # Preserve their position; the tokenizer adapts them to the model's roles.
     system_texts: list[str] = []
     if req.system:
         if isinstance(req.system, str):
@@ -212,7 +215,11 @@ def convert_anthropic_prompt(
     other: list[dict[str, Any]] = []
     for msg in req.messages:
         if msg.role == "system":
-            system_texts.append(_content_text(msg.content))
+            text = _content_text(msg.content)
+            if not other:
+                system_texts.append(text)
+            elif text:
+                other.append({"role": "system", "content": text})
             continue
 
         if isinstance(msg.content, str):
@@ -320,6 +327,7 @@ def convert_anthropic_to_genspec(
     reasoning_parser: str | None = None,
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     default_thinking_mode: str | None = None,
+    inline_system_policy: str = "auto",
 ) -> GenSpec:
     from .openai_api import apply_default_thinking_mode
 
@@ -344,6 +352,7 @@ def convert_anthropic_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=template_tools,
         parser_tools=parser_tools,
+        inline_system_policy=inline_system_policy,
     )
 
 

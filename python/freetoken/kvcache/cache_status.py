@@ -3,13 +3,19 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
+def window_pool_spec(config):
+    from . import resolve_pool_class
+
+    return resolve_pool_class(config.model_config).window_spec(config)
+
+
 def _supports_swa_ratio(config) -> bool:
-    """Whether ``swa_full_tokens_ratio`` sizes a separate window pool for this model -- DSV4 /
-    DSV4.1 (always) or a radix-SWA model (Gemma). Gates the ratio in telemetry and rebuild."""
-    mc = config.model_config
-    if getattr(mc, "dsv4_args", None) is not None or getattr(mc, "dsv41_args", None) is not None:
+    """Whether ``swa_full_tokens_ratio`` sizes a separate window pool for this model -- any pool
+    that declares a ``window_spec`` (DSV4, radix-SWA), or DSV4.1, whose fork pool keeps its window
+    ring in the cost model and so has no spec to probe. Gates the ratio in telemetry and rebuild."""
+    if getattr(config.model_config, "dsv41_args", None) is not None:
         return True
-    return mc.has_swa_attention and config.cache_type == "swa_radix"
+    return window_pool_spec(config) is not None
 
 
 def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
@@ -120,22 +126,18 @@ def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
         return int(_linear_pool_min_slots(config) - 1)
 
     def _swa() -> int:
-        # Report usable tokens, matching num_swa_pages in rebuild requests.
-        # DSV4's physical floor includes a dummy page; the SWA floor already excludes slot 0.
-        from .dsv4_cost_model import _dsv4_window_floor_pages
-        from .dsv41_cost_model import _dsv41_window_floor_pages
-        from .hybrid_swa_pool import _swa_pool_floor
-
+        spec = window_pool_spec(config)
+        if spec is not None:
+            return spec.page_size * spec.min_pages
+        # DSV4.1's fork pool has no window_spec: report usable tokens from its cost model,
+        # matching num_swa_pages in rebuild requests. Its physical floor includes a dummy page.
         mc = config.model_config
-        if getattr(mc, "dsv4_args", None) is not None:
-            P = mc.dsv4_args.window_size
-            return int((_dsv4_window_floor_pages(config, P) - 1) * P)
         if getattr(mc, "dsv41_args", None) is not None:
+            from .dsv41_cost_model import _dsv41_window_floor_pages
+
             P = mc.dsv41_args.window_size
             return int((_dsv41_window_floor_pages(config, P) - 1) * P)
-        if not (mc.has_swa_attention and config.cache_type == "swa_radix"):
-            return 0
-        return int(_swa_pool_floor(config))
+        return 0
 
     for key, fn in (("kv_tokens", _kv), ("moe_experts", _moe), ("mamba_slots", _mamba),
                     ("swa_tokens", _swa)):
@@ -165,19 +167,18 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
             # radix-SWA is token-granular page_size 1) and the concrete current size in that unit
             # (num_swa_pages, usable count). Same source as the scheduler's _current_cache_geometry.
             # Both 0 for models without a window pool. Lets a client denominate the swa control.
-            mc = config.model_config
-            if (
-                getattr(mc, "dsv4_args", None) is not None
-                or getattr(mc, "dsv41_args", None) is not None
-            ):
-                args = mc.dsv4_args if mc.dsv4_args is not None else mc.dsv41_args
-                pools["swa_page_size"] = int(args.window_size or 0)
-                sizes = getattr(engine.kv_cache, "sizes", None)  # usable = physical minus dummy
+            spec = window_pool_spec(config)
+            if spec is not None:
+                pools["swa_page_size"] = spec.page_size
+                pools["num_swa_pages"] = max(0, int(engine.kv_cache.window_pages))
+            elif getattr(config.model_config, "dsv41_args", None) is not None:
+                # The fork's DSV41 pool is not routed through resolve_pool_class, so the generic
+                # probe above sees no window_spec: read its size struct directly
+                # (usable = physical minus dummy page).
+                pools["swa_page_size"] = int(config.model_config.dsv41_args.window_size or 0)
+                sizes = getattr(engine.kv_cache, "sizes", None)
                 if sizes is not None:
                     pools["num_swa_pages"] = max(0, int(sizes.n_win_pages) - 1)
-            elif mc.has_swa_attention and config.cache_type == "swa_radix":
-                pools["swa_page_size"] = 1  # usable = pool tokens minus the slot-0 sentinel
-                pools["num_swa_pages"] = max(0, int(getattr(engine.kv_cache, "swa_num_tokens", 0) or 0) - 1)
         moe = engine.moe_offload_cache
         if moe is not None:
             pools["moe_cache_size"] = int(moe.cache_size or 0)

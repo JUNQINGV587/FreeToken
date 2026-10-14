@@ -420,8 +420,8 @@ class Scheduler(SchedulerIOMixin):
                         row_top_logprobs = []
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                # Overlap can advance device_len ahead of the token delivered to the host
-                # (upstream #546).
+                # Overlap can advance device_len ahead of the token delivered to the host, one
+                # token ahead of this host reply (upstream #546).
                 hit_length = req.input_ids.numel() >= req.max_device_len
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
@@ -983,17 +983,19 @@ class Scheduler(SchedulerIOMixin):
         the CONCRETE current window (usable pages) so a rollback restores it byte-for-byte,
         whether it was pinned or ratio-derived."""
         eng = self.engine
-        config = self.config
-        mc = config.model_config
-        num_swa_pages = None
-        if getattr(mc, "dsv4_args", None) is not None or getattr(mc, "dsv41_args", None) is not None:
-            sizes = getattr(eng.kv_cache, "sizes", None)
-            if sizes is not None:  # usable window pages = physical n_win_pages minus the dummy page
-                num_swa_pages = max(0, sizes.n_win_pages - 1)
-        elif getattr(mc, "has_swa_attention", False) and (
-            getattr(config, "cache_type", None) == "swa_radix"
-        ):  # usable window tokens = pool tokens minus the slot-0 sentinel
-            num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+        from freetoken.kvcache.cache_status import window_pool_spec
+
+        spec = window_pool_spec(self.config)
+        if spec is not None:
+            num_swa_pages = eng.kv_cache.window_pages
+        else:
+            # The fork's DSV41 pool is not routed through resolve_pool_class, so it has no
+            # window_spec. usable window pages = physical n_win_pages minus the dummy page.
+            num_swa_pages = None
+            if getattr(self.config.model_config, "dsv41_args", None) is not None:
+                sizes = getattr(eng.kv_cache, "sizes", None)
+                if sizes is not None:
+                    num_swa_pages = max(0, sizes.n_win_pages - 1)
         return dict(
             num_pages=eng.num_pages,
             moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,

@@ -95,8 +95,8 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
-    presence_penalty: float = Field(default=0.0, allow_inf_nan=False)
-    frequency_penalty: float = Field(default=0.0, allow_inf_nan=False)
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     # Sampled-token logprobs (OpenAI chat semantics): top_logprobs (0..20) requires
     # logprobs=true; entries cover generated tokens only (no prompt logprobs).
     # Fail-closed (400) when a reasoning parser or tool parsing is active: entries
@@ -139,8 +139,8 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
-    presence_penalty: float = Field(default=0.0, allow_inf_nan=False)
-    frequency_penalty: float = Field(default=0.0, allow_inf_nan=False)
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     ignore_eos: bool = False
     logprobs: int | None = None
     echo: bool = False

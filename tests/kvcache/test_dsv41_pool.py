@@ -23,7 +23,7 @@ import torch
 from freetoken.attention import AttnType
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
-from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
 from freetoken.kvcache.dsv41_cost_model import (
     _dsv41_pool_sizes,
     _dsv41_window_floor_pages,
@@ -551,3 +551,9 @@ def test_create_kv_pool_wires_the_radix_flag_from_cache_type():
     # The radix reservation is a superset of the naive one, so the pool's default prefill chunk
     # (half of what is left) can only shrink.
     assert reuse.prefill_chunk_budget <= naive.prefill_chunk_budget
+
+# Merge note: origin/main's variant of this file was not merged. It drives
+# kvcache/dsv4/v41_pool.py with swa_decoder_replay, a field this fork's
+# DeepseekV41Args does not have (TypeError), so it cannot run here. The fork's
+# own dsv41 pool contract above is what this PR protects; re-add upstream's
+# tests together with the args field they need.

@@ -336,7 +336,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         # Same MLA + Hyper-Connections skeleton as V4-Flash, but the routed experts are
         # ModelOpt NVFP4 (packed e2m1 + per-16 E4M3 scales + fp16 row globals) instead of
         # the V4 ds_fp4 dialect, and the compressor ratios are {0,1,2} with SHARED
-        # compressed-KV caches (CSA2) rather than V4's per-layer state.
+        # compressed-KV caches (CSA2) rather than V4's per-layer state. The DSV41 pools are
+        # packed byte rows written by the dsv41 pack kernel, not store_cache.
         name="deepseek-ai/DeepSeek-V4.1-Flash",
         architecture="DeepseekV41ForCausalLM",
         hidden_size=5120,

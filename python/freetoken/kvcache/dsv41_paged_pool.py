@@ -54,7 +54,7 @@ import torch
 from freetoken.utils import init_logger
 
 from .base import BaseKVCachePool
-from .dsv4_paged_pool import CompressStateRing, FreeListAllocator
+from .dsv4.window_tier import CompressStateRing, FreeListAllocator
 from .dsv41_cost_model import (
     DSV41PoolSizes,
     dsv41_cmp_source_of,

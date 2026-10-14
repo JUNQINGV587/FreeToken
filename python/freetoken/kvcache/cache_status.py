@@ -167,15 +167,21 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
             # radix-SWA is token-granular page_size 1) and the concrete current size in that unit
             # (num_swa_pages, usable count). Same source as the scheduler's _current_cache_geometry.
             # Both 0 for models without a window pool. Lets a client denominate the swa control.
-            spec = window_pool_spec(config)
+            try:
+                spec = window_pool_spec(config)
+            except Exception:  # noqa: BLE001 -- a stub config has no pool class to probe
+                spec = None
             if spec is not None:
                 pools["swa_page_size"] = spec.page_size
                 pools["num_swa_pages"] = max(0, int(engine.kv_cache.window_pages))
-            elif getattr(config.model_config, "dsv41_args", None) is not None:
-                # The fork's DSV41 pool is not routed through resolve_pool_class, so the generic
-                # probe above sees no window_spec: read its size struct directly
+            elif (
+                window_args := getattr(config.model_config, "dsv4_args", None)
+                or getattr(config.model_config, "dsv41_args", None)
+            ) is not None:
+                # The fork's DSV4/DSV41 pools are not routed through resolve_pool_class, so the
+                # generic probe above sees no window_spec: read the args + size struct directly
                 # (usable = physical minus dummy page).
-                pools["swa_page_size"] = int(config.model_config.dsv41_args.window_size or 0)
+                pools["swa_page_size"] = int(window_args.window_size or 0)
                 sizes = getattr(engine.kv_cache, "sizes", None)
                 if sizes is not None:
                     pools["num_swa_pages"] = max(0, int(sizes.n_win_pages) - 1)

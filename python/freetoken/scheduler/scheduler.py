@@ -985,14 +985,23 @@ class Scheduler(SchedulerIOMixin):
         eng = self.engine
         from freetoken.kvcache.cache_status import window_pool_spec
 
-        spec = window_pool_spec(self.config)
+        try:
+            spec = window_pool_spec(self.config)
+        except Exception:  # noqa: BLE001 -- a stub config has no pool class to probe
+            spec = None
         if spec is not None:
             num_swa_pages = eng.kv_cache.window_pages
         else:
             # The fork's DSV41 pool is not routed through resolve_pool_class, so it has no
             # window_spec. usable window pages = physical n_win_pages minus the dummy page.
             num_swa_pages = None
-            if getattr(self.config.model_config, "dsv41_args", None) is not None:
+            # No spec to probe: the fork's DSV4/DSV41 pools keep their window ring in the args
+            # plus the live pool sizes, so usable window pages = physical n_win_pages minus the
+            # dummy page (same rule as compute_cache_pools).
+            window_args = getattr(self.config.model_config, "dsv4_args", None) or getattr(
+                self.config.model_config, "dsv41_args", None
+            )
+            if window_args is not None:
                 sizes = getattr(eng.kv_cache, "sizes", None)
                 if sizes is not None:
                     num_swa_pages = max(0, sizes.n_win_pages - 1)

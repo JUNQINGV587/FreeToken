@@ -808,7 +808,9 @@ def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
             "match its config"
         )
 
-    # Split row entries into the two layouts by name.
+    # Split row entries into the two layouts by name. row_entries is the bank entries that
+    # are not per-tensor alphas -- upstream's _split_bank_entries keeps that split internal.
+    row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
     flat_entries: list[dict] = []
     per_layer_groups: dict[str, dict[int, dict]] = {}
     for e in row_entries:
@@ -899,7 +901,9 @@ def load_ftw_banks(
     alpha_specs = {e["name"]: (tuple(e["shape"]), _dtype_of(e["dtype"])) for e in alpha_entries}
     alpha_hb = alloc_banks(alpha_specs)
 
-    # Split row entries into the two layouts by name.
+    # Split row entries into the two layouts by name. row_entries is the bank entries that
+    # are not per-tensor alphas -- upstream's _split_bank_entries keeps that split internal.
+    row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
     flat_entries: list[dict] = []
     per_layer_groups: dict[str, dict[int, dict]] = {}
     for e in row_entries:

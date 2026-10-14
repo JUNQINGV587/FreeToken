@@ -76,6 +76,7 @@ def test_backend_pick_follows_the_served_expert_geometry(tmp_path):
     1.78 MB) benches at 32.2 GB/s -> offload, and hybrid decodes 3x slower than offload there."""
     small = {"hidden": 2048, "inter": 512, "experts": 256, "top_k": 8}
     prof = {
+        "version": PROFILE_VERSION,
         "gpu": {"name": "FAKE GPU"},
         "dtypes": {"nvfp4": "hybrid"},
         "dtype_kernels": {"nvfp4": {

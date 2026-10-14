@@ -104,6 +104,7 @@ def build_expert_banks(
     dummy: bool = False,
     num_experts: int | None = None,
     ram_prefix: int | None = None,
+    resident: bool = False,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -119,6 +120,8 @@ def build_expert_banks(
     only the first ``ram_prefix`` rows are pinned (``PinPipeline(prefix_rows=...)``),
     and the released tail pages are dropped (``release_bank_tails``) once the load
     settles. The rows stay allocated -- they are the tier's fetch destination.
+
+    ``resident`` packs into banks on ``device`` instead of host banks (the resident 'fused' experts).
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, pin_banks
     from freetoken.moe.legacy_format import legacy_format_for
@@ -129,8 +132,13 @@ def build_expert_banks(
     # count, not the layer's (global) routing count. ``num_experts`` overrides it.
     E = method.cfg.num_experts if num_experts is None else num_experts
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
-    hb = alloc_layer_banks(specs, num_layers)
-    banks = {role: [b.tensor for b in hb[role]] for role in specs}
+    if resident:
+        assert layer_sink is None
+        hb = None
+        banks = {role: [torch.empty(shape, dtype=dtype, device=device) for _ in range(num_layers)] for role, (shape, dtype) in specs.items()}
+    else:
+        hb = alloc_layer_banks(specs, num_layers)
+        banks = {role: [b.tensor for b in hb[role]] for role in specs}
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
         for role, spec in layout.items() if spec.resident
@@ -142,7 +150,7 @@ def build_expert_banks(
                 _dummy_fill(role, tensor)
         for alpha in alphas.values():
             alpha.fill_(1.0)
-        if torch.cuda.is_available():
+        if hb is not None and torch.cuda.is_available():
             pin_banks(hb)
         return ExpertBanks(
             legacy_format_for(method.kind, kernel.name), banks,
@@ -184,7 +192,7 @@ def build_expert_banks(
     if layer_sink is not None:
         with _single_threaded_torch_copies():
             _fill(layer_sink)
-    elif torch.cuda.is_available():
+    elif torch.cuda.is_available() and not resident:
         with _single_threaded_torch_copies(), PinPipeline(prefix_rows=ram_prefix) as pins:
             _fill(pins)
     else:
@@ -254,14 +262,16 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
 
 
 def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk,
-                         layer_sink=None, ownership=None, disk_tier=None) -> ExpertBanks:
+                         layer_sink=None, ownership=None, disk_tier=None, resident=False) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces, nvfp4_expert_spec_of
 
     num_layers = model_config.num_moe_layers
     # owner-local EP: the banks hold only this rank's rows
     E = ownership.local_num_experts if ownership is not None else None
     if dummy:
-        return build_expert_banks(method, num_layers, None, device=device, dummy=True, num_experts=E)
+        return build_expert_banks(
+            method, num_layers, None, device=device, dummy=True, num_experts=E, resident=resident
+        )
 
     # Disk tier: v0 speaks the native NVFP4 (triton) bank layout -- the index and
     # the fetch path are written against it. The triton_dsfp4 variant reads the same
@@ -319,7 +329,7 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     )
     banks = build_expert_banks(
         method, num_layers, pieces, device=device, layer_sink=layer_sink,
-        num_experts=E, ram_prefix=ram_prefix,
+        num_experts=E, ram_prefix=ram_prefix, resident=resident,
     )
     if disk_index is not None:
         import dataclasses
@@ -407,6 +417,7 @@ def load_expert_banks(
     layer_residency: list[str] | None = None,
     ownership=None,
     disk_tier=None,
+    resident: bool = False,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -431,9 +442,13 @@ def load_expert_banks(
 
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
-    """
-    from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
+    ``resident`` (with ``method``): the banks land on ``device`` for the resident 'fused' experts; no host bank outlives the load.
+    """
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks, load_ftw_banks_to_device
+
+    if resident:
+        assert method is not None and layer_sink is None and layer_residency is None
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         if ownership is not None:
             # ``load_ftw_banks`` rebuilds ``[num_experts, ...]`` GLOBAL rows and has no
@@ -452,6 +467,14 @@ def load_expert_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency,
         )
+
+        if resident:
+            banks = load_ftw_banks_to_device(model_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
+        else:
+            banks = load_ftw_banks(
+                model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+                layer_residency=layer_residency,
+            )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
             return banks
@@ -489,7 +512,7 @@ def load_expert_banks(
     def _build(par: bool) -> ExpertBanks:
         if method is not None:
             return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk,
-                                        layer_sink, ownership, disk_tier=disk_tier)
+                                        layer_sink, ownership, disk_tier=disk_tier, resident=resident)
         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink, ownership)
 
     with requested_residency(layer_residency) as residency_plan:
@@ -528,3 +551,33 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
             "but saves no pinned quota"
         )
     return banks
+
+
+def attach_resident_banks(layers, banks: ExpertBanks) -> None:
+    """Give each resident MoE layer its rows of the device ``banks``; bank layer ``i`` goes to the layer whose ``layer_id`` is ``i``."""
+    ids = sorted(layer.layer_id for layer in layers if layer.layer_id is not None)
+    num_layers = len(next(iter(banks.sources.values())))
+    if ids != list(range(num_layers)) or len(ids) != len(layers):
+        raise ValueError(f"resident MoE layer ids {ids} do not cover the {num_layers} expert bank layers")
+    for layer in layers:
+        i, e = layer.layer_id, layer.num_experts
+        layout = layer.quant_method.layout()
+        rows = {role: (e, *spec.shape) for role, spec in layout.items() if not spec.resident}
+        if set(banks.sources) != set(rows):
+            raise ValueError(f"expert banks hold {sorted(banks.sources)}, the {layer.quant_method.kernel.name} kernel reads {sorted(rows)}")
+        for role, shape in rows.items():
+            bank = banks.sources[role][i]
+            if tuple(bank.shape) != shape or bank.dtype != layout[role].dtype:
+                raise ValueError(
+                    f"bank {role!r} of layer {i} is {tuple(bank.shape)} {bank.dtype} but the {layer.quant_method.kernel.name} kernel "
+                    f"wants {shape} {layout[role].dtype}; the banks were packed for another kernel or model"
+                )
+        alphas = []
+        # apply() reads view.alphas as (gate_up, down)
+        for role in (role for role in ("gate_up_alpha", "down_alpha") if role in layout):
+            a = getattr(banks, role)
+            if a is None or a.numel() != num_layers * e or a.dtype != layout[role].dtype:
+                raise ValueError(f"the {layer.quant_method.kernel.name} kernel needs {num_layers * e} {layout[role].dtype} {role} values, the expert banks carry {None if a is None else (a.numel(), a.dtype)}")
+            alphas.append(a)
+        layer._expert_banks = {role: per_layer[i] for role, per_layer in banks.sources.items()}
+        layer._expert_alphas = tuple(a[i * e : (i + 1) * e] for a in alphas) or None

@@ -25,12 +25,13 @@ class QuantKind(Enum):
         return self.value
 
 
-FP8_BLOCK = 128
+FP8_BLOCK = 128  # DeepSeek-V3 style square block; V4.1 exports 32x32
 # DeepSeek-V4.1 quantizes fp8 weights (and activations) one scale per 32x32 block
 # ("one fp8 scale per 32x32 weight block / 32 activations", inference/model.py:27).
 FP8_BLOCK32 = 32
 # Every block size the fp8-block path knows how to store and run.
 FP8_BLOCKS = (FP8_BLOCK32, FP8_BLOCK)
+FP8_BLOCK_SIZES = FP8_BLOCKS
 NVFP4_GROUP = 16
 MX_GROUP = 32
 
@@ -86,9 +87,16 @@ def fp8_tensor_scheme(scale: str, *, per_row: bool = False, input_scale: bool = 
 
 
 def fp8_block_scheme(scale: str, block: int = FP8_BLOCK) -> QuantScheme:
+    """Square ``block x block`` e4m3 weight blocks, one scale each; ``block`` is the checkpoint's ``weight_block_size``."""
     if block not in FP8_BLOCKS:
-        raise ValueError(f"fp8 block size must be one of {FP8_BLOCKS}, got {block}")
+        raise NotImplementedError(f"fp8 block size {block} is not supported; one of {FP8_BLOCKS}")
     return QuantScheme(QuantKind.FP8_BLOCK, WeightDesc("e4m3", (block, block), scale), {"weight", "weight_scale_inv"})
+
+
+def fp8_block_size(scheme: QuantScheme) -> int:
+    """The square block edge of an FP8_BLOCK scheme (128 for DeepSeek-V3 style exports, 32 for DeepSeek-V4.1)."""
+    assert scheme.kind is QuantKind.FP8_BLOCK, scheme
+    return scheme.weight.group[0]
 
 
 def mxfp8_scheme() -> QuantScheme:

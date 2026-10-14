@@ -1,5 +1,6 @@
 import os
 from typing import TYPE_CHECKING, Any, Tuple
+from typing import TYPE_CHECKING, Iterator, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -419,15 +420,28 @@ class OffloadMoELayer(MoELayer):
             # No-op inside capture -- with graphs on the replay-time trigger is the
             # graph-doorbell host thread (moe/graph_fetch.py, FT_GRAPH_FETCH_PREFETCH).
             inner._disk_tier.prefetch_from_routing(self.layer_id, topk_ids)
+        tier = inner._cpu_tier
+        if tier is not None and tier.pre_ensure:
+            # B10c: the owner path must run the same ① A+B rescue as the
+            # non-owner branch (FREETOKEN_CT_PRE_ENSURE=1), on the RAW GLOBAL
+            # route BEFORE admission rewrites topk_ids to slot ids. The tier's
+            # tables are all in the local namespace, so the kernel claims
+            # only this rank's owned experts (geometry.global_start filter) --
+            # a remote entry is served by its owner rank, never claimed here.
+            # Claimed experts become pseudo-hits via the slot-0 sentinel, so
+            # ensure_route stages no eviction/fetch for them; combine()
+            # restores the sentinels from ctrl[3]+claimed_ptr.
+            tier.split_pre_owner(self.layer_id, owner, hidden_states,
+                                 topk_weights, topk_ids)
         if owner.graph_safe:
             update = owner.ensure_route_graph(self.layer_id, topk_weights, topk_ids)
         else:
             update = owner.ensure_route(self.layer_id, topk_weights, topk_ids)
-        if inner._cpu_tier is not None:
+        if tier is not None and not tier.pre_ensure:
             # Same three-way classification on the owner-local namespace:
             # update.slot_ids are local slots, the staged plan lives on inner.
-            inner._cpu_tier.split(self.layer_id, inner, hidden_states, update.weights,
-                                  update.slot_ids)
+            tier.split(self.layer_id, inner, hidden_states, update.weights,
+                       update.slot_ids)
         owner.copy_missing()
         if (inner.disk_tier_enabled
                 and os.environ.get("FT_DISK_TIER_VERIFY")
@@ -526,18 +540,21 @@ class OffloadMoELayer(MoELayer):
         The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
         the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
         routing split is device-side elementwise and the CPU submit/sync are host nodes.
-        Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
-        routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
+        Each route is computed exactly once -- CPU-assigned routes reach the GPU as slot -1 with
+        weight 0 (a kernel with ``supports_inactive_slots`` skips them without a read; any other reads
+        slot 0, whose storage is a payload or the bank's zero fill) and the CPU ids are -1 for
+        GPU-assigned routes (the C++ kernel skips id<0).
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+        raw_ids = topk_ids.clone()
+        cache.ensure_experts_hybrid(self.layer_id, topk_ids)
+        on_gpu = topk_ids >= 0
+        cpu_ids = torch.where(on_gpu, -1, raw_ids).contiguous()
+        gpu_w = torch.where(on_gpu, topk_weights, 0.0).contiguous()
+        gpu_slots = topk_ids
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
-        on_gpu = topk_ids >= 0
-
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -547,8 +564,10 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
-        gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
+        if not (self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots):
+            # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
+            # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
+            gpu_slots = gpu_slots.clamp_min(0)
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
@@ -759,6 +778,18 @@ def owner_ep_expert_tp_size(config: Any) -> int | None:
     """
     return 1 if getattr(config, "moe_ep_size", 1) > 1 else None
 
+def iter_moe_layers(model) -> Iterator[MoELayer]:
+    if isinstance(model, MoELayer):
+        yield model
+    if not isinstance(model, BaseOP):
+        return
+    for value in model.__dict__.values():
+        if isinstance(value, BaseOP):
+            yield from iter_moe_layers(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from iter_moe_layers(item)
+
 
 def make_moe_layer(
     config: "ModelConfig",
@@ -808,10 +839,10 @@ def make_moe_layer(
         has_bias=has_bias,
         quant_config=quant_config,
         prefix=prefix,
+        layer_id=layer_id,
     )
     if offload:
         assert layer_id is not None, "offload MoE backends need the layer_id"
-        kwargs["layer_id"] = layer_id
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
     # owner-local EP: whole disjoint experts per rank -> the expert GEMM is not sharded. The rule

@@ -95,6 +95,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
     images: List[bytes] | None = None
+    inline_system_policy: str | None = None
 
 
 @dataclass

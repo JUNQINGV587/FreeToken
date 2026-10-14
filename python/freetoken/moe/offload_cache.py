@@ -47,6 +47,7 @@ _SMALL_BANK_GATHER = os.getenv("FREETOKEN_PREFILL_SMALL_GATHER", "0").strip().lo
     "1", "true", "yes", "on",
 }
 
+from freetoken.kernel.fast_index_copy import default_blocks_per_bank
 from freetoken.utils import init_logger
 
 from . import ownership as _ownership
@@ -369,6 +370,7 @@ class OffloadMoeCache:
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
         # tensor); dst/feat are layer-invariant.
         self._copy_fused_ok = False
+        self._copy_blocks_per_bank = 8
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
@@ -730,6 +732,7 @@ class OffloadMoeCache:
         elif self._gather_bank_ids:
             self._gather_dst_ptrs = self._copy_dst_ptrs[self._gather_bank_ids].contiguous()
             self._gather_feat_bytes = self._copy_feat_bytes[self._gather_bank_ids].contiguous()
+        self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
     def validate_rebuild(self, cache_size: int) -> None:
@@ -1739,18 +1742,22 @@ class OffloadMoeCache:
             # serve the disk reads from a host thread at replay time.
             self._disk_tier.init_graph_bridge(self, graph_k_max)
 
-    def attach_cpu_tier(self, top_k: int, threads: int = 0):
+    def attach_cpu_tier(self, top_k: int, threads: int = 0, act_block: int | None = None):
         """Enable the RAM-resident miss tier (dsv41 M2; moe/cpu_tier.py).
 
         Decode misses on RAM-pinned bank rows are computed on the CPU from the
         pinned row instead of fetched; the disk tier must be attached FIRST (the
         pin row map is its). Returns the tier for engine lifecycle management
         (shutdown). Off = byte-identical fetch behavior.
+
+        ``act_block``: the checkpoint's fp8 activation block (128 on V4, 32 on
+        V4.1) for the tier's ds_fp4 FP8 round-trip -- pass the same value the
+        decode executor gets, so both land on one reference grid.
         """
         from freetoken.moe.cpu_tier import CpuTier
 
         assert self._disk_tier is not None, "cpu tier needs the disk tier's pin row map"
-        self._cpu_tier = CpuTier(self, self._disk_tier, threads=threads)
+        self._cpu_tier = CpuTier(self, self._disk_tier, threads=threads, act_block=act_block)
         self._cpu_tier.attach(top_k=top_k)
         return self._cpu_tier
 
@@ -1819,6 +1826,7 @@ class OffloadMoeCache:
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
+                blocks_per_bank=self._copy_blocks_per_bank,
             )
         else:
             from freetoken.kernel import fast_index_copy_jit
@@ -2426,20 +2434,9 @@ This variant never changes the shape.  Remote entries are remapped to a row that
 
 
 def iter_offload_moe_layers(model) -> Iterator:
-    from freetoken.layers import BaseOP, OffloadMoELayer
+    from freetoken.layers import OffloadMoELayer, iter_moe_layers
 
-    if isinstance(model, OffloadMoELayer):
-        yield model
-
-    if not isinstance(model, BaseOP):
-        return
-
-    for value in model.__dict__.values():
-        if isinstance(value, BaseOP):
-            yield from iter_offload_moe_layers(value)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                yield from iter_offload_moe_layers(item)
+    return (layer for layer in iter_moe_layers(model) if isinstance(layer, OffloadMoELayer))
 
 
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:

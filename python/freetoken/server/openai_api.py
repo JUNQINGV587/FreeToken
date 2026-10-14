@@ -151,6 +151,8 @@ def chat_request_to_genspec(
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=sampling_params,
+        # upstream's presence/frequency penalties ride the hoisted resolve_sampling call above,
+        # which this fork lifted out of the GenSpec literal to attach sampled-token logprobs.
         structured_output_schema=parse_response_format(req.response_format),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),

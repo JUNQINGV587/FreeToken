@@ -34,7 +34,7 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
     if specs_fn is None:
         if getattr(model_config, "dsv4_args", None) is not None:
-            from .dsv4_paged_pool import DSV4PagedKVCache
+            from .dsv4.v4_pool import DSV4PagedKVCache
 
             return DSV4PagedKVCache
         if getattr(model_config, "dsv41_args", None) is not None:
@@ -47,10 +47,13 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
     if AttnType.DSV4 in types:
-        from .dsv4_paged_pool import DSV4PagedKVCache
+        from .dsv4.v4_pool import DSV4PagedKVCache
 
         return DSV4PagedKVCache
     if AttnType.DSV41 in types:
+        # Keep the fork's V4.1 pool: the merged models/deepseek_v41 + attention/dsv41_sparse
+        # drive its API (cmp_source_of / translate_full_to_window). Upstream's same-named
+        # dsv4/v41_pool.py is a separate implementation with a different surface.
         from .dsv41_paged_pool import DSV41PagedKVCache
 
         return DSV41PagedKVCache
@@ -88,10 +91,12 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
-    from .dsv4_cost_model import _dsv4_pool_sizes
+    # Upstream moved the DSV4 modules into the dsv4/ subpackage; the fork's V4.1 modules stay
+    # top-level, so this keeps one import of each family.
+    from .dsv4.v4_cost_model import _dsv4_pool_sizes
     from .dsv41_cost_model import _dsv41_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
-    from .dsv4_paged_pool import DSV4PagedKVCache
+    from .dsv4.v4_pool import DSV4PagedKVCache
     from .dsv41_paged_pool import DSV41PagedKVCache
 
     model_config = config.model_config
@@ -106,6 +111,23 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             device=device,
             dtype=dtype,
             P=model_config.dsv4_args.window_size,
+            n_scratch=config.max_running_req + 1,
+        )
+        pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        return pool
+    if getattr(model_config, "dsv41_args", None) is not None:
+        from .dsv41_cost_model import _dsv41_pool_sizes
+        from .dsv41_paged_pool import DSV41PagedKVCache
+
+        # Same route as DSV4: the generic CacheManager over the shared page table; the pool is the
+        # swa_pool plug-in (window tier + per-source packed main / index pools + state rings), and
+        # the compressed / indexer / state tiers belong to a band's KV source (shared by identity).
+        pool = DSV41PagedKVCache(
+            sizes=_dsv41_pool_sizes(config, num_pages + 1),  # +1 for dummy page
+            args=model_config.dsv41_args,
+            device=device,
+            dtype=dtype,
+            P=model_config.dsv41_args.window_size,
             n_scratch=config.max_running_req + 1,
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")

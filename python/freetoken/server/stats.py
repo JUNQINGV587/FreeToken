@@ -199,11 +199,12 @@ def _resolved_page_size(state: Any, config: Any) -> int:
 def _swa_page_size(config: Any) -> int:
     """The window pool's own page unit: P (window_size) for DSV4 / DSV4.1, 1 token for radix-SWA.
     Mirrors compute_cache_pools' swa_page_size."""
-    mc = getattr(config, "model_config", None)
-    args = getattr(mc, "dsv4_args", None) or getattr(mc, "dsv41_args", None)
-    if args is not None:
-        return int(getattr(args, "window_size", 0) or 1)
-    return 1
+    # window_pool_spec dispatches through the pool family, so DSV4 / DSV4.1 (P-token pages)
+    # and radix-SWA (token-granular, page_size 1) each report their own unit.
+    from freetoken.kvcache.cache_status import window_pool_spec
+
+    spec = window_pool_spec(config)
+    return spec.page_size if spec is not None else 1
 
 
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
@@ -216,6 +217,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     config = state.config
     ready_at = getattr(state, "ready_at", None)
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
+    pools = getattr(state, "cache_pools", None) or {}
     kv = (
         {"used_pages": tr.kv_used_pages, "total_pages": tr.kv_total_pages,
          "page_size": _resolved_page_size(state, config)}

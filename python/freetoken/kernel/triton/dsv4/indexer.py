@@ -23,6 +23,15 @@ import torch
 import triton
 import triton.language as tl
 
+# The indexer pool holds either bf16 rows (the reference cache's own round-trip) or the same
+# values fp4-packed; ``load_rows`` dequantizes both, rounded through bf16 exactly as the
+# reference cache was.
+from freetoken.kernel.triton.dsv41.row_format import (
+    FMT_BF16,
+    FMT_FP4_E8M0_B32,
+    load_rows,
+)
+
 
 @triton.jit
 def _indexer_logits_kernel(
@@ -121,11 +130,12 @@ def _indexer_decode_logits_kernel(
     N_STAGE, RATIO,
     stride_qb, stride_qh, stride_qd,
     stride_wb, stride_wh,
-    stride_pr, stride_pd,
     stride_sb, stride_sw,
     stride_ob, stride_ot,
     H: tl.constexpr,
     D: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    FMT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
@@ -161,8 +171,9 @@ def _indexer_decode_logits_kernel(
                    mask=t_mask, other=0)
     rows = tl.maximum(snap, 0) // RATIO
 
-    k = tl.load(pool_ptr + rows[:, None] * stride_pr + offs_d[None, :] * stride_pd,
-                mask=t_mask[:, None], other=0.0)
+    # Rows are either bf16 or the same values fp4-packed; ``load_rows`` dequantizes both and
+    # rounds through bf16 -- what the reference cache actually held.
+    k = load_rows(pool_ptr, rows, t_mask, offs_d, D, ROW_BYTES, FMT).to(tl.bfloat16)
     q = tl.load(q_ptr + pid_b * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd,
                 mask=h_mask[:, None], other=0.0)
     w = tl.load(w_ptr + pid_b * stride_wb + offs_h * stride_wh, mask=h_mask, other=0.0).to(tl.float32)
@@ -199,24 +210,42 @@ def indexer_decode_logits(
     """
     B, H, D = q.shape
     assert weights.shape == (B, H), (weights.shape, (B, H))
-    assert idx_pool.shape[1] == D, (idx_pool.shape, D)
+    assert idx_pool.dim() == 2 and idx_pool.is_contiguous(), idx_pool.shape
     assert D == triton.next_power_of_2(D), f"index_head_dim must be pow2, got {D}"
 
+    if idx_pool.element_size() == 1:
+        # fp4-packed rows: [e2m1 nibbles | ue8m0 scales], and the row stride is in bytes.
+        fmt, row_bytes = FMT_FP4_E8M0_B32, idx_pool.stride(0)
+        assert row_bytes == D // 2 + D // 32, (row_bytes, D)
+        pool_u8 = idx_pool
+    else:
+        # bf16 rows: the reference cache's own layout, one row per block.
+        assert idx_pool.element_size() == 2 and idx_pool.shape[1] == D, (idx_pool.shape, D)
+        # load_rows walks byte offsets from the pool base, so the bf16 slab goes in as uint8
+        # rows -- the same tensor, one row still ROW_BYTES wide. Passing the bf16 tensor
+        # itself would make its pointer arithmetic count 2-byte elements and gather the wrong
+        # rows (this is what the v41 callers do with their uint8 pools).
+        pool_u8 = idx_pool.view(torch.uint8)
+        fmt, row_bytes = FMT_BF16, pool_u8.stride(0)
+    assert pool_u8.dtype == torch.uint8
+
     if out is None:
-        out = torch.empty((B, n_stage), dtype=idx_pool.dtype, device=q.device)
+        # bf16, exactly what the bf16 pool allocated before the packed layout landed: the top-k
+        # downstream only ranks scores, so this is not a precision change.
+        out = torch.empty((B, n_stage), dtype=torch.bfloat16, device=q.device)
     if n_stage == 0:
         return out
 
     BLOCK_T = 64
     _indexer_decode_logits_kernel[(B, triton.cdiv(n_stage, BLOCK_T))](
-        q, weights, idx_pool, full_snap, valid, out,
+        q, weights, pool_u8, full_snap, valid, out,
         n_stage, ratio,
         q.stride(0), q.stride(1), q.stride(2),
         weights.stride(0), weights.stride(1),
-        idx_pool.stride(0), idx_pool.stride(1),
         full_snap.stride(0), full_snap.stride(1),
         out.stride(0), out.stride(1),
         H=H, D=D,
+        ROW_BYTES=row_bytes, FMT=fmt,
         BLOCK_H=triton.next_power_of_2(H), BLOCK_T=BLOCK_T,
         num_warps=4, num_stages=2,
     )

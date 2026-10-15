@@ -4,13 +4,17 @@ Four buffer families, sized from a budget (the cost model) not ``num_requests``:
 
 * ``window_pool[L]``  -- all layers; the 128-sliding KV ring, page-granular.
 * ``cmp_pool[L]``     -- ratio>0 layers; compressed KV, per-block.
-* ``idx_pool[L]``     -- ratio==4 layers; Lightning-Indexer compressed keys.
+* ``idx_pool[L]``     -- ratio==4 layers; Lightning-Indexer compressed keys, fp4-packed rows.
 * ``state_ring[L]``   -- ratio>0 layers; the per-window-page compress-state ring
   (fp32, ``kv|score`` split), with index ``-1`` a permanent scratch slot.
 
-The KV/compressed/indexer pools are bf16 (the fp8/fp4 quant is an in-place round-trip already
-baked into the bf16 value, so ``index_select`` staging is byte-exact); only the compress-state
-ring is fp32.
+The window/compressed pools are bf16 (the fp8/fp4 quant is an in-place round-trip already baked
+into the bf16 value, so ``index_select`` staging is byte-exact). The indexer pool instead stores
+that same round-trip PACKED -- ``[e2m1 nibbles | ue8m0 scales]`` rows, per ``v41_row_format`` --
+which is still bit-exact (bf16 represents ``code * 2**e`` exactly, and the writer's own scale is
+re-derived: a stored row's amax always lands on the top e2m1 code) and ~3.8x smaller at
+``index_head_dim`` 128. ``store_indexer`` packs; ``read_indexer_keys`` and the fused decode
+kernel unpack. Only the compress-state ring is fp32.
 
 ``state_loc`` is DERIVED from a window slot, never stored:
     state_loc = where(ws < 0, -1, (ws // P) * ring_size + ws % ring_size)
@@ -29,6 +33,9 @@ from .v4_cost_model import (
     dsv4_window_unit_bytes,
     ring_size_for_ratio,
 )
+# The one packed row format this pool writes for the indexer tier; the descriptor is shared with
+# the kernels that read those rows (``kernel/triton/dsv41``).
+from .v41_row_format import FP4_E8M0_B32 as _IDX_FMT
 # The window-tier building blocks and the pool base live in window_tier.py (shared with the DSV41
 # pool); the first two are re-exported here for the DSV4 callers and tests that import them from
 # this module.
@@ -130,9 +137,9 @@ class DSV4PagedKVCache(WindowTierPagedPool):
                 self.idx_pool.append(
                     torch.zeros(
                         sizes.idx_blocks[L] + self.n_scratch,
-                        self.index_head_dim,
+                        _IDX_FMT.row_bytes(self.index_head_dim),
                         device=device,
-                        dtype=dtype,
+                        dtype=torch.uint8,
                     )
                 )
                 # Indexer compressor ring: index_head_dim, overlap, ring_size=8.
@@ -320,9 +327,24 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         pool.index_copy_(0, cmp_slot, kv.to(self._dtype))
 
     def store_indexer(self, k: torch.Tensor, layer_id: int, idx_slot: torch.Tensor) -> None:
+        """Quantize + pack this layer's indexer keys into the fp4 row pool.
+
+        ``k`` is already the ``fp4_act_quant`` round-trip the reference cache would hold, so
+        packing is bit-exact: bf16 represents ``code * 2**e`` exactly.
+        """
         pool = self.idx_pool[layer_id]
         assert pool is not None, f"layer {layer_id} has no indexer pool (only ratio-4)"
-        pool.index_copy_(0, idx_slot, k.to(self._dtype))
+        from freetoken.kernel.triton.dsv41.pack import pack_rows
+
+        pack_rows(k, _IDX_FMT, pool=pool, row_ids=idx_slot)
+
+    def read_indexer_keys(self, layer_id: int, rows: torch.Tensor) -> torch.Tensor:
+        """Gather + dequantize ``[M, index_head_dim]`` bf16 indexer keys (prefill/extend)."""
+        pool = self.idx_pool[layer_id]
+        assert pool is not None, f"layer {layer_id} has no indexer pool (only ratio-4)"
+        from freetoken.kernel.triton.dsv41.pack import unpack_rows
+
+        return unpack_rows(pool, _IDX_FMT, self.index_head_dim, rows)
 
     def total_bytes(self) -> int:
         n = self.full_to_window.numel() * self.full_to_window.element_size()

@@ -67,6 +67,11 @@ class CompressorBackendMixin:
     def scatter_compressed(
         self, layer_id: int, tier: str, rows: torch.Tensor, kv: torch.Tensor
     ) -> None:
+        if tier == "idx":
+            # The indexer tier stores fp4 rows there, so route the write through the pool's
+            # packer (bf16 is what the reference cache would hold, not what this pool holds).
+            self.pool.store_indexer(kv, layer_id, rows)
+            return
         pool = self.compress_pool(layer_id, tier)
         pool.index_copy_(0, rows, kv.to(pool.dtype))
 

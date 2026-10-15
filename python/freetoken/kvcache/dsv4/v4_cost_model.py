@@ -12,7 +12,7 @@ Two pure (device-free) functions:
 
 Byte conventions:
   kv bytes    = head_dim       * 2  (bf16)
-  index bytes = index_head_dim * 2  (bf16)
+  index bytes = indexer fp4 row = index_head_dim // 2 + index_head_dim // 32
   state bytes = 2*(1+overlap)*head_dim * 4  (fp32);  overlap = (ratio == 4)
   ring_size   = 8 (ratio 4) / 128 (ratio 128)
 """
@@ -50,7 +50,12 @@ def _kv_bytes(args) -> int:
 
 
 def _index_bytes(args) -> int:
-    return args.index_head_dim * _BF16_BYTES
+    # The indexer pool holds the same fp4 round-trip the reference cache carries, packed as
+    # ``[e2m1 nibbles | ue8m0 scales]`` rows instead of bf16 (see ``v4_pool`` /
+    # ``v41_row_format``); bf16 could represent those values exactly, so this is pure capacity.
+    from .v41_row_format import FP4_E8M0_B32
+
+    return FP4_E8M0_B32.row_bytes(args.index_head_dim)
 
 
 def _state_bytes(args, ratio: int) -> int:

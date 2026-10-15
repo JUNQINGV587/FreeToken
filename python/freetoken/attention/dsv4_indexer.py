@@ -23,15 +23,14 @@ class IndexerBackendMixin:
         """Blocks ``[0, n_blocks)`` of this request's indexer keys as a dense
         ``[bsz, n_blocks, index_head_dim]`` slab, in ascending block order.
 
-        Byte-exact ``index_select`` of the bf16 pool: block ``b`` lives at the arithmetic row
-        ``full_loc(b * ratio) // ratio``, read off the request's LIVE full locs (prefill/extend
-        only -- decode reads the snapshot inside the fused kernel instead).
+        The pool gathers block ``b`` at the arithmetic row ``full_loc(b * ratio) // ratio``
+        (read off the request's LIVE full locs -- prefill/extend only: decode reads the snapshot
+        inside the fused kernel instead) and unpacks its fp4 row; the dequantized value is the
+        bf16 the reference cache would have carried, so the slab is what this kernel always saw.
         """
         block_starts = torch.arange(0, n_blocks * ratio, ratio, device=self.device)
         rows = self.compress_rows_of(ti, block_starts, ratio)
-        return self.compress_pool(layer_id, "idx").index_select(0, rows).unsqueeze(0).expand(
-            bsz, -1, -1
-        )
+        return self.pool.read_indexer_keys(layer_id, rows).unsqueeze(0).expand(bsz, -1, -1)
 
     def indexer_prefill_logits(
         self, q: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor

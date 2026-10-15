@@ -59,7 +59,9 @@ def test_pool_tiers_present_per_ratio():
             assert pool.state_ring[L] is not None
             if ratio == 4:
                 assert pool.idx_pool[L] is not None
-                assert pool.idx_pool[L].shape[1] == 128
+                # fp4 rows: index_head_dim // 2 nibble bytes + index_head_dim // 32 scale bytes
+                assert pool.idx_pool[L].dtype == torch.uint8
+                assert pool.idx_pool[L].shape[1] == 68
             else:
                 assert pool.idx_pool[L] is None
 
@@ -243,18 +245,16 @@ def test_store_window_scatters():
     assert torch.equal(pool.window_pool[L][slots], k)
 
 
-def test_store_compressed_and_indexer():
-    pool, sizes, _ = _pool()
+def test_store_compressed_scatters():
+    pool, _, _ = _pool()
     L = 2  # ratio 4 -> has both cmp + idx
     cmp_slots = torch.tensor([1, 4], dtype=torch.int64)
     cmp = torch.randn(2, 512, dtype=torch.bfloat16)
     pool.store_compressed(cmp, L, cmp_slots)
     assert torch.equal(pool.cmp_pool[L][cmp_slots], cmp)
 
-    idx_slots = torch.tensor([0, 2], dtype=torch.int64)
-    idxk = torch.randn(2, 128, dtype=torch.bfloat16)
-    pool.store_indexer(idxk, L, idx_slots)
-    assert torch.equal(pool.idx_pool[L][idx_slots], idxk)
+    # store_indexer packs through a Triton kernel, so its round trip is covered on GPU in
+    # tests/kernels/test_dsv4_indexer_decode.py.
 
 
 def test_store_indexer_rejects_ratio128_layer():

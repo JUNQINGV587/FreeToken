@@ -123,3 +123,36 @@ def test_cuda_graph_follows_valid(pool):
         mask = torch.isfinite(ref)
         if mask.any():
             torch.testing.assert_close(got[mask], ref[mask], **TOL)
+
+
+@pytest.fixture(scope="module")
+def packed_pool(pool):
+    """The same rows the bf16 pool holds, re-encoded as fp4_e8m0_b32 packed rows.
+
+    A writer quantizes before storing, so ``pool`` already holds the fp4 round trip; packing
+    those exact values is what ``store_indexer`` does on the real path.
+    """
+    from freetoken.kernel.triton.dsv41.pack import pack_rows, quant_roundtrip
+    from freetoken.kvcache.dsv4.v41_row_format import FP4_E8M0_B32
+
+    rows = quant_roundtrip(pool, FP4_E8M0_B32)
+    out = torch.zeros(pool.shape[0], FP4_E8M0_B32.row_bytes(D), dtype=torch.uint8, device="cuda")
+    pack_rows(rows, FP4_E8M0_B32, pool=out, row_ids=torch.arange(pool.shape[0], device="cuda"))
+    return rows, out
+
+
+def test_packed_rows_match_the_bf16_pool(pool, packed_pool):
+    """A packed indexer pool must score exactly like the bf16 slab it replaces."""
+    rows, packed = packed_pool
+    q, w, snap, valid = _build([700, -1, 900], 2048, seed=1)
+    got = indexer_decode_logits(q, w, packed, snap, valid, 2048, RATIO)
+    want = indexer_decode_logits(q, w, rows, snap, valid, 2048, RATIO)
+    assert torch.equal(got, want)
+    assert torch.isinf(got[1]).all(), "the -1 row stays fully masked"
+
+
+def test_packed_row_layout(packed_pool):
+    _, packed = packed_pool
+    assert packed.dtype == torch.uint8
+    assert packed.shape[1] == D // 2 + D // 32
+    assert packed.stride(0) == packed.shape[1]

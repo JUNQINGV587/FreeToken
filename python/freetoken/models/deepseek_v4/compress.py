@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from freetoken.attention.indexer_memory import plan_query_block
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.compress import gated_pool
@@ -415,12 +416,9 @@ class Indexer(BaseOP):
         fp4_act_quant_inplace(q, 32)
         self.compressor.forward(x, start_pos, window_slots, ti=ti)  # scatters indexer keys to idx_pool
         weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        keys = self.attn.indexer_keys(ti, end_pos // ratio, ratio, self.layer_id, bsz)
-        scores = self.attn.indexer_prefill_logits(q, keys, weights)
-        return self.attn.indexer_select_prefill(
-            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
-            topk=self.index_topk, offset=offset,
-        )
+        n_blocks = end_pos // ratio
+        keys = self.attn.indexer_keys(ti, n_blocks, ratio, self.layer_id, bsz)
+        return self._select_prefill(q, keys, weights, start_pos, seqlen, ratio, offset)
 
     def extend(self, x, qr, start_pos, offset, window_slots, tail_window_slot, ti: int = 0):
         """Carry-aware indexer for re-prefill new tokens [start_pos, end). Runs the indexer's
@@ -436,12 +434,37 @@ class Indexer(BaseOP):
         fp4_act_quant_inplace(q, 32)
         self.compressor.forward(x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti)  # writes idx_pool
         weights = self.weights_proj.forward(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
-        scores = self.attn.indexer_prefill_logits(q, keys, weights)
-        return self.attn.indexer_select_prefill(
-            scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
-            topk=self.index_topk, offset=offset,
-        )
+        n_blocks = end // ratio
+        keys = self.attn.indexer_keys(ti, n_blocks, ratio, self.layer_id, bsz)
+        return self._select_prefill(q, keys, weights, start_pos, seqlen, ratio, offset)
+
+    @torch.no_grad()
+    def _select_prefill(self, q, keys, weights, start_pos, seqlen, ratio, offset):
+        """Top-k compressed blocks for a prefill/extend range, scored in query sub-blocks.
+
+        ``q``/``weights`` are [1, seqlen, ...] and ``keys`` the compressed block keys of the whole
+        range. Returns int64 ``[1, seqlen, topk]`` block indices ("-1" unreachable), exactly what
+        the single-shot call returned. Every intermediate is O(rows x n_blocks) while n_blocks
+        tracks the CONTEXT and rows track the CHUNK, so one call at a long context wants tens of
+        GiB; the query sub-blocks bound that, and the MoE half of the pass still covers the whole
+        chunk, so the disk tier keeps its one expert fetch per chunk.
+        """
+        block = plan_query_block(seqlen, keys.size(1)) or seqlen
+        if block >= seqlen:
+            scores = self.attn.indexer_prefill_logits(q, keys, weights)
+            return self.attn.indexer_select_prefill(
+                scores, start_pos=start_pos, seqlen=seqlen, ratio=ratio,
+                topk=self.index_topk, offset=offset,
+            )
+        parts = [
+            self.attn.indexer_select_prefill(
+                self.attn.indexer_prefill_logits(q[:, s0:s1], keys, weights[:, s0:s1]),
+                start_pos=start_pos + s0, seqlen=s1 - s0, ratio=ratio,
+                topk=self.index_topk, offset=offset,
+            )
+            for s0, s1 in ((s0, min(s0 + block, seqlen)) for s0 in range(0, seqlen, block))
+        ]
+        return torch.cat(parts, dim=1)
 
     def decode_step(
         self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,

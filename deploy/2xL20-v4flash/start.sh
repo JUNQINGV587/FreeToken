@@ -21,10 +21,10 @@ ft serve \
   --expert-ram-experts 176 \
   --moe-ram-pin-file /data/research/runs/20261008-v4flash-firstboot/pin_set_v4f_p176.json \
   --disk-tier-auto-reserve-gb 0 \
-  --moe-cache-size 2000 \
+  --moe-cache-size 2500 \
   --memory-ratio 0.98 \
   --moe-cpu-tier \
-  --num-tokens 262144 \
+  --num-tokens 98304 \
   --max-seq-len-override 1048576 \
   --max-output-tokens 131072 \
   --prefill-chunk-tokens 4096 \

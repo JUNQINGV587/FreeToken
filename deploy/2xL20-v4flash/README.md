@@ -113,6 +113,19 @@ API server is ready to serve on 0.0.0.0:1925                                    
   每层活跃 3.078 行, 即每 token 约 6.75 行(91 MiB)要过 PCIe, 这就是 46-62 ms 的主要成分。
 - `--moe-cache-policy` 保持 LRU: 同一 trace 离线回放, LFU 的拷贝量是 LRU 的 4.4 倍。
 
+长上下文下的实测(单流、递进请求, 后一档命中前一档前缀, 所以 TTFT 只含增量 prefill):
+
+| 请求 prompt_tokens | TTFT | 尾 64 稳态 |
+|---|---|---|
+| 31492(冷) | 154.2 s | 13.05 tok/s = 76.7 ms/token |
+| 47356 | 78.2 s | 27.50 tok/s = 36.4 ms/token |
+| 63244 | 78.4 s | 34.43 tok/s = 29.0 ms/token |
+
+读法: prefill 约 200 tok/s(两次 15.9K tokens 的增量各花 78 s, 三档一致);
+**decode 不随上下文变慢**——29-77 ms 的差别来自槽位被前一轮捂热没有, 不是上下文长度
+(短上下文热态是 46 ms)。表里 prompt_tokens 按服务端 usage 回读, 比目标值大
+(造 prompt 的脚本按 2.15 字符/token 估, 中文实际约 1.64)。
+
 基准工具(在宿主机 `/data/build`, 不在本仓库): `ft-bench-single.py`(单流分段),
 `ft-bench3.py`(1/3/8 路 chat), `ft-longctx.py`(`FT_CTX=52000` 字符 = 24165 tokens, `FT_N=3`)。
 跨工具/跨端点的数字不可直接比较。
@@ -126,17 +139,26 @@ API server is ready to serve on 0.0.0.0:1925                                    
   所以"再加槽位"只能从 KV 池里拿, 这就是为什么本配方把 KV 压到 98304。
 - **8 路并发未定论**: 同一配方不同轮次拿过 23.73 与 37.52, 2302 槽 + 72K KV 又拿过 42.23。
   本配方 8 路实测 16.07-16.90, 可能不如旧配方; 本条只作记录, 不作为选型依据。
+- **decode 不随上下文长度变慢**: 31K/47K/63K prompt 的尾段稳态是 76.7/36.4/29.0 ms(§6),
+  差别来自槽位冷热而非上下文。随上下文涨的是 **prefill(约 200 tok/s)** 和对显存余量的要求(§8)。
 
-## 8. 余量是硬门槛(两个失败样本)
+## 8. 余量是硬门槛(三个失败样本)
 
 - **0.14 GiB**: 起服正常, 第一个请求即
   `torch.OutOfMemoryError: Tried to allocate 704.00 MiB. GPU 1 has a total capacity of 47.45 GiB of which 102.88 MiB is free.`,
   随后 `Backend supervisor: backend worker freetoken-TP1-scheduler exited`。
 - **1.07 GiB**: 短基准(1/3/8 路)全部正常, 真 3x24K prefill 时容器死亡。
-- **1.63 GiB(本配方)**: 真 3x24K 探针通过(202.2s)。
+- **1.63 GiB + 单个 72K prompt**: 起服与短请求都正常, 单请求 72K tokens 的 prompt 在 prefill 阶段
+  `torch.OutOfMemoryError: Tried to allocate 264.00 MiB. GPU 0 ... 160.88 MiB is free`
+  (位置 `attention/dsv4_indexer.py:72 indexer_select_prefill`), 随后
+  `Backend worker is gone and cannot be restarted`。同样的 72K 拆成 3x24K 并发则通过。
+- **1.63 GiB(本配方)**: 真 3x24K 探针通过(202.2s); 单请求 63244 tokens 通过。
 - **2.91 GiB(上一版)**: 探针运行中一度降到 2.09 GiB, 通过。
 
 推论: 短请求只需 >0.2 GiB; 长 prefill 需要 1.6 GiB 以上。余量不足不会在短对话里暴露。
+**单请求 prompt 长度另有一条上限**: 63244 tokens 通过、约 72K OOM——indexer 的 top-k 临时张量
+按单序列长度涨, `--prefill-chunk-tokens` 切不动它。所以池子标称的 98304 在单请求下用不到,
+**单请求 prompt 建议不超过约 64K**; 需要更长的单序列, 得先把余量让出来(减槽位)。
 
 ## 9. 已知 CLI 与流程陷阱(期间踩过)
 

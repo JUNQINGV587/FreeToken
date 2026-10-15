@@ -1,9 +1,10 @@
 # DeepSeek-V4-Flash-0731-NVFP4 on 2x L20: 起服配方
 
-一句话: 这套参数在 2x L20 48GB + 125 GiB RAM 上把**单流稳态做到 46.1 ms/token (21.7 tok/s)**,
-同时 **3 路并发 20.64 tok/s**, 并通过**真 3x24K tokens 长上下文**(3 路全部成功, 202.2s, 每路 24165 prompt tokens)。
+一句话: 这套参数在 2x L20 48GB + 125 GiB RAM 上把**单流稳态做到 48.8 ms/token (20.4 tok/s)**,
+**3 路并发 21.29 tok/s**, 并通过**真 3x24K tokens 长上下文**(3 路全部成功, 183.2s, 每路 24165 prompt tokens);
+多让出 100 槽/卡把**单请求 prompt 顶到 KV 池上限**(实测 94612 tokens 通过, 2500 槽版只能到约 64K)。
 
-定稿: 2026-10-15(单流版)。上一版(2026-10-14)是为 3 路调的, 两者对照与回滚见 §10。
+定稿: 2026-10-15(2400 槽版)。同日更早的 2500 槽版单流更快(46.1 ms)但单请求上限低, 两者对照与回滚见 §10。
 本目录 `start.sh` 是容器内命令, 宿主侧 `docker run` 见 §3。
 
 ## 1. 硬件与权重
@@ -57,7 +58,7 @@ docker run -d --name freetoken-dsv4f --restart unless-stopped \
 | `--moe-disk-tier` | `on` | 尾部按需从盘取; 与 hybrid 互斥(见 §9) |
 | `--expert-ram-experts` | 176 | 宿主内存 pin 预算(host-wide, 按 rank 均分 = [88,88]/rank) |
 | `--moe-ram-pin-file` | `pin_set_v4f_p176.json` | pin 集合; pin 失败是硬启动失败, 无自动回退 |
-| `--moe-cache-size` | **2500** | VRAM 槽位数(1 槽 = 1 行专家 = 13.5 MiB); **单流与 3 路都随它近似线性变快**, 见 §7 |
+| `--moe-cache-size` | **2400** | VRAM 槽位数(1 槽 = 1 行专家 = 13.5 MiB); **单流与 3 路都随它近似线性变快**。比 2500 少 100 槽 = 每卡多让 1.33 GiB 余量, 换来单请求到池上限(§7/§8) |
 | `--memory-ratio` | 0.98 | 显存预算系数 |
 | `--num-tokens` | **98304** | **硬钉 KV 容量**。KV 池大小对单流与 3 路吞吐都无影响(§7), 所以把它压到刚好覆盖 3x24K 探针的量, 把显存让给槽位 |
 | `--max-seq-len-override` | 1048576 | 单请求上下文上限, 与 KV 池容量无关 |
@@ -76,15 +77,15 @@ docker run -d --name freetoken-dsv4f --restart unless-stopped \
 ## 5. 实测几何(起服日志原文)
 
 ```
-owner EP prefill overlap enabled: slots [0, 256) of 2500 are borrowed as the 2-layer prefill buffer ring
+owner EP prefill overlap enabled: slots [0, 256) of 2400 are borrowed as the 2-layer prefill buffer ring
 disk tier: 88/256 experts/layer pinned in RAM (learned pin set from .../pin_set_v4f_p176.json); the rest fetched from /data/models/... on slot-cache miss
 Allocating 98304 tokens for DSV4 KV cache (154 window pages), total = 3.19 GiB     (rank 0 与 rank 1 各一条)
-Free GPU memory after capturing CUDA graphs: 1.63 GiB
-API server is ready to serve on 0.0.0.0:1925                                          (144s)
+Free GPU memory after capturing CUDA graphs: 2.96 GiB
+API server is ready to serve on 0.0.0.0:1925                                          (150s)
 ```
 
-2500 槽/rank 约 33.0 GiB, 其中 256 槽借给 prefill ring; 可用 2244 槽 >> 非 pin 行 1720, 尾部全驻留。
-两卡显存账: 每卡 33.0(槽) + 3.19(KV) + 9.7(非专家权重与激活) + 0.77(图) ≈ 46.7 GiB, 余 1.63。
+2400 槽/rank 约 31.6 GiB, 其中 256 槽借给 prefill ring; 可用 2144 槽 >> 非 pin 行 1720, 尾部全驻留。
+两卡显存账: 每卡 31.6(槽) + 3.19(KV) + 9.7(非专家权重与激活) + 0.77(图) ≈ 45.3 GiB, 余 2.96。
 
 ## 6. 实测记录(2026-10-15)
 
@@ -101,7 +102,8 @@ API server is ready to serve on 0.0.0.0:1925                                    
 | 2400 / 131072 | 1.90 GiB | 48.8 / 49.5 | 20.24 | 未测 |
 | 2400 / 131072 + `--max-running-requests 4` | 1.90 GiB | 48.6 / 49.3 | 19.64 | 未测 |
 | 2500 / 65536 + `--max-running-requests 4` | 2.70 GiB | 46.5 / 47.2 | 20.57 | 未测(KV 池容不下 3x24K) |
-| **2500 / 98304(本配方)** | **1.63 GiB** | **46.1 / 46.1** | **20.64** | **通过 202.2s** |
+| 2500 / 98304 | 1.63 GiB | 46.1 / 46.1 | 20.64 | 通过 202.2s |
+| **2400 / 98304(本配方)** | **2.96 GiB** | **49.0 / 48.8** | **21.29** | **通过 183.2s** |
 
 同一张表读出来的四条:
 - 单流随槽位变快: 2000 -> 2256 是 -15%, 2256 -> 2400 是 -8%, 2400 -> 2500 是 -5%, 边际约 3.3 ms/100 槽。
@@ -134,7 +136,8 @@ API server is ready to serve on 0.0.0.0:1925                                    
 
 - **槽位数是唯一有效旋钮**: 单流(2000/2256/2400/2500 -> 62.2/53.3/48.8/46.4 ms)与
   3 路(1200/1700/2000/2106/2302 -> 11.26/15.04/17.58/18.16/20.51 tok/s, 约 0.0084 tok/s 每槽)
-  都跟着它走; 每 100 槽约值 3.3 ms(单流)。
+  都跟着它走; 每 100 槽约值 3.3 ms(单流)。**槽位不是白拿的**: 余量小的版本单请求长不了(§8),
+  本配方就是拿 100 槽/卡换回了 3 万 tokens 的单请求长度。
 - **显存预算里槽位与 KV 抢同一块地**: 每 1024 tokens 约 0.033 GiB/rank(2500 槽下实测口径)。
   所以"再加槽位"只能从 KV 池里拿, 这就是为什么本配方把 KV 压到 98304。
 - **8 路并发未定论**: 同一配方不同轮次拿过 23.73 与 37.52, 2302 槽 + 72K KV 又拿过 42.23。
@@ -152,13 +155,16 @@ API server is ready to serve on 0.0.0.0:1925                                    
   `torch.OutOfMemoryError: Tried to allocate 264.00 MiB. GPU 0 ... 160.88 MiB is free`
   (位置 `attention/dsv4_indexer.py:72 indexer_select_prefill`), 随后
   `Backend worker is gone and cannot be restarted`。同样的 72K 拆成 3x24K 并发则通过。
-- **1.63 GiB(本配方)**: 真 3x24K 探针通过(202.2s); 单请求 63244 tokens 通过。
-- **2.91 GiB(上一版)**: 探针运行中一度降到 2.09 GiB, 通过。
+- **1.63 GiB(2500 槽版)**: 真 3x24K 探针通过(202.2s); 单请求 63244 tokens 通过。
+- **2.96 GiB(本配方)**: 真 3x24K 探针通过(183.2s); 单请求 **84292 与 94612 tokens 都通过**
+  (94612 = 池子 98304 的 96%)。
+- **2.91 GiB(更早的 2000 槽版)**: 探针运行中一度降到 2.09 GiB, 通过。
 
-推论: 短请求只需 >0.2 GiB; 长 prefill 需要 1.6 GiB 以上。余量不足不会在短对话里暴露。
-**单请求 prompt 长度另有一条上限**: 63244 tokens 通过、约 72K OOM——indexer 的 top-k 临时张量
-按单序列长度涨, `--prefill-chunk-tokens` 切不动它。所以池子标称的 98304 在单请求下用不到,
-**单请求 prompt 建议不超过约 64K**; 需要更长的单序列, 得先把余量让出来(减槽位)。
+推论: 短请求只需 >0.2 GiB; 长 prefill 需要 1.6 GiB 以上, 单请求越长要得越多。
+**单请求 prompt 的上限由余量决定**: indexer 的 top-k 临时张量按单序列长度线性涨(约 3.7 KiB/token),
+`--prefill-chunk-tokens` 切不动它——1.63 GiB 余量下 63244 通过、约 72K OOM; 2.96 GiB 下 94612 通过,
+顶到 KV 池上限。想再长只能继续让余量(减槽位)或加大池子, 两者都吃显存。根本解法在代码:
+让 `indexer_select_prefill` 按 chunk 分片(未开工)。
 
 ## 9. 已知 CLI 与流程陷阱(期间踩过)
 
@@ -183,17 +189,20 @@ API server is ready to serve on 0.0.0.0:1925                                    
 本配方只改参数, 不产生代码改动。回滚 = 把下面两项改回上一版, 然后 `docker rm -f freetoken-dsv4f`
 再跑一遍 §3 的 `docker run`(重建前先按 §3 停旧容器):
 
-| 参数 | 本配方 | 上一版(3 路) | 更旧的出厂版 |
-|---|---|---|---|
-| `--moe-cache-size` | 2500 | 2000 | 1200 |
-| `--num-tokens` | 98304 | 262144 | 1048576 |
-| `--swa-num-pages-override` | 不设 | 不设 | 435 |
-| `--cuda-graph-max-bs` | 4 | 4 | 16 |
-| `--memory-ratio` | 0.98 | 0.98 | 0.95 |
-| `--disk-tier-auto-reserve-gb` | 0 | 0 | 8 |
+| 参数 | 本配方(2400) | 2500 槽版 | 3 路版(2026-10-14) | 出厂版 |
+|---|---|---|---|---|
+| `--moe-cache-size` | 2400 | 2500 | 2000 | 1200 |
+| `--num-tokens` | 98304 | 98304 | 262144 | 1048576 |
+| `--swa-num-pages-override` | 不设 | 不设 | 不设 | 435 |
+| `--cuda-graph-max-bs` | 4 | 4 | 4 | 16 |
+| `--memory-ratio` | 0.98 | 0.98 | 0.98 | 0.95 |
+| `--disk-tier-auto-reserve-gb` | 0 | 0 | 0 | 8 |
 
-备选几何: **2400 槽 / 131072 tokens**(单流 48.8 ms、3 路 20.24、余量 1.90 GiB、上下文 131K)。
-比本配方慢 5.5%, 但上下文多 33%。**注意: 2400/131072 没有跑过真 3x24K 探针**, 只有本配方跑了。
+单流最快的是 2500 槽版(46.1 ms)但单请求只能到约 64K; 要 3 路优先可回 3 路版(17.58 tok/s, 上下文 262144)。
+
+备选几何: **2400 槽 / 131072 tokens**(单流 48.8 ms、3 路 20.24、余量 1.90 GiB、上下文 131K tokens)。
+与本配方槽位相同、池子大 33%, 但余量少 1.06 GiB ⇒ 单请求上限反而低。**2400/131072 没跑过真 3x24K 探针**;
+本配方(2400/98304)是实测过的组合, 优先用。
 更省事的回滚做法是重建前先存档当前实例(`docker stop` + `docker rename`), 之后一条 `docker rename` 换回来;
 本仓库不假定存档容器一定存在(它可能被清理), 所以上表才是权威口径。宿主上的脚本备份
 `/data/build/start_ftv4f.sh.bak-<ts>` 只作参考, 不在仓库里、不保证存在。
@@ -203,15 +212,16 @@ API server is ready to serve on 0.0.0.0:1925                                    
 ```bash
 docker logs freetoken-dsv4f 2>&1 | grep -E "slots \[0, 256\) of|Allocating .* KV cache|Free GPU memory after"
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:1925/v1/models
-docker cp /data/build/ft-bench-single.py freetoken-dsv4f:/tmp/ && docker exec -e FT_PORT=1925 -e FT_GEN=512 -e FT_TRAIL=128 freetoken-dsv4f python3 /tmp/ft-bench-single.py
+docker cp /data/build/ft-bench-single.py freetoken-dsv4f:/tmp/ && docker exec -e FT_PORT=1925 -e FT_GEN=512 -e FT_TAIL=128 freetoken-dsv4f python3 /tmp/ft-bench-single.py
 docker cp /data/build/ft-longctx.py    freetoken-dsv4f:/tmp/ && docker exec -e FT_PORT=1925 -e FT_N=3 -e FT_CTX=52000 freetoken-dsv4f python3 /tmp/ft-longctx.py
 ```
 
-四条几何 + 200 + 单流尾段(应约 21.7 tok/s) + 24K 探针, 全部满足才算这次部署成立。
+四条几何 + 200 + 单流尾段(应约 20.4 tok/s = 48.8 ms) + 3x24K 探针, 全部满足才算这次部署成立。
 
 ## 12. 遗留待办
 
-- **TTFT 仍是 5-7 s**(单流首 token)。已定位到机制: 该 prompt 在 prefill 阶段要把自己路由到的
+- **TTFT 仍是 5-7 s**(单流首 token; 长上下文下更贵: 84292 tokens 冷起首 token **379.6 s**,
+  ≈222 tok/s, 命中前缀时只付增量、55.6 s)。已定位到机制: 该 prompt 在 prefill 阶段要把自己路由到的
   专家行整批搬进显存(约 2200 行/rank, 其中约 1/3 不在 pin 集里、要读盘), 与 KV 池、槽位缓存
   都无关(槽位从 2000 加到 2500, TTFT 从 8.12 到 8.15 s, 不动)。候选方向: 按 prefill 轨迹重学
   pin 集(`tools/trace/make_ram_pin_set.py`), 或做 prefill 感知的取数准入。未开工。

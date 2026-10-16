@@ -144,6 +144,28 @@ def test_replay_reuses_the_captured_buffer():
     assert torch.equal(batch_snap[0, :300], torch.arange(1000, 1300, dtype=torch.int64))
 
 
+def test_replay_carries_the_page_table_rows():
+    """The per-request carry key travels with the step: the compressor reads ``md.table_rows``
+    when it rolls a request-keyed ring block, so a replay must stage that batch's own rows and
+    an eager step must hand over the live tensor. A stale or shared key would let two resident
+    requests roll the same carry block."""
+    backend, _, _ = _stack()
+    backend.init_capture_graph(max_seq_len=1024, bs_list=[2])
+    first = _decode_batch([2, MRR], [259, 0])
+    backend.prepare_for_replay(first)
+    md = first.attn_metadata
+    assert torch.equal(md.table_rows, first.active_table_idx)  # this request's own key
+    buf = md.table_rows
+
+    second = _decode_batch([3, 2], [299, 1])
+    backend.prepare_for_replay(second)
+    md2 = second.attn_metadata
+    assert md2.table_rows.data_ptr() == buf.data_ptr()  # replay: the captured buffer, re-staged
+    want = torch.tensor([3, 2], dtype=torch.int64)
+    assert torch.equal(md2.table_rows, want)
+    assert torch.equal(md.table_rows, want)  # one buffer per capture shape, as with full_snap
+
+
 def test_capture_stages_the_dummy_row():
     """Capture runs on dummy rows only; they must resolve to the reserved page so the captured
     gather reads a real slot instead of the -1 fill."""

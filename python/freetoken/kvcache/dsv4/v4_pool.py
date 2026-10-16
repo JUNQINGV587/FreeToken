@@ -164,6 +164,9 @@ class DSV4PagedKVCache(WindowTierPagedPool):
                     overlap=(ratio == 4),
                     head_dim=self.head_dim,
                     device=device,
+                    # Non-overlap rings hold one block per resident request row, not one per
+                    # window page: see CompressStateRing and dsv4_pool_sizes.
+                    request_keyed=(ratio != 4),
                 )
             )
 

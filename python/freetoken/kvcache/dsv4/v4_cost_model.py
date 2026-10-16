@@ -73,10 +73,11 @@ def dsv4_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:
     """Bytes per P-token across ALL tiers, summed over layers per ratio class.
 
     Window term scaled by ``swa_ratio``; compressed ``1/ratio``; indexer ``1/4``
-    (ratio-4 layers). The compress-state / indexer-state rings are sized off the
+    (ratio-4 layers). The overlap compress-state / indexer-state rings are sized off the
     WINDOW pages (``state_slots = n_win_pages * ring_size`` in ``dsv4_pool_sizes``),
     so their per-page contribution is scaled by ``swa_ratio`` too -- matching the
-    actual pool, not ``ring_size`` slots on every full page.
+    actual pool, not ``ring_size`` slots on every full page. The non-overlap
+    (ratio-128) ring is request-keyed instead, so it contributes nothing per page.
     """
     assert P % 1 == 0 and P > 0
     kv_b = _kv_bytes(args)
@@ -97,7 +98,10 @@ def dsv4_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:
             # the window pages -> swa_ratio-scaled per full page.
             total += round(swa_ratio * ring_size_for_ratio(4)) * _idx_state_bytes(args)
         # Compress-state ring: ring_size slots per WINDOW page (swa_ratio-scaled), fp32.
-        total += round(swa_ratio * ring_size_for_ratio(ratio)) * _state_bytes(args, ratio)
+        # Overlap (ratio-4) rings only: a non-overlap ring is request-keyed and its
+        # per-page copy is dead (see dsv4_pool_sizes), so it has no per-page cost.
+        if ratio == 4:
+            total += round(swa_ratio * ring_size_for_ratio(ratio)) * _state_bytes(args, ratio)
     return int(total)
 
 
@@ -121,17 +125,19 @@ def dsv4_kv_unit_bytes(args, P: int = 128) -> int:
 
 def dsv4_window_unit_bytes(args, P: int = 128) -> int:
     """WINDOW(swa)-tier bytes per window token: the sliding KV pool (every layer) plus the
-    compress-state and indexer-state rings (both sized off the window pages,
-    ``state_slots = n_win_pages * ring_size``). Independent of ``swa_ratio`` -- the ratio only sets
-    how many window tokens exist, not the per-token cost. This is ``swa_bytes_per_token``."""
+    overlap compress-state and indexer-state rings (sized off the window pages,
+    ``state_slots = n_win_pages * ring_size``). The non-overlap (ratio-128) ring is
+    request-keyed and therefore a fixed cost, not a per-token one. Independent of
+    ``swa_ratio`` -- the ratio only sets how many window tokens exist, not the per-token
+    cost. This is ``swa_bytes_per_token``."""
     kv_b = _kv_bytes(args)
     ratios = tuple(args.compress_ratios)[: args.n_layers]
     per_page = len(ratios) * P * kv_b  # window KV: P slots per page, every layer
     for ratio in ratios:
         if ratio == 0:
             continue
-        per_page += ring_size_for_ratio(ratio) * _state_bytes(args, ratio)  # attn ring
         if ratio == 4:
+            per_page += ring_size_for_ratio(ratio) * _state_bytes(args, ratio)  # attn ring
             per_page += ring_size_for_ratio(4) * _idx_state_bytes(args)  # indexer ring
     return -(-per_page // P)  # ceil to bytes/window-token
 
@@ -188,10 +194,22 @@ def dsv4_pool_sizes(
         rs = ring_size_for_ratio(ratio)
         cmp_blocks.append(full_token // ratio)
         idx_blocks.append(full_token // 4 if ratio == 4 else None)
-        state_slots.append(n_win_pages * rs)
+        if ratio == 4:
+            # Overlap ring: one block per window page -- that page's carry IS read back
+            # (a radix match seeds the register from it and decode only rolls within it).
+            state_slots.append(n_win_pages * rs)
+            # Indexer ring (ratio-4 only) is sized like the attention ratio-4 ring.
+            idx_state_slots.append(n_win_pages * ring_size_for_ratio(4))
+        else:
+            # Non-overlap ring: one block per RESIDENT request row instead of one per
+            # window page (``max_batch_size`` rows, the +1 dummy included -- see
+            # engine.py, which sets it to max_running_req + 1). The per-page copy is
+            # dead: nothing reads a page's carry back (the model's extend zeroes the
+            # register before reducing, and a radix match re-derives the block from its
+            # own tokens). Verified by tests/models/test_deepseek_v4_compress_ring.py.
+            state_slots.append(max(1, int(getattr(args, "max_batch_size", 1))) * rs)
+            idx_state_slots.append(None)
         ring_sizes.append(rs)
-        # Indexer ring (ratio-4 only) is sized like the attention ratio-4 ring.
-        idx_state_slots.append(n_win_pages * ring_size_for_ratio(4) if ratio == 4 else None)
 
     return DSV4PoolSizes(
         P=P,

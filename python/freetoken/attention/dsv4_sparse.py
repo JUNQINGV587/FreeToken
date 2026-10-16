@@ -132,6 +132,7 @@ class DSV4CaptureData:
 
     full_snap: torch.Tensor
     last_indices: torch.Tensor
+    table_snap: torch.Tensor
 
     @classmethod
     def create(cls, max_bs: int, width: int, device: torch.device) -> DSV4CaptureData:
@@ -140,6 +141,9 @@ class DSV4CaptureData:
             # the sparse kernel masks) and the compressed row arithmetic floors below zero.
             full_snap=torch.full((max_bs, width), -1, dtype=torch.int64, device=device),
             last_indices=torch.arange(max_bs, dtype=torch.int32, device=device),
+            # The batch's page-table rows: the key the request-keyed (ratio-128) compress-state
+            # rings are addressed by, and a graph input, so it needs a stable captured buffer.
+            table_snap=torch.zeros(max_bs, dtype=torch.int64, device=device),
         )
 
 
@@ -282,9 +286,10 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         src = self.pool.full_loc_map.index_select(0, rows_ti)
         w = min(src.shape[1], cap.full_snap.shape[1])
         cap.full_snap[:bs, :w].copy_(src[:bs, :w])
+        cap.table_snap[:bs].copy_(rows_ti[:bs])
         batch.attn_metadata = DSV4AttnMetadata(
             last_indices=cap.last_indices[:bs], full_snap=cap.full_snap[:bs],
-            window_ar=self._window_ar,
+            table_rows=cap.table_snap[:bs], window_ar=self._window_ar,
         )
 
 

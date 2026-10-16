@@ -5,8 +5,12 @@ the Lightning Indexer's own (writes ``idx_pool``) -- over three tiers of paged s
 
 * the compressed-KV pool row for a block, which is arithmetic off the block's full loc
   (``full_loc(b * ratio) // ratio``), so it needs no slot map;
-* the per-window-page compress-state RING, which carries the rolling reduction across page and
-  request boundaries so a radix hit can resume a prefix by value;
+* the compress-state RING, which carries the rolling reduction across page and request
+  boundaries so a radix hit can resume a prefix by value. Overlap (ratio-4) rings are keyed by
+  window page -- that page's carry IS read back (a radix match seeds from it); non-overlap
+  (ratio-128) rings are keyed by the resident request's page-table row, because their per-page
+  copy is provably dead (the extend zeroes the register before reducing, and a radix match
+  re-derives the block from its own tokens);
 * a per-row scratch row, the destination for a decode step whose block did not complete (a
   discarded write that keeps the masked store graph-safe and collision-free).
 
@@ -20,6 +24,7 @@ from __future__ import annotations
 import os
 
 import torch
+from freetoken.core import get_global_ctx
 
 
 class CompressorBackendMixin:
@@ -86,22 +91,53 @@ class CompressorBackendMixin:
         keeps co-tenant decode rows from contaminating each other's carry."""
         return torch.div(window_slots, self.window_size, rounding_mode="floor") * ring_size
 
+    def request_state_loc(self, row: int, ring_size: int) -> torch.Tensor:
+        """A request-keyed ring's block: ``row * ring_size + arange(ring_size)``. ``row`` is the
+        resident request's page-table row, NOT a batch position -- batch positions move when a
+        request finishes, so a carry keyed by one would follow the wrong request."""
+        base = row * ring_size
+        return torch.arange(base, base + ring_size, device=self.device, dtype=torch.int64)
+
+    def ring_block_base(
+        self, ring, window_slots: torch.Tensor, ring_size: int, rows: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Block bases for a decode row set: page-keyed (overlap) rings take the window slots,
+        request-keyed (non-overlap) rings take the batch's page-table rows."""
+        if ring.request_keyed:
+            assert rows is not None, "request-keyed ring needs the batch's page-table rows"
+            return rows * ring_size
+        return self.ring_page_base(window_slots, ring_size)
+
+    def request_rows(self) -> torch.Tensor:
+        """The decode batch's stable per-row key: its page-table row (see ``ring_block_base``)."""
+        md = get_global_ctx().batch.attn_metadata
+        rows = getattr(md, "table_rows", None)
+        assert rows is not None, "decode metadata is missing its page-table rows"
+        return rows if rows.dtype == torch.int64 else rows.to(torch.int64)
+
     def read_carry(
         self, layer_id: int, tier: str, window_slot: int, ring_size: int
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         """The ``[ring_size, 2 * item]`` carry block at ``window_slot``'s page -- kv half then
-        score half. Used to resume a prefix by value on a radix hit."""
+        score half. Used to resume a prefix by value on a radix hit; ``None`` where the ring is
+        request-keyed (nothing seeds from a page there -- see ``write_boundary_carries``)."""
         ring = self.compress_state_ring(layer_id, tier)
-        assert ring is not None
+        if ring is None or ring.request_keyed:
+            return None
         return ring.get(self.carry_state_loc(window_slot, ring_size))
 
     def write_carry(
-        self, layer_id: int, tier: str, window_slot: int, ring_size: int, kv_score: torch.Tensor
+        self, layer_id: int, tier: str, window_slot: int, ring_size: int, kv_score: torch.Tensor,
+        row: int | None = None,
     ) -> None:
         ring = self.compress_state_ring(layer_id, tier)
         if ring is None:
             return
-        state_loc = self.carry_state_loc(window_slot, ring_size)
+        if ring.request_keyed:
+            assert row is not None, "request-keyed ring needs the request's page-table row"
+            state_loc = self.request_state_loc(int(row), ring_size)
+        else:
+            state_loc = self.carry_state_loc(window_slot, ring_size)
         ring.set(state_loc, kv_score)
         if self._RING_CHECK:
             assert torch.equal(ring.get(state_loc), kv_score), (
@@ -110,18 +146,19 @@ class CompressorBackendMixin:
             )
 
     def read_carry_blocks(
-        self, layer_id: int, tier: str, window_slots: torch.Tensor, ring_size: int
+        self, layer_id: int, tier: str, window_slots: torch.Tensor, ring_size: int,
+        rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-row carry blocks ``[B, ring_size, 2 * item]`` for a decode step."""
         ring = self.compress_state_ring(layer_id, tier)
-        return ring.get_blocks(self.ring_page_base(window_slots, ring_size))
+        return ring.get_blocks(self.ring_block_base(ring, window_slots, ring_size, rows))
 
     def write_carry_blocks(
         self, layer_id: int, tier: str, window_slots: torch.Tensor, ring_size: int,
-        blocks: torch.Tensor,
+        blocks: torch.Tensor, rows: torch.Tensor | None = None,
     ) -> None:
         ring = self.compress_state_ring(layer_id, tier)
-        ring.set_blocks(self.ring_page_base(window_slots, ring_size), blocks)
+        ring.set_blocks(self.ring_block_base(ring, window_slots, ring_size, rows), blocks)
 
     def write_boundary_carries(
         self, *, layer_id: int, tier: str, ratio: int, overlap: bool, ring_size: int,
@@ -138,7 +175,10 @@ class CompressorBackendMixin:
         already in the ring.
         """
         ring = self.compress_state_ring(layer_id, tier)
-        if ring is None:
+        if ring is None or ring.request_keyed:
+            # Non-overlap (ratio-128) rings are request-keyed: the block a boundary write would
+            # produce is the reset constant, and nothing reads a page's block back (the model's
+            # extend zeroes the register before reducing). Writing it would be dead weight.
             return
         P, item = self.window_size, ring.item_size
         rows = ring_size

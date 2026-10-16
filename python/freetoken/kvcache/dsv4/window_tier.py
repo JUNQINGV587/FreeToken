@@ -77,6 +77,12 @@ class CompressStateRing:
 
     Last row (index ``-1``) is a permanent scratch slot, re-cleared on every write. Last dim is
     split ``kv | score``; ``set`` writes both halves.
+
+    ``request_keyed`` picks what a block belongs to: a WINDOW PAGE (``False``, the default) or a
+    resident REQUEST's page-table row (``True``). Only the non-overlap tiers (ratio 128) are
+    request-keyed: their per-page carry is never read back (the extend zeroes the register before
+    reducing, and a radix match re-derives the block from its own tokens), so one block per
+    resident row replaces one block per window page.
     """
 
     def __init__(
@@ -87,9 +93,11 @@ class CompressStateRing:
         head_dim: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        request_keyed: bool = False,
     ) -> None:
         self.ring_size = ring_size
         self.head_dim = head_dim
+        self.request_keyed = request_keyed
         self._item_size = (1 + int(overlap)) * head_dim  # width of kv (== width of score)
         last_dim = 2 * self._item_size
         self.buffer = torch.zeros((n_slots + 1, last_dim), dtype=dtype, device=device)

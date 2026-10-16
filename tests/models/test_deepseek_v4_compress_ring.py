@@ -142,17 +142,18 @@ class _Rig:
         self.comp._kv_state.fill_(0.0)
         self.comp._score_state.fill_(float("-inf"))
 
-    def resume(self, *, seed: bool = True, mutate=None, scrub: bool = True) -> None:
-        self.prefill(RESUME_AT)
+    def resume(self, *, at: int = RESUME_AT, seed: bool = True, mutate=None,
+               scrub: bool = True) -> None:
+        self.prefill(at)
         if not seed:
             self.comp._seed_carry_from_ring = lambda window_slot: None
         if mutate is not None:
-            self.put_seed_block(mutate(self.seed_block()))
+            self.put_seed_block(mutate(self.seed_block(at)), at)
         if scrub:
             self.scrub_register()
         self.comp.extend(
-            self.x[:, RESUME_AT:PREFILL], RESUME_AT, self.ws[RESUME_AT:PREFILL],
-            tail_window_slot=RESUME_AT - 1,
+            self.x[:, at:PREFILL], at, self.ws[at:PREFILL],
+            tail_window_slot=at - 1,
         )
 
     def decode(self, lo: int = PREFILL, hi: int = TOTAL) -> None:
@@ -167,14 +168,18 @@ class _Rig:
         n = n_blocks if n_blocks is not None else TOTAL // self.ratio
         return self.pool.cmp_pool[self.layer_id][:n].clone()
 
-    def seed_block(self) -> torch.Tensor:
+    def seed_block(self, at: int = RESUME_AT) -> torch.Tensor:
+        """The page seed a resume reads back: the compact ``kv|score`` rows (ratio 4 only)."""
         return self.comp.attn.read_carry(
-            self.layer_id, "attn", RESUME_AT - 1, self.comp.ring_size
+            self.layer_id, "attn", at - 1, self.comp.ring_size
         ).clone()
 
-    def put_seed_block(self, block: torch.Tensor) -> None:
-        self.comp.attn.write_carry(
-            self.layer_id, "attn", RESUME_AT - 1, self.comp.ring_size, block
+    def put_seed_block(self, block: torch.Tensor, at: int = RESUME_AT) -> None:
+        # A seed row is ``item`` wide, not ``head_dim``: the overlap half rides in the same row.
+        ratio, width = self.ratio, self.comp.item_size
+        self.comp.attn.write_seed(
+            self.layer_id, "attn", at - 1,
+            block[: ratio * width].view(ratio, width), block[ratio * width:].view(ratio, width),
         )
 
     def empty_block(self) -> torch.Tensor:
@@ -200,6 +205,31 @@ def test_resume_matches_from_scratch_bit_for_bit(ratio):
 
 
 @pytest.mark.parametrize("ratio", RATIOS)
+@pytest.mark.parametrize("at", [RESUME_AT, 2 * 128])
+def test_resume_matches_from_scratch_wherever_the_prefix_ends(ratio, at):
+    """A radix hit lands on a page boundary, not necessarily on page 0: what a real resume reads is
+    the seed written for the page the prefix ends in. Resuming at page 1 and at page 2 must both
+    reproduce a from-scratch prefill bit for bit, and the seed must be what carries the overlap
+    tier forward -- dropping it has to move the rows there and only there."""
+    ref = _Rig(ratio)
+    ref.prefill()
+    ref.decode()
+    ref_rows = ref.rows()
+
+    got = _Rig(ratio)
+    got.resume(at=at)
+    got.decode()
+    assert torch.equal(got.rows(), ref_rows), f"resume at {at} drifted from a full prefill"
+
+    unseeded = _Rig(ratio)
+    unseeded.resume(at=at, seed=False)
+    unseeded.decode()
+    assert torch.equal(unseeded.rows(), ref_rows) is (ratio == 128), (
+        "the page seed must be load-bearing for the overlap tier and dead for the non-overlap tier"
+    )
+
+
+@pytest.mark.parametrize("ratio", RATIOS)
 def test_resume_state_comes_through_the_ring(ratio):
     """Negative control: the extend starts from a scrubbed register, so a ratio-4 resume must
     move without the ring seed and a ratio-128 one must not (compress.py:258 discards it)."""
@@ -217,40 +247,103 @@ def test_resume_state_comes_through_the_ring(ratio):
     )
 
 
-def test_ratio4_only_the_seed_quadrant_is_live():
-    """The extend copies ks[:ratio, :d] and ss[:ratio, :d] out of the block (compress.py:229-236):
-    one ratio-row x head-dim quadrant per half. Everything else must be unread."""
+def test_ratio4_page_seed_is_the_compact_rows():
+    """The ratio-4 carry is a request-keyed live block plus a page-keyed seed holding exactly what a
+    resume reads back: ``ratio`` rows of the kv half then of the score half, each row ``item`` wide
+    (a whole row is load-bearing -- the extend's overlap_transform reads its second half). That is
+    32 KiB/page at head_dim=512, not the 64 KiB whole block (and not the ~1 GiB of page blocks it
+    replaces)."""
+    rig = _Rig(4)
+    rig.prefill()
+    store = rig.pool.state_seed[rig.layer_id]
+    width = rig.comp.item_size
+    assert rig.ring.request_keyed and store is not None
+    assert width == 2 * HEAD, "an overlap tier's carry row is (1+overlap)*head_dim wide"
+    assert store.item_size == 4 * width
+    assert store.buffer.shape[1] == 2 * 4 * width
+    assert rig.comp.attn.read_carry(rig.layer_id, "attn", RESUME_AT - 1, 8).numel() == 2 * 4 * width
+
+
+def test_indexer_tier_keeps_its_own_seed_in_its_own_geometry():
+    """The indexer tier is a separate store at ``index_head_dim``: a seed written for it must be
+    readable by value from the indexer store, must not share the attention store's geometry, and
+    must leave the attention seed alone (one dict lookup decides which store a tier addresses)."""
+    rig = _Rig(4)
+    attn_seed = rig.comp.attn.compress_state_seed(rig.layer_id, "attn")
+    idx_seed = rig.comp.attn.compress_state_seed(rig.layer_id, "idx")
+    ihd = _args().index_head_dim
+    iwidth = 2 * ihd  # the indexer compressor is overlap too
+    assert idx_seed is not None and idx_seed is not attn_seed
+    assert idx_seed.item_size == 4 * iwidth != attn_seed.item_size
+
+    page = rig.comp.attn.seed_page_loc(300)
+    attn_before = attn_seed.get(page).clone()
+    kv = torch.arange(4 * iwidth, device=DEVICE, dtype=torch.float32).view(4, iwidth)
+    score = -kv - 1.0
+    rig.comp.attn.write_seed(rig.layer_id, "idx", 300, kv, score)
+    got = rig.comp.attn.read_carry(rig.layer_id, "idx", 300, ring_size=8)
+    assert torch.equal(got, torch.cat([kv.reshape(-1), score.reshape(-1)]))
+    assert torch.equal(attn_seed.get(page), attn_before), "the idx write touched the attn store"
+
+
+def test_ratio4_resume_ignores_the_live_block():
+    """The resume seeds from the page store, not from the request's live carry block: clobbering
+    every live block row right before the extend must not move the resumed rows."""
     ref = _Rig(4)
     ref.resume()
     ref_rows = ref.rows()
-
-    def poison_rest(block):
-        item = block.shape[1] // 2
-        keep = torch.zeros_like(block, dtype=torch.bool)
-        keep[:4, :HEAD] = True
-        keep[:4, item : item + HEAD] = True
-        block[~keep] = 123.0
-        return block
 
     got = _Rig(4)
-    got.resume(mutate=poison_rest)
-    assert torch.equal(got.rows(), ref_rows), "ratio-4 reads more of the block than the quadrant"
+
+    def poison_live(_seed):
+        ring = got.pool.state_ring[got.layer_id]
+        ring.buffer[:, : ring.item_size] = 7.0
+        ring.buffer[:, ring.item_size :] = -3.0
+        return _seed
+
+    got.resume(mutate=poison_live)
+    assert torch.equal(got.rows(), ref_rows), "the resume read the live block instead of the seed"
 
 
-def test_ratio4_seed_quadrant_is_load_bearing():
+def test_ratio4_seed_first_half_is_load_bearing():
     ref = _Rig(4)
     ref.resume()
     ref_rows = ref.rows()
 
-    def poison_quadrant(block):
-        item = block.shape[1] // 2
-        block[:4, :HEAD] = 123.0
-        block[:4, item : item + HEAD] = 0.0
-        return block
+    def poison_quadrant(seed):
+        seed[: 4 * HEAD] = 123.0
+        seed[4 * HEAD :] = 0.0
+        return seed
 
     got = _Rig(4)
     got.resume(mutate=poison_quadrant)
     assert not torch.equal(got.rows(), ref_rows), "the live quadrant must change the result"
+
+
+def test_resume_seeds_the_whole_carry_row():
+    """A carry row is ``item = 2*head_dim`` wide and the extend's overlap_transform feeds the row's
+    SECOND half into the first new block's overlap slots. A resume must therefore restore every
+    column of rows ``[0:ratio]`` from the page seed -- not just ``[0:head_dim]``. Restoring the
+    narrow half leaves the overlap half at the reset constant, so a chunked prefill (which resumes
+    through the radix on every chunk after the first) rebuilds its first block's overlap slots from
+    zeros. This compares the restored register against the producing request's own boundary rows,
+    which is what L1's whole-block copy restored."""
+    ref = _Rig(4)
+    ref.prefill(RESUME_AT)
+    prod_kv = ref.comp._kv_state[0, :4].clone()
+    prod_score = ref.comp._score_state[0, :4].clone()
+
+    got = _Rig(4)
+    got.prefill(RESUME_AT)
+    got.scrub_register()
+    got.comp._seed_carry_from_ring(RESUME_AT - 1)
+
+    assert torch.equal(got.comp._kv_state[0, :4], prod_kv), (
+        "the resume restored a narrower row than the producing request persisted"
+    )
+    assert torch.equal(got.comp._score_state[0, :4], prod_score), (
+        "the resume restored a narrower score row than the producing request persisted"
+    )
 
 
 def test_ratio128_ring_is_request_keyed_with_no_page_block():
@@ -261,6 +354,7 @@ def test_ratio128_ring_is_request_keyed_with_no_page_block():
     rig = _Rig(128)
     assert rig.ring.request_keyed
     assert rig.ring.n_slots == _args().max_batch_size * rig.comp.ring_size
+    assert rig.pool.state_seed[rig.layer_id] is None, "a non-overlap tier keeps no page seed"
     rig.prefill()
     assert rig.comp.attn.read_carry(rig.layer_id, "attn", PREFILL - 1, rig.comp.ring_size) is None
 
@@ -287,12 +381,13 @@ def test_ratio128_own_block_rolls_and_every_other_row_is_dead():
     assert not torch.equal(run("own"), ref), "the request's own rolling block must be live"
 
 
-def test_ratio128_the_request_row_selects_the_block():
+@pytest.mark.parametrize("ratio", RATIOS)
+def test_the_request_row_selects_the_live_block(ratio):
     """Moving the request row mid-page moves the roll to that row's own block: the carry that
     row 0 had half accumulated is not what row 1's continued decode sees, so the compressed
     rows must move. This is the two-requests-do-not-share-a-block direction of the same key."""
     def run(switch: bool) -> torch.Tensor:
-        rig = _Rig(128)
+        rig = _Rig(ratio)
         rig.prefill()
         rig.decode(PREFILL, PREFILL + 40)
         if switch:

@@ -79,10 +79,11 @@ class CompressStateRing:
     split ``kv | score``; ``set`` writes both halves.
 
     ``request_keyed`` picks what a block belongs to: a WINDOW PAGE (``False``, the default) or a
-    resident REQUEST's page-table row (``True``). Only the non-overlap tiers (ratio 128) are
-    request-keyed: their per-page carry is never read back (the extend zeroes the register before
-    reducing, and a radix match re-derives the block from its own tokens), so one block per
-    resident row replaces one block per window page.
+    resident REQUEST's page-table row (``True``). Every DSV4 tier is request-keyed: the whole block
+    is live state that only the request rolling that page touches, and what has to outlive the
+    request is the narrow overlap seed a ``CompressSeedStore`` keeps. A non-overlap (ratio 128)
+    tier keeps no seed at all -- its per-page carry is never read back (the extend zeroes the
+    register before reducing, and a radix match re-derives the block from its own tokens).
     """
 
     def __init__(
@@ -131,6 +132,60 @@ class CompressStateRing:
         """Batched per-row carry-block write of ``[B, ring_size, 2*item]``; re-clears scratch."""
         rows = page_base[:, None] + torch.arange(self.ring_size, device=page_base.device)
         self.buffer[rows] = blocks
+        self._clear_scratch()
+
+
+class CompressSeedStore:
+    """Per-layer page-keyed overlap seed: ``[n_slots + 1, 2*ratio*row_width]``.
+
+    An overlap tier's carry block is ``[ring_size, 2*item]``, but a later request only ever reads
+    the first ``ratio`` rows of the kv half and of the score half back (the extend seeds those into
+    the register, and a radix match re-derives everything else from the matched page's own tokens).
+    A row is ``item`` wide, NOT ``head_dim``: on an overlap tier ``item = 2 * head_dim`` and the
+    extend's ``overlap_transform`` feeds the row's SECOND half into the current block's overlap
+    slots, so the whole row is load-bearing. Keeping just those ``ratio`` rows per window page
+    instead of the whole block is what makes the seed store 32 KiB/page/layer instead of 64 KiB at
+    the 512K attention geometry. Last row is scratch, re-cleared on every write, because a slot of
+    ``-1`` (dummy row) must read back the neutral block.
+    """
+
+    def __init__(
+        self,
+        n_slots: int,
+        ratio: int,
+        row_width: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        self.ratio = ratio
+        self.row_width = row_width
+        self._item_size = ratio * row_width  # width of the kv quadrant (== the score quadrant)
+        self.buffer = torch.zeros((n_slots + 1, 2 * self._item_size), dtype=dtype, device=device)
+        self.n_slots = n_slots
+        self._clear_scratch()
+
+    def _clear_scratch(self) -> None:
+        self.buffer[-1, : self._item_size].zero_()
+        self.buffer[-1, self._item_size :].fill_(float("-inf"))
+
+    @property
+    def item_size(self) -> int:
+        return self._item_size
+
+    def get(self, slot: torch.Tensor) -> torch.Tensor:
+        """Gather ``kv|score`` quadrants at ``slot`` (``-1`` -> scratch row)."""
+        return self.buffer[slot]
+
+    def set(self, slot: torch.Tensor, kv_score: torch.Tensor) -> None:
+        """Scatter ``kv|score`` quadrants to ``slot`` then re-clear the scratch row."""
+        self.buffer[slot] = kv_score
+        self._clear_scratch()
+
+    def set_blocks(self, slots: torch.Tensor, kv_score: torch.Tensor) -> None:
+        """Batched write: ``slots`` ``[B]`` (``-1`` -> the scratch row, discarded) and ``kv_score``
+        ``[B, 2*ratio*head_dim]``. Rows that finished no page pass ``-1``, so the write stays
+        graph-safe (no host sync, no out-of-range index) and the scratch row is re-cleared after."""
+        self.buffer[slots] = kv_score
         self._clear_scratch()
 
 

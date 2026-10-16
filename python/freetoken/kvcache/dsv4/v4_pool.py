@@ -39,7 +39,12 @@ from .v41_row_format import FP4_E8M0_B32 as _IDX_FMT
 # The window-tier building blocks and the pool base live in window_tier.py (shared with the DSV41
 # pool); the first two are re-exported here for the DSV4 callers and tests that import them from
 # this module.
-from .window_tier import CompressStateRing, FreeListAllocator, WindowTierPagedPool  # noqa: F401
+from .window_tier import (  # noqa: F401
+    CompressSeedStore,
+    CompressStateRing,
+    FreeListAllocator,
+    WindowTierPagedPool,
+)
 
 
 logger = init_logger(__name__)
@@ -111,10 +116,15 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         # ``state_ring`` is the ATTENTION compressor's ring (head_dim). Ratio-4
         # layers additionally own an ``indexer_state_ring`` (index_head_dim) for
         # the indexer's own compressor -- a separate pool, no collision.
+        # Every ring is request-keyed (one live block per resident request row);
+        # the overlap (ratio-4) tiers keep their narrow page seed -- the only part
+        # of a carry block a later request reads back -- in a CompressSeedStore.
         self.cmp_pool: list[torch.Tensor | None] = []
         self.idx_pool: list[torch.Tensor | None] = []
         self.state_ring: list[CompressStateRing | None] = []
         self.indexer_state_ring: list[CompressStateRing | None] = []
+        self.state_seed: list[CompressSeedStore | None] = []
+        self.indexer_state_seed: list[CompressSeedStore | None] = []
         for L in range(self._n_layers):
             ratio = self.compress_ratios[L]
             if ratio == 0:
@@ -122,6 +132,8 @@ class DSV4PagedKVCache(WindowTierPagedPool):
                 self.idx_pool.append(None)
                 self.state_ring.append(None)
                 self.indexer_state_ring.append(None)
+                self.state_seed.append(None)
+                self.indexer_state_seed.append(None)
                 self.cmp_scratch_base.append(None)
                 self.idx_scratch_base.append(None)
                 continue
@@ -143,31 +155,47 @@ class DSV4PagedKVCache(WindowTierPagedPool):
                     )
                 )
                 # Indexer compressor ring: index_head_dim, overlap, ring_size=8.
-                self.indexer_state_ring.append(
-                    CompressStateRing(
-                        n_slots=sizes.idx_state_slots[L],
-                        ring_size=ring_size_for_ratio(4),
-                        overlap=True,
-                        head_dim=self.index_head_dim,
+                idx_ring = CompressStateRing(
+                    n_slots=sizes.idx_state_slots[L],
+                    ring_size=ring_size_for_ratio(4),
+                    overlap=True,
+                    head_dim=self.index_head_dim,
+                    device=device,
+                    request_keyed=True,
+                )
+                self.indexer_state_ring.append(idx_ring)
+                self.indexer_state_seed.append(
+                    CompressSeedStore(
+                        n_slots=sizes.idx_seed_slots[L],
+                        ratio=4,
+                        row_width=idx_ring.item_size,
                         device=device,
                     )
                 )
             else:
                 self.idx_pool.append(None)
                 self.indexer_state_ring.append(None)
+                self.indexer_state_seed.append(None)
                 self.idx_scratch_base.append(None)
 
-            self.state_ring.append(
-                CompressStateRing(
-                    n_slots=sizes.state_slots[L],
-                    ring_size=ring_size_for_ratio(ratio),
-                    overlap=(ratio == 4),
-                    head_dim=self.head_dim,
+            attn_ring = CompressStateRing(
+                n_slots=sizes.state_slots[L],
+                ring_size=ring_size_for_ratio(ratio),
+                overlap=(ratio == 4),
+                head_dim=self.head_dim,
+                device=device,
+                request_keyed=True,
+            )
+            self.state_ring.append(attn_ring)
+            self.state_seed.append(
+                CompressSeedStore(
+                    n_slots=sizes.state_seed_slots[L],
+                    ratio=4,
+                    row_width=attn_ring.item_size,
                     device=device,
-                    # Non-overlap rings hold one block per resident request row, not one per
-                    # window page: see CompressStateRing and dsv4_pool_sizes.
-                    request_keyed=(ratio != 4),
                 )
+                if ratio == 4
+                else None
             )
 
     # ----- engine-facing rebuild surface -----

@@ -31,10 +31,10 @@ class CompressorBackendMixin:
     # DSV4_RING_CHECK=1 -> assert the ring read-back equals what was written. Off by default.
     _RING_CHECK = os.environ.get("DSV4_RING_CHECK", "0") == "1"
 
-    # tier -> (KV-pool, state-ring, scratch-base) attribute names on the pool.
+    # tier -> (KV-pool, state-ring, scratch-base, seed-store) attribute names on the pool.
     _TIER_ATTRS = {
-        "attn": ("cmp_pool", "state_ring", "cmp_scratch_base"),
-        "idx": ("idx_pool", "indexer_state_ring", "idx_scratch_base"),
+        "attn": ("cmp_pool", "state_ring", "cmp_scratch_base", "state_seed"),
+        "idx": ("idx_pool", "indexer_state_ring", "idx_scratch_base", "indexer_state_seed"),
     }
 
     # ----- pool views ------------------------------------------------------------------
@@ -43,6 +43,10 @@ class CompressorBackendMixin:
 
     def compress_state_ring(self, layer_id: int, tier: str):
         return getattr(self.pool, self._TIER_ATTRS[tier][1])[layer_id]
+
+    def compress_state_seed(self, layer_id: int, tier: str):
+        """The tier's overlap seed store (``None`` on tiers that keep no page seed)."""
+        return getattr(self.pool, self._TIER_ATTRS[tier][3])[layer_id]
 
     def compress_scratch_base(self, layer_id: int, tier: str) -> int:
         return getattr(self.pool, self._TIER_ATTRS[tier][2])[layer_id]
@@ -118,13 +122,51 @@ class CompressorBackendMixin:
     def read_carry(
         self, layer_id: int, tier: str, window_slot: int, ring_size: int
     ) -> torch.Tensor | None:
-        """The ``[ring_size, 2 * item]`` carry block at ``window_slot``'s page -- kv half then
-        score half. Used to resume a prefix by value on a radix hit; ``None`` where the ring is
-        request-keyed (nothing seeds from a page there -- see ``write_boundary_carries``)."""
-        ring = self.compress_state_ring(layer_id, tier)
-        if ring is None or ring.request_keyed:
+        """The compact overlap seed at ``window_slot``'s page -- ``[2 * ratio * head_dim]``, kv
+        quadrant then score quadrant. Used to resume a prefix by value on a radix hit; ``None``
+        where the tier keeps no page seed (the non-overlap tiers' per-page carry is dead)."""
+        seed = self.compress_state_seed(layer_id, tier)
+        if seed is None:
             return None
-        return ring.get(self.carry_state_loc(window_slot, ring_size))
+        return seed.get(self.seed_page_loc(window_slot))
+
+    def seed_page_loc(self, window_slot: int) -> torch.Tensor:
+        """Seed slot of a window slot: its page. A radix match is page-aligned, so only a whole
+        page's quadrant is ever read back."""
+        return torch.tensor(window_slot // self.window_size, device=self.device)
+
+    def write_seed(
+        self, layer_id: int, tier: str, window_slot: int, kv_rows: torch.Tensor,
+        score_rows: torch.Tensor,
+    ) -> None:
+        """Persist a page's overlap seed: ``ratio`` rows of the kv half then of the score half,
+        each row ``item`` wide (the whole row is load-bearing -- the extend's overlap_transform
+        reads its second half)."""
+        seed = self.compress_state_seed(layer_id, tier)
+        if seed is None:
+            return
+        flat = torch.cat([kv_rows.reshape(-1), score_rows.reshape(-1)])
+        page = self.seed_page_loc(window_slot)
+        seed.set(page, flat)
+        if self._RING_CHECK:
+            assert torch.equal(seed.get(page), flat), (
+                f"seed read-back != written rows (layer={layer_id} tier={tier} slot="
+                f"{window_slot})"
+            )
+
+    def write_seed_blocks(
+        self, layer_id: int, tier: str, slots: torch.Tensor, kv_rows: torch.Tensor,
+        score_rows: torch.Tensor,
+    ) -> None:
+        """Batched per-row seed write at ``slots`` ``[B]`` (``-1`` -> discarded scratch row)."""
+        seed = self.compress_state_seed(layer_id, tier)
+        if seed is None:
+            return
+        B = slots.size(0)
+        flat = torch.cat([kv_rows.reshape(B, -1), score_rows.reshape(B, -1)], dim=-1)
+        seed.set_blocks(slots, flat)
+        if self._RING_CHECK:
+            assert torch.equal(seed.get(slots), flat), "seed read-back != written rows"
 
     def write_carry(
         self, layer_id: int, tier: str, window_slot: int, ring_size: int, kv_score: torch.Tensor,
@@ -163,7 +205,7 @@ class CompressorBackendMixin:
     def write_boundary_carries(
         self, *, layer_id: int, tier: str, ratio: int, overlap: bool, ring_size: int,
         ape: torch.Tensor, kv: torch.Tensor, score: torch.Tensor, lo: int, hi: int,
-        window_slots: torch.Tensor,
+        window_slots: torch.Tensor, row: int | None = None,
     ) -> None:
         """Persist the carry at EVERY window-page boundary in ``(lo, hi]``, so any future radix
         match (always page-aligned) can read its carry by value.
@@ -173,27 +215,30 @@ class CompressorBackendMixin:
         state. ``kv``/``score`` cover ``[lo, hi)``; ``window_slots`` is indexed by ``pos - lo``.
         The first boundary written is ``lo + P`` -- the one AT ``lo`` is the seed source and is
         already in the ring.
+
+        An overlap tier writes two places: the page's compact seed (the only part a later request
+        reads back) and the requesting row's live carry block, which the next decode step rolls
+        from. A non-overlap tier writes nothing: its boundary block is the reset constant and
+        nothing reads a page's block back (the model's extend zeroes the register before
+        reducing).
         """
-        ring = self.compress_state_ring(layer_id, tier)
-        if ring is None or ring.request_keyed:
-            # Non-overlap (ratio-128) rings are request-keyed: the block a boundary write would
-            # produce is the reset constant, and nothing reads a page's block back (the model's
-            # extend zeroes the register before reducing). Writing it would be dead weight.
+        seed = self.compress_state_seed(layer_id, tier)
+        if seed is None:
             return
-        P, item = self.window_size, ring.item_size
-        rows = ring_size
-        empty_kv = kv.new_zeros(rows, item, dtype=torch.float32)
-        empty_ss = kv.new_full((rows, item), float("-inf"), dtype=torch.float32)
+        P = self.window_size
+        item = self.compress_state_ring(layer_id, tier).item_size
         for B in range((lo // P + 1) * P, hi + 1, P):
             ws = int(window_slots[B - 1 - lo].item())
             if overlap:
-                blk_kv, blk_ss = empty_kv.clone(), empty_ss.clone()
+                blk_kv = kv.new_zeros(ring_size, item, dtype=torch.float32)
+                blk_ss = kv.new_full((ring_size, item), float("-inf"), dtype=torch.float32)
                 blk_kv[:ratio] = kv[0, B - ratio - lo: B - lo]
                 blk_ss[:ratio] = score[0, B - ratio - lo: B - lo] + ape
-                kv_score = torch.cat([blk_kv, blk_ss], dim=-1)
-            else:
-                kv_score = torch.cat([empty_kv, empty_ss], dim=-1)
-            self.write_carry(layer_id, tier, ws, ring_size, kv_score)
+                assert row is not None, "overlap boundary write needs the request's row"
+                self.write_carry(
+                    layer_id, tier, ws, ring_size, torch.cat([blk_kv, blk_ss], dim=-1), row=row,
+                )
+                self.write_seed(layer_id, tier, ws, blk_kv[:ratio], blk_ss[:ratio])
 
 
 __all__ = ["CompressorBackendMixin"]

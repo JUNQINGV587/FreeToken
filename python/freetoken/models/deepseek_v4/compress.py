@@ -96,29 +96,34 @@ class Compressor(BaseOP):
         )
 
     def _seed_carry_from_ring(self, window_slot: int) -> None:
-        # Carry-by-value on a radix re-prefill: seed the register carry FROM the paged ring block of
-        # the matched window TAIL page (covering [start_pos-128, start_pos)), retained by the radix.
-        # Replaces the from-scratch seed at a hit; the block was written by the producing request's
-        # page-boundary write-through, cat([kv_state, score_state]) split at item_size. ``None``
-        # where the ring is request-keyed: nothing seeds from a page there (see write_carry).
-        block = self.attn.read_carry(  # [ring_size, 2*item]
-            self.layer_id, self.tier, window_slot, self.ring_size
-        )
-        if block is None:
+        # Carry-by-value on a radix re-prefill: seed the register carry FROM the matched window TAIL
+        # page's compact seed (kv rows then score rows) -- the only part of that page's carry block a
+        # later request reads back. The rows are ``item`` wide (``(1+overlap)*head_dim``), because
+        # the extend's overlap_transform feeds a row's second half into the current block's overlap
+        # slots. It was written by the producing request's page-boundary persistence (prefill/extend
+        # boundary carries, or a decode page completion). ``None`` where the tier keeps no page seed
+        # (the non-overlap tiers); every other register slot keeps its reset value, which is bit-equal
+        # to the from-scratch seed.
+        seed = self.attn.read_carry(self.layer_id, self.tier, window_slot, self.ring_size)
+        if seed is None:
             return
-        item = self.item_size
-        self._kv_state[0].copy_(block[:, :item])
-        self._score_state[0].copy_(block[:, item:])
+        ratio, width = self.compress_ratio, self._kv_state.size(-1)
+        self._kv_state[0, :ratio].copy_(seed[: ratio * width].view(ratio, width))
+        self._score_state[0, :ratio].copy_(seed[ratio * width:].view(ratio, width))
 
-    def _write_boundary_carries(self, kv, score, seqlen: int, window_slots: torch.Tensor) -> None:
+    def _write_boundary_carries(
+        self, kv, score, seqlen: int, window_slots: torch.Tensor, row: int
+    ) -> None:
         # Full-prefill boundary carries: positions [0, seqlen), window_slots indexed by pos.
-        self._write_boundary_carries_range(kv, score, 0, seqlen, window_slots)
+        self._write_boundary_carries_range(kv, score, 0, seqlen, window_slots, row)
 
-    def _write_boundary_carries_range(self, kv, score, lo: int, hi: int, window_slots) -> None:
+    def _write_boundary_carries_range(
+        self, kv, score, lo: int, hi: int, window_slots, row: int
+    ) -> None:
         self.attn.write_boundary_carries(
             layer_id=self.layer_id, tier=self.tier, ratio=self.compress_ratio,
             overlap=self.overlap, ring_size=self.ring_size, ape=self.ape,
-            kv=kv, score=score, lo=lo, hi=hi, window_slots=window_slots,
+            kv=kv, score=score, lo=lo, hi=hi, window_slots=window_slots, row=row,
         )
 
     def overlap_transform(self, tensor: torch.Tensor, value=0):
@@ -169,7 +174,7 @@ class Compressor(BaseOP):
         # in-progress tail page (the final-page carry == the decode seed for the token after the
         # whole prompt). The register stays the bs=1 compute source, so this does not perturb parity.
         if seqlen > 0:
-            self._write_boundary_carries(kv_full, score_full, seqlen, window_slots)
+            self._write_boundary_carries(kv_full, score_full, seqlen, window_slots, ti)
             if seqlen % self.P != 0:
                 self._write_through_carry(int(window_slots[-1].item()), ti)
         if not should_compress:
@@ -266,7 +271,7 @@ class Compressor(BaseOP):
             ss[:bsz, offset: offset + remainder] = score[:, cutoff:] + self.ape[:remainder]
         # Page-boundary carries across [start_pos, start_pos+seqlen); plus tail if unaligned.
         end = start_pos + seqlen
-        self._write_boundary_carries_range(kv_full, score_full, start_pos, end, window_slots)
+        self._write_boundary_carries_range(kv_full, score_full, start_pos, end, window_slots, ti)
         if end % self.P != 0:
             self._write_through_carry(int(window_slots[-1].item()), ti)
         if not should_compress:
@@ -302,12 +307,13 @@ class Compressor(BaseOP):
         ``window_slots`` are GPU int tensors ``[B]``; ``rows`` is the LOCAL row index [B] into the
         decode snapshot).
 
-        The rolling carry lives PER ROW in the paged state ring. Each row's whole ``ring_size``
-        carry block is READ from where the prior step / prefill wrote it, advanced, and WRITTEN
-        BACK -- so the carry follows the request across 128-page boundaries. Overlap (ratio-4)
-        tiers key a block by WINDOW PAGE (distinct pages -> disjoint blocks, so co-tenant rows
-        never contaminate each other's carry); non-overlap (ratio-128) tiers key it by the
-        request's page-table row instead, because nothing ever reads a page's block back."""
+        The rolling carry lives PER ROW in the request-keyed state ring: each row's whole
+        ``ring_size`` carry block is READ from where the prior step / prefill wrote it, advanced,
+        and WRITTEN BACK, so the carry follows the request across 128-page boundaries. The block is
+        live state -- only the request rolling that page touches it -- so the ring is keyed by the
+        request's page-table row (stable), never by batch position (which moves). What has to
+        outlive the request is the compact per-page seed: at a window-page boundary the completed
+        page's quadrant is persisted for a future radix match."""
         assert self.cmp_pool is not None
         B = x.size(0)
         ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
@@ -341,12 +347,28 @@ class Compressor(BaseOP):
             ks.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), kv)
             ss.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), score)
             compressed = gated_pool(ks, ss, dtype)
-        # Persist the advanced carry block (per row, disjoint blocks); the next step reads it from
-        # here. Within a page the page-keyed rings self-roll, so this is a self-consistent roll.
+        # Persist the advanced carry block (per row, request-keyed disjoint blocks); the next step
+        # reads it from here, so this is a self-consistent roll.
         self.attn.write_carry_blocks(
             self.layer_id, self.tier, window_slots, self.ring_size,
             torch.cat([ks, ss], dim=-1), rows=ring_rows,
         )
+
+        # At a window-page boundary the page becomes a radix match point, so persist its compact
+        # seed -- the register rows the completion just finalised (post-swap rows 0..ratio-1, each
+        # ``item`` wide: the extend's overlap_transform reads a row's second half too). Rows that
+        # finished no page write to the store's discarded scratch row instead, which keeps the
+        # batched write graph-safe (no host sync, no out-of-range index).
+        if overlap:
+            seed_slots = torch.where(
+                (pos + 1) % self.P == 0,
+                torch.div(window_slots, self.P, rounding_mode="floor"),
+                torch.full_like(window_slots, -1),
+            )
+            self.attn.write_seed_blocks(
+                self.layer_id, self.tier, seed_slots,
+                ks[:, :ratio].clone(), ss[:, :ratio].clone(),
+            )
 
         compressed = self.norm.forward(compressed)
         freqs_t = self._freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))  # [B, rd//2]

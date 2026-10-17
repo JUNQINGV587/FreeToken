@@ -537,7 +537,16 @@ class OffloadMoeCache:
             self.ensure_experts(
                 layer, torch.as_tensor(experts, dtype=torch.int32, device=self.device)
             )
-        self.copy_missing()
+            # ``copy_missing`` consumes the shared staging buffers
+            # (src_indices/evict_slots/num_indices/_pending_src_layer) and copies
+            # THIS layer's host rows. Staging several layers before one copy left
+            # every layer but the last with installed-but-uncopied slots: their
+            # maps pointed at slots still holding the previous occupant's bytes,
+            # which decode then hit as phantom hits (2026-10-18: the residual
+            # repeat-run drift was exactly this after every >512-token prefill's
+            # release/rewarm cycle).
+            if self._pending_src_layer is not None:
+                self.copy_missing()
 
     @property
     def prefill_depth(self) -> int:

@@ -360,3 +360,38 @@ def test_apply_syncs_elastic_guard_freeze_set(monkeypatch):
     assert guard._pinned == {0, 1, 6, 7}  # flat ids layer*E+e
     cache.apply_admission_swaps([((0, 0), (0, 2))])
     assert guard._pinned == {1, 2, 6, 7}  # release freeze follows the layout
+
+
+# ---- rewarm staging (2026-10-18 phantom-hit fix) ---------------------------
+
+
+def test_rewarm_copies_every_layer_it_stages():
+    """``apply_elastic_rewarm`` must stage+copy ONE layer at a time.
+
+    Regression: it used to call ``ensure_experts`` for every layer and then a
+    single trailing ``copy_missing()``. The staging buffers
+    (src_indices/evict_slots/num_indices/_pending_src_layer) are shared and
+    overwritten by the next layer's staging, so only the last layer's host rows
+    were copied while every other layer's install had already updated the slot
+    maps -- their slots kept the previous occupant's bytes and decode read them
+    as phantom hits. Observed as nondeterministic decode output after any
+    >512-token prefill on the 2026-10-17/18 drift investigation.
+    """
+    cache = OffloadMoeCache(num_layers=3, num_experts=4, cache_size=8,
+                            device=torch.device("cpu"))
+    calls = []
+
+    def ensure(layer, experts):
+        cache._pending_src_layer = int(layer)
+        calls.append(("ensure", int(layer)))
+
+    def copy():
+        calls.append(("copy", int(cache._pending_src_layer)))
+        cache._pending_src_layer = None
+
+    cache.ensure_experts = ensure
+    cache.copy_missing = copy
+    cache.apply_elastic_rewarm([0 * 4 + 1, 1 * 4 + 2, 2 * 4 + 0])
+    assert calls == [("ensure", 0), ("copy", 0),
+                     ("ensure", 1), ("copy", 1),
+                     ("ensure", 2), ("copy", 2)]

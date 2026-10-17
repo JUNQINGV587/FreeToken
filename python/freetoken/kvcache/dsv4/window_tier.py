@@ -136,30 +136,30 @@ class CompressStateRing:
 
 
 class CompressSeedStore:
-    """Per-layer page-keyed overlap seed: ``[n_slots + 1, 2*ratio*row_width]``.
+    """Per-layer page-keyed overlap seed: ``[n_slots + 1, 2*ratio*head_dim]``.
 
-    An overlap tier's carry block is ``[ring_size, 2*item]``, but a later request only ever reads
-    the first ``ratio`` rows of the kv half and of the score half back (the extend seeds those into
-    the register, and a radix match re-derives everything else from the matched page's own tokens).
-    A row is ``item`` wide, NOT ``head_dim``: on an overlap tier ``item = 2 * head_dim`` and the
-    extend's ``overlap_transform`` feeds the row's SECOND half into the current block's overlap
-    slots, so the whole row is load-bearing. Keeping just those ``ratio`` rows per window page
-    instead of the whole block is what makes the seed store 32 KiB/page/layer instead of 64 KiB at
-    the 512K attention geometry. Last row is scratch, re-cleared on every write, because a slot of
-    ``-1`` (dummy row) must read back the neutral block.
+    An overlap tier's carry block is ``[ring_size, 2*item]`` with ``item = 2 * head_dim``, but only a
+    QUADRANT of it is ever read back: the ``ratio`` rows the extend seeds into the register, first
+    ``head_dim`` columns of the kv half and of the score half (``ratio=4``: 16 KiB/page/layer at
+    head_dim=512, against the 64 KiB whole block it replaces). The row's SECOND half is the overlap
+    half -- ``overlap_transform`` feeds it into the current block's overlap slots -- and that path
+    rebuilds its values from the page's own tokens: a whole-row seed measures identically in the
+    ring rig (prefill -> radix-style resume -> decode, driven through the real Compressor) and in
+    the end-to-end A/B against production, at twice the footprint. Last row is scratch, re-cleared
+    on every write, because a slot of ``-1`` (dummy row) must read back the neutral block.
     """
 
     def __init__(
         self,
         n_slots: int,
         ratio: int,
-        row_width: int,
+        head_dim: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
     ) -> None:
         self.ratio = ratio
-        self.row_width = row_width
-        self._item_size = ratio * row_width  # width of the kv quadrant (== the score quadrant)
+        self.head_dim = head_dim
+        self._item_size = ratio * head_dim  # width of the kv quadrant (== the score quadrant)
         self.buffer = torch.zeros((n_slots + 1, 2 * self._item_size), dtype=dtype, device=device)
         self.n_slots = n_slots
         self._clear_scratch()

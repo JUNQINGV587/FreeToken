@@ -175,8 +175,8 @@ class _Rig:
         ).clone()
 
     def put_seed_block(self, block: torch.Tensor, at: int = RESUME_AT) -> None:
-        # A seed row is ``item`` wide, not ``head_dim``: the overlap half rides in the same row.
-        ratio, width = self.ratio, self.comp.item_size
+        # A seed holds the quadrant: rows [0:ratio], first ``head_dim`` columns of kv and score.
+        ratio, width = self.ratio, self.comp.head_dim
         self.comp.attn.write_seed(
             self.layer_id, "attn", at - 1,
             block[: ratio * width].view(ratio, width), block[ratio * width:].view(ratio, width),
@@ -247,21 +247,21 @@ def test_resume_state_comes_through_the_ring(ratio):
     )
 
 
-def test_ratio4_page_seed_is_the_compact_rows():
+def test_ratio4_page_seed_is_the_load_bearing_quadrant():
     """The ratio-4 carry is a request-keyed live block plus a page-keyed seed holding exactly what a
-    resume reads back: ``ratio`` rows of the kv half then of the score half, each row ``item`` wide
-    (a whole row is load-bearing -- the extend's overlap_transform reads its second half). That is
-    32 KiB/page at head_dim=512, not the 64 KiB whole block (and not the ~1 GiB of page blocks it
-    replaces)."""
+    resume reads back: ``ratio`` rows, first ``head_dim`` columns, of the kv half then of the score
+    half. That is 16 KiB/page at head_dim=512, not the 64 KiB whole block (and not the ~1 GiB of
+    page blocks it replaces). The row's overlap half is not persisted -- the extend rebuilds it from
+    the page's own tokens (see the resume contract test below)."""
     rig = _Rig(4)
     rig.prefill()
     store = rig.pool.state_seed[rig.layer_id]
-    width = rig.comp.item_size
     assert rig.ring.request_keyed and store is not None
-    assert width == 2 * HEAD, "an overlap tier's carry row is (1+overlap)*head_dim wide"
-    assert store.item_size == 4 * width
-    assert store.buffer.shape[1] == 2 * 4 * width
-    assert rig.comp.attn.read_carry(rig.layer_id, "attn", RESUME_AT - 1, 8).numel() == 2 * 4 * width
+    assert rig.comp.item_size == 2 * HEAD, "an overlap tier's carry row is (1+overlap)*head_dim wide"
+    assert store.head_dim == HEAD
+    assert store.item_size == 4 * HEAD
+    assert store.buffer.shape[1] == 2 * 4 * HEAD
+    assert rig.comp.attn.read_carry(rig.layer_id, "attn", RESUME_AT - 1, 8).numel() == 2 * 4 * HEAD
 
 
 def test_indexer_tier_keeps_its_own_seed_in_its_own_geometry():
@@ -272,13 +272,13 @@ def test_indexer_tier_keeps_its_own_seed_in_its_own_geometry():
     attn_seed = rig.comp.attn.compress_state_seed(rig.layer_id, "attn")
     idx_seed = rig.comp.attn.compress_state_seed(rig.layer_id, "idx")
     ihd = _args().index_head_dim
-    iwidth = 2 * ihd  # the indexer compressor is overlap too
     assert idx_seed is not None and idx_seed is not attn_seed
-    assert idx_seed.item_size == 4 * iwidth != attn_seed.item_size
+    assert idx_seed.head_dim == ihd, "the indexer store measures at index_head_dim"
+    assert idx_seed.item_size == 4 * ihd != attn_seed.item_size
 
     page = rig.comp.attn.seed_page_loc(300)
     attn_before = attn_seed.get(page).clone()
-    kv = torch.arange(4 * iwidth, device=DEVICE, dtype=torch.float32).view(4, iwidth)
+    kv = torch.arange(4 * ihd, device=DEVICE, dtype=torch.float32).view(4, ihd)
     score = -kv - 1.0
     rig.comp.attn.write_seed(rig.layer_id, "idx", 300, kv, score)
     got = rig.comp.attn.read_carry(rig.layer_id, "idx", 300, ring_size=8)
@@ -305,7 +305,7 @@ def test_ratio4_resume_ignores_the_live_block():
     assert torch.equal(got.rows(), ref_rows), "the resume read the live block instead of the seed"
 
 
-def test_ratio4_seed_first_half_is_load_bearing():
+def test_ratio4_seed_quadrants_are_load_bearing():
     ref = _Rig(4)
     ref.resume()
     ref_rows = ref.rows()
@@ -320,30 +320,36 @@ def test_ratio4_seed_first_half_is_load_bearing():
     assert not torch.equal(got.rows(), ref_rows), "the live quadrant must change the result"
 
 
-def test_resume_seeds_the_whole_carry_row():
-    """A carry row is ``item = 2*head_dim`` wide and the extend's overlap_transform feeds the row's
-    SECOND half into the first new block's overlap slots. A resume must therefore restore every
-    column of rows ``[0:ratio]`` from the page seed -- not just ``[0:head_dim]``. Restoring the
-    narrow half leaves the overlap half at the reset constant, so a chunked prefill (which resumes
-    through the radix on every chunk after the first) rebuilds its first block's overlap slots from
-    zeros. This compares the restored register against the producing request's own boundary rows,
-    which is what L1's whole-block copy restored."""
+def test_resume_seeds_the_load_bearing_quadrant():
+    """A resume restores every column the producing request persisted: rows ``[0:ratio]``, first
+    ``head_dim`` columns of the kv half and of the score half, taken from the page seed. The row's
+    SECOND half is the overlap half (``overlap_transform`` feeds it into the first new block's
+    overlap slots) and the seed deliberately does not carry it -- measured identical in the ring rig
+    and in the end-to-end A/B, at half the footprint. Rows past ``ratio`` are live request state.
+    So the contract is: the persisted quadrant matches the producer's boundary rows bit for bit, and
+    the unpersisted half stays at the register's reset constant."""
     ref = _Rig(4)
     ref.prefill(RESUME_AT)
-    prod_kv = ref.comp._kv_state[0, :4].clone()
-    prod_score = ref.comp._score_state[0, :4].clone()
+    prod_kv = ref.comp._kv_state[0, :4, :HEAD].clone()
+    prod_score = ref.comp._score_state[0, :4, :HEAD].clone()
 
     got = _Rig(4)
     got.prefill(RESUME_AT)
     got.scrub_register()
     got.comp._seed_carry_from_ring(RESUME_AT - 1)
 
-    assert torch.equal(got.comp._kv_state[0, :4], prod_kv), (
-        "the resume restored a narrower row than the producing request persisted"
+    assert torch.equal(got.comp._kv_state[0, :4, :HEAD], prod_kv), (
+        "the resume must restore every column the producer persisted"
     )
-    assert torch.equal(got.comp._score_state[0, :4], prod_score), (
-        "the resume restored a narrower score row than the producing request persisted"
+    assert torch.equal(got.comp._score_state[0, :4, :HEAD], prod_score), (
+        "the resume must restore every score column the producer persisted"
     )
+    assert torch.equal(
+        got.comp._kv_state[0, :4, HEAD:], torch.zeros_like(prod_kv)
+    ), "the overlap half is not persisted and must stay at the reset constant"
+    assert bool(
+        (got.comp._score_state[0, :4, HEAD:] == float("-inf")).all()
+    ), "the unpersisted score half must stay at the reset constant"
 
 
 def test_ratio128_ring_is_request_keyed_with_no_page_block():

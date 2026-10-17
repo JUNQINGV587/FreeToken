@@ -168,7 +168,7 @@ class DSV4PagedKVCache(WindowTierPagedPool):
                     CompressSeedStore(
                         n_slots=sizes.idx_seed_slots[L],
                         ratio=4,
-                        row_width=idx_ring.item_size,
+                        head_dim=self.index_head_dim,
                         device=device,
                     )
                 )
@@ -191,7 +191,7 @@ class DSV4PagedKVCache(WindowTierPagedPool):
                 CompressSeedStore(
                     n_slots=sizes.state_seed_slots[L],
                     ratio=4,
-                    row_width=attn_ring.item_size,
+                    head_dim=self.head_dim,
                     device=device,
                 )
                 if ratio == 4

@@ -97,19 +97,18 @@ class Compressor(BaseOP):
 
     def _seed_carry_from_ring(self, window_slot: int) -> None:
         # Carry-by-value on a radix re-prefill: seed the register carry FROM the matched window TAIL
-        # page's compact seed (kv rows then score rows) -- the only part of that page's carry block a
-        # later request reads back. The rows are ``item`` wide (``(1+overlap)*head_dim``), because
-        # the extend's overlap_transform feeds a row's second half into the current block's overlap
-        # slots. It was written by the producing request's page-boundary persistence (prefill/extend
-        # boundary carries, or a decode page completion). ``None`` where the tier keeps no page seed
-        # (the non-overlap tiers); every other register slot keeps its reset value, which is bit-equal
-        # to the from-scratch seed.
+        # page's compact seed (kv rows then score rows) -- the quadrant of that page's carry block a
+        # later request reads back. It was written by the producing request's page-boundary
+        # persistence (prefill/extend boundary carries, or a decode page completion). The row's
+        # overlap half is NOT in the seed (the extend rebuilds it from the page's own tokens), and
+        # rows past ``ratio`` keep their reset value, which is bit-equal to the from-scratch seed.
+        # ``None`` where the tier keeps no page seed (the non-overlap tiers).
         seed = self.attn.read_carry(self.layer_id, self.tier, window_slot, self.ring_size)
         if seed is None:
             return
-        ratio, width = self.compress_ratio, self._kv_state.size(-1)
-        self._kv_state[0, :ratio].copy_(seed[: ratio * width].view(ratio, width))
-        self._score_state[0, :ratio].copy_(seed[ratio * width:].view(ratio, width))
+        ratio, width = self.compress_ratio, self.head_dim
+        self._kv_state[0, :ratio, :width].copy_(seed[: ratio * width].view(ratio, width))
+        self._score_state[0, :ratio, :width].copy_(seed[ratio * width:].view(ratio, width))
 
     def _write_boundary_carries(
         self, kv, score, seqlen: int, window_slots: torch.Tensor, row: int
@@ -355,8 +354,8 @@ class Compressor(BaseOP):
         )
 
         # At a window-page boundary the page becomes a radix match point, so persist its compact
-        # seed -- the register rows the completion just finalised (post-swap rows 0..ratio-1, each
-        # ``item`` wide: the extend's overlap_transform reads a row's second half too). Rows that
+        # seed -- the register rows the completion just finalised (post-swap rows 0..ratio-1, first
+        # ``head_dim`` columns: the load-bearing quadrant). Rows that
         # finished no page write to the store's discarded scratch row instead, which keeps the
         # batched write graph-safe (no host sync, no out-of-range index).
         if overlap:
@@ -367,7 +366,7 @@ class Compressor(BaseOP):
             )
             self.attn.write_seed_blocks(
                 self.layer_id, self.tier, seed_slots,
-                ks[:, :ratio].clone(), ss[:, :ratio].clone(),
+                ks[:, :ratio, : self.head_dim].clone(), ss[:, :ratio, : self.head_dim].clone(),
             )
 
         compressed = self.norm.forward(compressed)

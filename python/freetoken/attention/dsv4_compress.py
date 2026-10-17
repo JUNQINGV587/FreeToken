@@ -139,9 +139,9 @@ class CompressorBackendMixin:
         self, layer_id: int, tier: str, window_slot: int, kv_rows: torch.Tensor,
         score_rows: torch.Tensor,
     ) -> None:
-        """Persist a page's overlap seed: ``ratio`` rows of the kv half then of the score half,
-        each row ``item`` wide (the whole row is load-bearing -- the extend's overlap_transform
-        reads its second half)."""
+        """Persist a page's load-bearing seed: ``ratio`` rows of the kv half then of the score
+        half, each row's first ``head_dim`` columns (the quadrant a resume reads back; the overlap
+        half of the row is rebuilt from the page's own tokens)."""
         seed = self.compress_state_seed(layer_id, tier)
         if seed is None:
             return
@@ -238,7 +238,10 @@ class CompressorBackendMixin:
                 self.write_carry(
                     layer_id, tier, ws, ring_size, torch.cat([blk_kv, blk_ss], dim=-1), row=row,
                 )
-                self.write_seed(layer_id, tier, ws, blk_kv[:ratio], blk_ss[:ratio])
+                self.write_seed(
+                    layer_id, tier, ws, blk_kv[:ratio, : seed.head_dim],
+                    blk_ss[:ratio, : seed.head_dim],
+                )
 
 
 __all__ = ["CompressorBackendMixin"]

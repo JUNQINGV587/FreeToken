@@ -70,17 +70,18 @@ def _idx_state_bytes(args) -> int:
 
 
 def _seed_bytes(args, ratio: int) -> int:
-    # Overlap seed store (ratio-4 only): the rows of a carry block that a later request
-    # reads back -- ``ratio`` rows of the kv half plus ``ratio`` rows of the score half.
-    # A row is ``(1 + overlap) * head_dim`` wide, not ``head_dim``: the extend feeds the
-    # row's second half into the current block's overlap slots, so the whole row is
-    # load-bearing. Anything past row ``ratio`` is live state in the request-keyed ring.
-    overlap = 1 if ratio == 4 else 0
-    return 2 * ratio * (1 + overlap) * args.head_dim * _FP32_BYTES
+    # Overlap seed store (ratio-4 only): the load-bearing QUADRANT of a carry block that a
+    # later request reads back -- ``ratio`` rows, each row's first ``head_dim`` columns, of
+    # the kv half and of the score half. The rest of the row (the overlap half the extend
+    # feeds into the current block's slots) is not persisted: it is rebuilt from the page's
+    # own tokens, and a whole-row seed measures the same in the ring rig and in the
+    # end-to-end A/B while costing 2x. Anything past row ``ratio`` is live request state.
+    return 2 * ratio * args.head_dim * _FP32_BYTES
 
 
 def _idx_seed_bytes(args) -> int:
-    return 2 * 4 * 2 * args.index_head_dim * _FP32_BYTES
+    # Indexer overlap seed store: the same quadrant shape at ``index_head_dim``.
+    return 2 * 4 * args.index_head_dim * _FP32_BYTES
 
 
 def dsv4_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:

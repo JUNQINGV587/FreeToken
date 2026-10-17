@@ -293,22 +293,21 @@ def test_cli_says_what_is_wrong_with_a_missing_trace(tmp_path):
     assert "no such trace" in out.stderr
 
 
-def test_wipe_band_makes_the_borrowed_slots_the_first_victims():
-    """Owner-EP prefill overlap invalidates its borrowed slots at each chunk boundary.
+def test_the_borrowed_band_is_never_handed_to_decode():
+    """Owner-EP prefill overlap reserves its borrowed slots from the decode LRU.
 
-    ``offload_cache._invalidate_prefill_buffer`` clears ``slot_for_id`` and zeroes
-    ``usage`` over the borrowed range, so those slots become the coldest in the pool and
-    the LRU side refills them first. Modelled by ``Sim.wipe_band``.
+    The ring copy runs on the copy stream while decode admission runs on the compute
+    stream; if a decode row could be admitted into the borrowed band between the
+    invalidate and the ring copy, the copy would rewrite bytes ``slot_for_id`` still
+    declares resident -- the phantom hit behind the decode nondeterminism.  The band is
+    therefore excluded from the managed pool, and a chunk-boundary wipe drops nothing.
     """
     sim = Sim(8, 512, policy="lru", band_slots=4)
+    assert sim.n_slots == 4, "the managed pool excludes the band"
     for e in range(12):
         sim.ensure(0, [e])
-    dropped = sim.wipe_band()
-    assert dropped > 0, "the band must have held live rows"
-    before = sim.misses
-    sim.ensure(0, [99])
-    assert sim.misses == before + 1, "a fresh row after the wipe is still a miss"
-    assert sim.slot_of[99] < 4, "the refill must land in the wiped band"
+    assert all(slot >= 4 for slot in sim.slot_of.values()), "no row may land in the band"
+    assert sim.wipe_band() == 0, "the band never holds managed rows"
 
 
 def test_a_zero_band_wipe_is_a_no_op():

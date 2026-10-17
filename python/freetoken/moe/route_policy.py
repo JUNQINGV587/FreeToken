@@ -120,17 +120,23 @@ class Sim:
         # A pinned row never needs a managed slot, so the LRU side shrinks by P.
         self.n_slots = cache_size - len(self.pin)
         # Owner-EP prefill overlap borrows the slot cache's first
-        # ``prefill_depth * num_experts`` slots as the buffer ring and invalidates them
-        # when the ring is reused (offload_cache._invalidate_prefill_buffer), so every
-        # row that lands there is dropped at the next prefill chunk.  Modelled as a
-        # positional band that a caller wipes at chunk boundaries.
+        # ``prefill_depth * num_experts`` slots as the buffer ring.  Those slots are
+        # reserved: decode admission never hands them out (their ``usage`` carries
+        # ``RESERVED_USAGE``), because the ring copy races decode admission on another
+        # stream and a row admitted into the band would be silently overwritten while
+        # ``slot_for_id`` still called it resident.  The managed pool therefore starts
+        # above the band.  ``wipe_band`` is therefore a no-op on managed rows and only
+        # exists to keep the chunk-boundary accounting explicit.
         self.band = min(band_slots, self.n_slots)
+        self.n_slots -= self.band
         self.slot_of: dict[int, int] = {}
-        self.owner: list[int | None] = [None] * self.n_slots
-        self.usage: list[int] = [0] * self.n_slots
-        self.count: list[int] = [0] * self.n_slots
+        # Slot ids are absolute: the band [0, band) is reserved, so the managed pool
+        # lives above it in [band, band + n_slots).
+        self.owner: list[int | None] = [None] * cache_size
+        self.usage: list[int] = [0] * cache_size
+        self.count: list[int] = [0] * cache_size
         self.heap: list[tuple] = []
-        self.free = list(range(self.n_slots))
+        self.free = list(range(self.band, self.band + self.n_slots))
         self.step = 0
         self.calls = 0
         self.active = 0
@@ -184,28 +190,14 @@ class Sim:
             f"than the pool holds)")
 
     def wipe_band(self) -> int:
-        """Invalidate the borrowed prefill-ring band (one prefill chunk boundary).
+        """Model one prefill chunk boundary.
 
-        ``_invalidate_prefill_buffer`` clears ``slot_for_id`` and zeroes ``usage`` for the
-        borrowed range, which makes those slots the coldest in the pool -- so the LRU side
-        refills them first and they absorb the next misses.  Returns the number of rows
-        dropped.  Pinned rows never sit in the band (the engine carves the pin region out
-        of the persistent region above it).
+        The real ``_invalidate_prefill_buffer`` clears ``slot_for_id`` and stamps
+        ``RESERVED_USAGE`` on the borrowed range.  The managed pool excludes the band
+        entirely, so no managed row can live there and nothing is dropped.  Returns the
+        number of rows dropped (always 0).
         """
-        dropped = 0
-        for s in range(self.band):
-            fid = self.owner[s]
-            if fid is None:
-                continue
-            del self.slot_of[fid]
-            self.owner[s] = None
-            self.usage[s] = 0
-            self.count[s] = 0
-            # The kernel sees these as empty slots (``id_of_slot == -1``), so they return
-            # to the free list; any stale heap entry for them is discarded on pop.
-            self.free.append(s)
-            dropped += 1
-        return dropped
+        return 0
 
     # ------------------------------------------------------------------ replay
     def ensure(self, layer: int, ids) -> None:

@@ -12,24 +12,33 @@ prefetching the next layer, which serialized the prefill-overlap pipeline. On lo
 cached contexts that turned a ~3 s chunk into a 20-150 s turn (py-spy: 92% of the
 scheduler inside this invalidation + ``synchronize``, GPU 0-3% utilized).
 
-This kernel is fixed-shape: one launch, no synchronization, identical result. Zeroing
-``usage`` here (instead of a separate ``zero_``) keeps the buffer's slots as the
-argmin(usage) eviction victims, exactly like the code it replaces.
+This kernel is fixed-shape: one launch, no synchronization, identical result.
+
+``usage`` is stamped with :data:`RESERVED_USAGE` instead of 0: the borrowed band must
+never be an LRU eviction victim.  Decode admission races the ring copy on another
+stream, so a decode expert admitted into the band between the invalidate and the copy
+would have its bytes silently rewritten while ``slot_for_id`` still declares it
+resident -- a phantom hit that reads another layer's weights.  The sentinel (int64)
+keeps every band slot out of ``argmin(usage)`` for the life of the cache.
 """
 
 import torch
 import triton
 import triton.language as tl
 
+# Keep in sync with ``freetoken.moe.offload_cache.RESERVED_USAGE``.
+RESERVED_USAGE = 1 << 62
+
 
 @triton.jit
 def _invalidate_slots_kernel(
     id_of_slot_ptr,   # (num_slots,) int32 -- slot -> expert id, -1 if empty
     slot_for_id_ptr,  # (num_layers * num_experts) int32 -- expert id -> slot, -1 if not resident
-    usage_ptr,        # (num_slots,) int64 -- last-used step; zeroed so these slots are
-                      # the argmin(usage) victims in ensure_experts' eviction
+    usage_ptr,        # (num_slots,) int64 -- last-used step; stamped with
+                      # RESERVED_USAGE so no eviction ever picks these slots
     slot_start,
     n,
+    reserved_usage,  # int64 sentinel; runtime arg (Triton kernels cannot read module globals)
     BLOCK: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -38,7 +47,7 @@ def _invalidate_slots_kernel(
     # clear the expert's residency flag; empty slots (-1) are masked out
     tl.store(slot_for_id_ptr + e, -1, mask=m & (e >= 0))
     tl.store(id_of_slot_ptr + slot_start + i, -1, mask=m)
-    tl.store(usage_ptr + slot_start + i, 0, mask=m)
+    tl.store(usage_ptr + slot_start + i, reserved_usage, mask=m)
 
 
 def invalidate_prefill_slots(
@@ -67,9 +76,10 @@ def invalidate_prefill_slots(
         old_ids = id_of_slot[slot_start : slot_start + num_experts]
         slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
         old_ids.fill_(-1)
-        usage[slot_start : slot_start + num_experts].zero_()
+        usage[slot_start : slot_start + num_experts].fill_(RESERVED_USAGE)
         return
     grid = ((num_experts + 255) // 256,)
     _invalidate_slots_kernel[grid](
-        id_of_slot, slot_for_id, usage, slot_start, num_experts, BLOCK=256
+        id_of_slot, slot_for_id, usage, slot_start, num_experts,
+        RESERVED_USAGE, BLOCK=256,
     )

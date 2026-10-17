@@ -271,7 +271,11 @@ def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     cache.prefetch_prefill_layer(0)
 
     assert cache.id_of_slot[:num_experts].tolist() == [-1] * num_experts
-    assert cache.usage[:num_experts].tolist() == [0] * num_experts
+    # The borrowed band is stamped with the reservation sentinel, not zeroed: decode
+    # admission must never pick these slots (see offload_cache.RESERVED_USAGE).
+    from freetoken.moe.offload_cache import RESERVED_USAGE
+
+    assert cache.usage[:num_experts].tolist() == [RESERVED_USAGE] * num_experts
     for layer_id, expert_id in zip(old_layers.tolist(), old_experts.tolist()):
         assert int(cache.slot_for_id[layer_id, expert_id].item()) == -1
     assert torch.equal(cache.bank_caches["gate_up"][:num_experts], gate_up_source[0])
@@ -309,7 +313,9 @@ def test_invalidate_prefill_slots_kernel_matches_eager_reference():
             buf = ref_ids[slot_start : slot_start + num_experts]
             ref_sfi.view(-1)[buf[buf >= 0].long()] = -1
             buf.fill_(-1)
-            ref_usage[slot_start : slot_start + num_experts].zero_()
+            from freetoken.moe.offload_cache import RESERVED_USAGE
+
+            ref_usage[slot_start : slot_start + num_experts].fill_(RESERVED_USAGE)
 
             invalidate_prefill_slots(ids_c, sfi_c, usage_c, slot_start, num_experts)
             torch.cuda.synchronize()

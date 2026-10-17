@@ -55,6 +55,15 @@ from .ownership import OwnerCacheGeometry, OwnerCacheUpdate, same_device
 
 logger = init_logger(__name__)
 
+# Slots the prefill-overlap ring borrows are never handed to the decode LRU.  The ring
+# invalidates the band before it copies, but decode admission runs concurrently on
+# another stream: without a hard reservation a decode expert can be admitted into the
+# band between the invalidate and the ring copy, and the copy then silently rewrites
+# bytes that ``slot_for_id`` still declares resident -- a phantom hit that reads
+# another layer's weights (nondeterministic decode output).  ``usage`` is int64, so a
+# sentinel this large is never the argmin while any real slot exists.
+RESERVED_USAGE = 1 << 62
+
 # quant_format -> bank names, in registration order: the single place a format's bank
 # layout is declared. The cache machinery (copy_missing, the prefill double buffers,
 # bank_views) iterates banks in this order, the layers' kernel dispatch unpacks views
@@ -241,6 +250,8 @@ class OffloadMoeCache:
             device=self.device,
         )
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
+        if self.prefill_overlap:
+            self.usage[: self._prefill_depth * self.num_experts].fill_(RESERVED_USAGE)
         # stats_snapshot TTL cache (W20, 2026-10-05): the scheduler stamps this dict
         # onto every reply batch; without a TTL each stamp pays GPU syncs
         # (usage.gt(0).sum().item() + lru_stats.sum) measured at ~17% of the decode
@@ -615,6 +626,7 @@ class OffloadMoeCache:
                 cache[0].numel() * cache.element_size() for cache in self.bank_caches.values()
             )
         if self.prefill_overlap:
+            self.usage[: self._prefill_depth * self.num_experts].fill_(RESERVED_USAGE)
             self._init_prefill_overlap_buffers()
 
     def _build_copy_plan(self) -> None:
@@ -926,7 +938,7 @@ class OffloadMoeCache:
             ids = self.id_of_slot[slot_start : slot_start + self.num_experts]
             self.slot_for_id.view(-1)[ids[ids >= 0]] = -1
             ids.fill_(-1)
-            self.usage[slot_start : slot_start + self.num_experts] = 0
+            self.usage[slot_start : slot_start + self.num_experts] = RESERVED_USAGE
             return
 
         from freetoken.kernel.triton.moe import invalidate_prefill_slots

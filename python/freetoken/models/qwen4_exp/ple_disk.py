@@ -35,6 +35,8 @@ _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
 _ASYNC_ENV = "FREETOKEN_PLE_ASYNC_FILL"
 
+_UNSET = object()
+
 logger = init_logger(__name__)
 
 
@@ -198,9 +200,14 @@ class DiskRowTable:
         self._graph_dev = torch.empty(
             max_graph_rows * self._token_bytes, dtype=torch.uint8, device=self._device
         )
-        # completes once the last graph launch that read ``_graph_pinned`` has run (recorded by the
-        # dispatch context after the step's fill: a record inside the capture would not be observable)
-        self._graph_consumed = torch.cuda.Event()
+        # completes once the last graph launch that read ``_graph_pinned`` has run. Two slots: the
+        # dispatch context records after the deferred fill, so a fill must wait on the PREVIOUS launch,
+        # never on the one whose flag WAIT it is about to satisfy.
+        self._graph_consumed = [torch.cuda.Event(), torch.cuda.Event()]
+        self._consumed_slot = 0
+        self._consumed_prev: torch.cuda.Event | None = None
+        # the event the worker's own fill waits on; written by the worker right before the call
+        self._fill_consumed = threading.local()
         eager_bytes = max_extend_tokens * self._token_bytes
         # the overlap scheduler fills batch k+1 while batch k's lookup copy may still be queued: the
         # eager staging alternates two pinned buffers, and each is rewritten only once the H2D copy
@@ -239,7 +246,11 @@ class DiskRowTable:
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
         if graph:
-            self._graph_consumed.synchronize()
+            # the worker captures this at its own entry; every other thread waits on the last record
+            event = getattr(self._fill_consumed, "event", _UNSET)
+            event = self._consumed_prev if event is _UNSET else event
+            if event is not None:
+                event.synchronize()
             pinned = self._graph_pinned
         else:
             self._eager_slot ^= 1
@@ -279,6 +290,9 @@ class DiskRowTable:
                 bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
+                # capture the wait target before the exit can record: a fill that waited on the
+                # record taken right after it is enqueued blocks the flag WAIT it exists to satisfy
+                prev_consumed = self._consumed_prev
                 # snapshot the window context here: the worker runs after the engine has
                 # advanced the requests for the next step, so req fields read there tear
                 windows = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
@@ -288,6 +302,7 @@ class DiskRowTable:
                         self._readback_event.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
                         runs = [torch.tensor([*w, t], dtype=torch.int64) for w, t in zip(windows, tokens)]
+                        self._fill_consumed.event = prev_consumed
                         self.fill(runs, graph=True)
                     except BaseException:
                         from freetoken.kernel.row_store import signal
@@ -334,7 +349,10 @@ class DiskRowTable:
             deferred()
         if use_graph:
             # only after this step's fill: the next fill waits on this launch, not the fill on it
-            self._graph_consumed.record(torch.cuda.current_stream(self._device))
+            event = self._graph_consumed[self._consumed_slot]
+            event.record(torch.cuda.current_stream(self._device))
+            self._consumed_prev = event
+            self._consumed_slot ^= 1
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 

@@ -38,6 +38,7 @@ from dataclasses import dataclass
 import torch
 
 from freetoken.moe.host_banks import HostBank
+from . import prefill_profile
 from freetoken.moe.prefetch_plan import (
     build_prefetch_plan, form_blocks, load_prediction_doc)
 
@@ -1740,6 +1741,14 @@ class DiskTier:
         self._pf_pin_bytes += pin.numel() * self._row_bytes_total
         self._pf_disk_rows += disk.numel()
         self._pf_disk_bytes += disk.numel() * self._db_row_bytes
+        # Per-chunk profile (no-op unless FREETOKEN_PREFILL_PROFILE=1): the routed
+        # demand split per layer is what a chunk-size A/B reads to tell "fewer,
+        # bigger fetches" from "the same fetch total with a different overlap".
+        prof = prefill_profile.get_profiler()
+        prof.bump("dt_route_rows", pin.numel() + disk.numel())
+        prof.bump("dt_pin_rows", pin.numel())
+        prof.bump("dt_disk_rows", disk.numel())
+        prof.bump("dt_disk_bytes", disk.numel() * self._db_row_bytes)
         serve_pin = self._prefill_pin_source and pin.numel() > 0
         if disk.numel() == 0 and not serve_pin:
             # All-resident layer: nothing to serve, but the GEMM still runs --
@@ -1790,14 +1799,20 @@ class DiskTier:
                 disk = torch.tensor(
                     [e for e in disk.tolist() if e not in hit_entries],
                     dtype=disk.dtype, device=disk.device)
-        futures = [
-            self._pool.submit(self._fetch_expert, layer_id, int(e), -1,
-                              buffers, buffer_id)
-            for e in disk.tolist()
-        ]
-        for f in futures:
-            f.result()
-        self._sync_fetches()
+        if hit_entries:
+            prof.bump("dt_stash_hit", len(hit_entries))
+        # Host-blocking disk wait for this layer (pool preadv + slab H2D drain).
+        # series=True keeps the per-layer samples: a chunk total averages away the
+        # within-chunk trend (e.g. waits shrinking once the ②b window warms up).
+        with prof.phase("dt_fetch", series=True):
+            futures = [
+                self._pool.submit(self._fetch_expert, layer_id, int(e), -1,
+                                  buffers, buffer_id)
+                for e in disk.tolist()
+            ]
+            for f in futures:
+                f.result()
+            self._sync_fetches()
         # The slab H2D copies are drained now: drop the hits' slab references.
         for entry in hit_entries.values():
             self._bulk_recycle_rec(entry["rec"])

@@ -30,6 +30,7 @@ from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNorm, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel, embed_input_ids
+from freetoken.moe import prefill_profile
 
 from .args import DeepseekV4Args
 from .attention import Attention
@@ -96,17 +97,28 @@ class Block(BaseOP):
         # metadata; ``flat_positions`` [T] = per-token ABSOLUTE position (batch.positions).
         # ``spans_by_ti`` maps a page-table row to its image spans: the sparse attention needs
         # the pairs, the block-tiled backends read the flat ends (batch.mm_block_ends) instead.
+        prof = prefill_profile.get_profiler()
+        # Names the layer for the per-layer timeline / series; no-op unless enabled.
+        prof.set_layer(self.layer_id)
         residual = x
-        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = self.attn_norm.forward(x)
-        x = self.attn.forward_ragged(x, segments, flat_positions, spans_by_ti=spans_by_ti)
-        x = self.hc_post(x, residual, post, comb)
+        with prof.phase("attn_mix"):
+            x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+            x = self.attn_norm.forward(x)
+        # series=True keeps the per-layer samples: a chunk total hides whether the cost
+        # grows towards the end of the chunk (a device queue filling up) or is flat.
+        with prof.phase("attn_core", series=True):
+            x = self.attn.forward_ragged(x, segments, flat_positions, spans_by_ti=spans_by_ti)
+        with prof.phase("attn_combine"):
+            x = self.hc_post(x, residual, post, comb)
 
         residual = x
-        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        x = self.ffn_norm.forward(x)
-        x = self.ffn.forward(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
+        with prof.phase("mlp_mix"):
+            x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+            x = self.ffn_norm.forward(x)
+        with prof.phase("moe_total", series=True):
+            x = self.ffn.forward(x, input_ids)
+        with prof.phase("mlp_combine"):
+            x = self.hc_post(x, residual, post, comb)
         return x
 
     def decode_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctx=None):

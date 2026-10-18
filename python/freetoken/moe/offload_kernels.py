@@ -8,6 +8,7 @@ import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
 
 from freetoken.moe import prefill_profile
+from freetoken.moe.classed_ensure import classed_ensure
 from freetoken.moe.prefill_profile import get_profiler
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
@@ -18,6 +19,15 @@ _HYBRID_FETCH_BY_RECENCY = (
     os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
 )
 
+# Classed admission (disk-tier mode): split the slot cache into a main region for
+# NVMe-backed rows and a small pin-scratch region for RAM-pin rows, so the churning
+# pin class can no longer evict the disk rows the cache exists to hold (see
+# classed_ensure.py). Default on whenever a disk tier is attached; FREETOKEN_
+# CLASSED_ENSURE=0 forces the vanilla global LRU. The pin region defaults to 64
+# slots (decode's worst case is bs*topk = 32 misses/layer/step).
+_CLASSED_ENSURE_ON = os.getenv("FREETOKEN_CLASSED_ENSURE", "1").strip() != "0"
+_CLASSED_PIN_SLOTS = int(os.getenv("FREETOKEN_PIN_CACHE_SLOTS", "128"))
+
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
@@ -27,7 +37,35 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     ``src_indices`` back, so ``copy_missing`` still resolves against this layer's own host
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
+
+    With a disk tier attached, routes to the classed variant instead: pin-class
+    misses may only evict the top ``_CLASSED_PIN_SLOTS`` slots, disk-class misses
+    only the rest. The conservative guard ``numel <= min(region sizes)`` bounds each
+    class's distinct misses by construction (duplicates only shrink it); wider
+    queries (prefill's short path) fall back to the vanilla global LRU.
     """
+    tier = getattr(cache, "_disk_tier", None)
+    if _CLASSED_ENSURE_ON and tier is not None and getattr(tier, "_ram", 0) > 0:
+        pin_region = min(_CLASSED_PIN_SLOTS, cache.cache_size // 4)
+        pin_start = cache.cache_size - pin_region
+        if 0 < pin_start and expert_ids.numel() <= min(pin_region, pin_start):
+            classed_ensure(
+                expert_ids,
+                cache.slot_for_id.view(-1),
+                cache.id_of_slot,
+                cache.usage,
+                cache.step,
+                expert_ids,
+                cache.src_indices,
+                cache.evict_slots,
+                cache.num_indices,
+                tier._row_map_dev[layer_id],
+                ram_local=tier._ram,
+                pin_start=pin_start,
+                stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+                id_base=layer_id * cache.num_experts,
+            )
+            return
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),

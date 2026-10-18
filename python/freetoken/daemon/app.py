@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from freetoken.server.disconnect import client_is_gone
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -450,7 +451,7 @@ def _log_stream(request: Request, ring, since: int) -> StreamingResponse:
         mutation runs on the loop thread, so the reader never blocks) and a client-visible gap
         sentinel so a slow client knows it lost lines;
       * ``id:<seq>`` on every frame + ``Last-Event-ID`` honoured for native EventSource resume;
-      * a 15 s heartbeat + ``is_disconnected`` check so an idle client's disconnect is detected
+      * a 15 s heartbeat + direct transport probe so an idle client's disconnect is detected
         and the subscriber is always removed in ``finally`` (no leak)."""
     loop = asyncio.get_running_loop()
     lei = request.headers.get("last-event-id")
@@ -501,7 +502,7 @@ def _log_stream(request: Request, ring, since: int) -> StreamingResponse:
                 yield _sse(rec)
             last_seq = cursor - 1
             while True:
-                if await request.is_disconnected():
+                if await client_is_gone(request):
                     break
                 try:
                     rec = await asyncio.wait_for(q.get(), timeout=15.0)

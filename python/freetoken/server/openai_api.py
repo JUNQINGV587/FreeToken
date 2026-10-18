@@ -273,6 +273,27 @@ def register_openai_routes(
 # request's extra decode work without measurable polling overhead.
 _DISCONNECT_POLL_SECONDS = 1.0
 
+# How long a single transport probe may block before the client counts as
+# connected. The probe must actually await receive(): Starlette's
+# Request.is_disconnected() runs receive() inside an already-cancelled anyio
+# scope, so the cancellation lands on receive()'s first await and a disconnect
+# that has not been queued yet is never observed — with uvicorn 0.54 that made
+# the watchdog below report a live client forever. Awaiting with a short timeout
+# returns the queued http.disconnect message instead.
+_DISCONNECT_PROBE_SECONDS = 0.05
+
+
+async def _client_is_gone(request: Request) -> bool:
+    """True once the peer closed the connection, without blocking the handler."""
+    receive = getattr(request, "_receive", None)
+    if receive is None:  # pragma: no cover - only for non-Starlette doubles
+        return await request.is_disconnected()
+    try:
+        message = await asyncio.wait_for(receive(), timeout=_DISCONNECT_PROBE_SECONDS)
+    except asyncio.TimeoutError:
+        return False
+    return isinstance(message, dict) and message.get("type") == "http.disconnect"
+
 
 async def _await_watching_disconnect(awaitable, request: Request | None, state: Any, uid: int):
     """Run an in-flight generation awaitable while watching the transport — the
@@ -289,7 +310,7 @@ async def _await_watching_disconnect(awaitable, request: Request | None, state: 
             done, _ = await asyncio.wait({gen}, timeout=_DISCONNECT_POLL_SECONDS)
             if done:
                 return gen.result()
-            if await request.is_disconnected():
+            if await _client_is_gone(request):
                 break
     except asyncio.CancelledError:
         # The handler itself was cancelled (server shutdown): deliver the abort,

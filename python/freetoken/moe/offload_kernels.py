@@ -23,10 +23,13 @@ _HYBRID_FETCH_BY_RECENCY = (
 # NVMe-backed rows and a small pin-scratch region for RAM-pin rows, so the churning
 # pin class can no longer evict the disk rows the cache exists to hold (see
 # classed_ensure.py). Default on whenever a disk tier is attached; FREETOKEN_
-# CLASSED_ENSURE=0 forces the vanilla global LRU. The pin region defaults to 64
-# slots (decode's worst case is bs*topk = 32 misses/layer/step).
+# CLASSED_ENSURE=0 forces the vanilla global LRU. The pin region defaults to 1024
+# slots: oracle trace replay + production A/B (2026-10-19, runs/202610-v4f-cache-oracle)
+# showed 128 slots thrash the pin class (49.2 fetch rows/token vs 10.7 at 1024) while
+# the remaining 416 disk-region slots still capture the disk working set (0.97
+# rows/token vs 1.98 unified). Production single-stream decode 7.5 -> 9.1 t/s (+21%).
 _CLASSED_ENSURE_ON = os.getenv("FREETOKEN_CLASSED_ENSURE", "1").strip() != "0"
-_CLASSED_PIN_SLOTS = int(os.getenv("FREETOKEN_PIN_CACHE_SLOTS", "128"))
+_CLASSED_PIN_SLOTS = int(os.getenv("FREETOKEN_PIN_CACHE_SLOTS", "1024"))
 
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:

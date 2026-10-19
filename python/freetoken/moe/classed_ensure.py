@@ -26,11 +26,14 @@ The caller bounds it conservatively by ``query.numel() <= min(pin_start, num_cac
 pin_start)`` and falls back to flashlib's ``lru_ensure`` otherwise (prefill's wide
 queries take that path; decode's ``bs * topk <= 32`` always fits a 128-slot region).
 
-Default pin region: 128 slots (``FREETOKEN_PIN_CACHE_SLOTS``). Measured on the V4-Flash
-1440-slot cache (2026-10-18, runs/202610-v4f-prefill-opt/PHASE-C-classed-ensure.md):
-64 slots cost ~13% single-stream decode latency (pin working set ~128 rows/step thrashed),
-128 restores parity with vanilla while keeping the decode NVMe cut at −88%; 256 buys
-nothing and weakens disk-row residency.
+Default pin region: 1024 slots (``FREETOKEN_PIN_CACHE_SLOTS``). History on the V4-Flash
+1440-slot cache: the original 2026-10-18 sweep {64,128,256} looked flat in speed, which
+was misread as "routing is iid, capacity doesn't matter". Oracle replay of a real
+production routing trace (2026-10-19, runs/202610-v4f-cache-oracle/RESULT.md) proved the
+opposite: 128 slots thrash the pin class (49.2 fetch rows/token vs 10.7 at 1024), and a
+production A/B confirmed it — single-stream decode 7.5 -> 9.1 t/s (+21%) with the disk
+class still protected (0.97 NVMe rows/token vs 1.98 unified). 1024 is the sweet spot:
+bigger regions erode disk-row residency without cutting total fetches further.
 """
 from __future__ import annotations
 
